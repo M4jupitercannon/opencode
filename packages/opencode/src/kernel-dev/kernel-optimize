@@ -1,0 +1,434 @@
+#!/bin/bash
+# GPU Kernel Optimization Tool
+# Usage: kernel-optimize --src source.py [--target output.py] [--goal 2.0]
+
+set -e
+
+# Default values
+SRC_FILE=""
+TARGET_FILE=""
+GOAL_SPEEDUP=""
+SHOW_HELP=false
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --src)
+            SRC_FILE="$2"
+            shift 2
+            ;;
+        --target)
+            TARGET_FILE="$2"
+            shift 2
+            ;;
+        --goal)
+            GOAL_SPEEDUP="$2"
+            shift 2
+            ;;
+        --help|-h)
+            SHOW_HELP=true
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Use --help for usage information"
+            exit 1
+            ;;
+    esac
+done
+
+if [ "$SHOW_HELP" = true ]; then
+    echo "GPU Kernel Optimization Tool"
+    echo ""
+    echo "Automatically optimize PyTorch implementations into high-performance"
+    echo "Triton Kernels using AI (Claude Opus 4.5 via AMD Gateway)."
+    echo ""
+    echo "Usage: kernel-optimize --src <source.py> [--target <output.py>] [--goal <speedup>]"
+    echo ""
+    echo "Options:"
+    echo "  --src FILE      Source PyTorch implementation (required)"
+    echo "  --target FILE   Target Triton implementation output"
+    echo "                  Default: <src_basename>_opt.py"
+    echo "  --goal NUMBER   Target speedup ratio (e.g., 2.0 for 2x speedup)"
+    echo "                  Stop optimization when goal is reached"
+    echo "                  If not reached, save best result to target"
+    echo "  --help, -h      Show this help message"
+    echo ""
+    echo "Environment Variables:"
+    echo "  LLM_GATEWAY_KEY  AMD LLM Gateway API key (required)"
+    echo ""
+    echo "Examples:"
+    echo "  # Basic usage (output to model_opt.py)"
+    echo "  kernel-optimize --src model.py"
+    echo ""
+    echo "  # With custom output file"
+    echo "  kernel-optimize --src model.py --target model_triton.py"
+    echo ""
+    echo "  # With performance goal"
+    echo "  kernel-optimize --src model.py --goal 2.0"
+    echo ""
+    echo "Source File Format:"
+    echo "  Your source file should contain:"
+    echo "    - class Model(nn.Module): PyTorch implementation"
+    echo "    - def get_inputs(): Returns list of input tensors for forward()"
+    echo "    - def get_init_inputs(): Returns init parameters for Model() (optional)"
+    echo ""
+    echo "Output:"
+    echo "  The tool will generate a target file with:"
+    echo "    - Header comment with speedup, timing info, and optimization notes"
+    echo "    - Optimized Triton kernel"
+    echo "    - class ModelNew(nn.Module): Triton-accelerated implementation"
+    echo ""
+    echo "Logs:"
+    echo "  Optimization history is saved to: <target>_history.log"
+    echo "  This log contains all attempted optimizations for reference"
+    exit 0
+fi
+
+# Validate required arguments
+if [ -z "$SRC_FILE" ]; then
+    echo "Error: --src is required"
+    echo "Usage: kernel-optimize --src <source.py> [--target <output.py>] [--goal <speedup>]"
+    exit 1
+fi
+
+# Check if LLM_GATEWAY_KEY is set
+if [ -z "$LLM_GATEWAY_KEY" ]; then
+    echo "Error: LLM_GATEWAY_KEY environment variable is not set"
+    echo "Please set it with: export LLM_GATEWAY_KEY=your-api-key"
+    exit 1
+fi
+
+# Check if source file exists
+if [ ! -f "$SRC_FILE" ]; then
+    echo "Error: Source file '$SRC_FILE' not found"
+    exit 1
+fi
+
+# Get absolute paths
+SRC_PATH=$(realpath "$SRC_FILE")
+SRC_DIR=$(dirname "$SRC_PATH")
+SRC_BASENAME=$(basename "$SRC_FILE" .py)
+
+# Default target file if not specified: src_opt.py
+if [ -z "$TARGET_FILE" ]; then
+    TARGET_FILE="${SRC_DIR}/${SRC_BASENAME}_opt.py"
+fi
+
+TARGET_DIR=$(dirname "$TARGET_FILE")
+TARGET_NAME=$(basename "$TARGET_FILE")
+
+# Create target directory if it doesn't exist
+if [ ! -d "$TARGET_DIR" ] && [ "$TARGET_DIR" != "." ]; then
+    mkdir -p "$TARGET_DIR"
+fi
+
+TARGET_PATH=$(realpath "$TARGET_DIR")/"$TARGET_NAME"
+WORK_DIR=$(dirname "$SRC_PATH")
+
+# Log file for optimization history
+LOG_FILE="${TARGET_PATH%.py}_history.log"
+
+echo "============================================"
+echo "GPU Kernel Optimization Tool"
+echo "============================================"
+echo "Source file:  $SRC_PATH"
+echo "Target file:  $TARGET_PATH"
+echo "History log:  $LOG_FILE"
+if [ -n "$GOAL_SPEEDUP" ]; then
+    echo "Goal:         ${GOAL_SPEEDUP}x speedup"
+fi
+echo "Working dir:  $WORK_DIR"
+echo "============================================"
+echo ""
+
+# Initialize log file
+echo "# Kernel Optimization History Log" > "$LOG_FILE"
+echo "# Source: $SRC_PATH" >> "$LOG_FILE"
+echo "# Target: $TARGET_PATH" >> "$LOG_FILE"
+echo "# Started: $(date -Iseconds)" >> "$LOG_FILE"
+if [ -n "$GOAL_SPEEDUP" ]; then
+    echo "# Goal: ${GOAL_SPEEDUP}x speedup" >> "$LOG_FILE"
+fi
+echo "# ============================================" >> "$LOG_FILE"
+echo "" >> "$LOG_FILE"
+
+# Create opencode config in the working directory
+OPENCODE_DIR="$WORK_DIR/.opencode"
+mkdir -p "$OPENCODE_DIR/agent"
+
+# Set goal text for agent
+if [ -n "$GOAL_SPEEDUP" ]; then
+    GOAL_TEXT="Achieve ${GOAL_SPEEDUP}x speedup. Stop optimization when this goal is reached."
+    GOAL_SECTION="## Performance Goal
+- Target speedup: ${GOAL_SPEEDUP}x
+- Once you achieve >= ${GOAL_SPEEDUP}x speedup with correct accuracy, STOP optimization
+- If after multiple attempts you cannot reach the goal, save your BEST result"
+else
+    GOAL_TEXT="Optimize for best possible speedup."
+    GOAL_SECTION="## Performance Goal
+- Optimize for best possible speedup
+- Keep iterating until performance plateaus"
+fi
+
+# Create agent config with all variables expanded
+cat > "$OPENCODE_DIR/agent/kernel-dev.md" << EOF
+---
+model: amd-anthropic/claude-opus-4-5
+temperature: 0.3
+steps: 50
+---
+
+# GPU Kernel Development Expert
+
+You are a professional GPU Kernel development expert, specializing in accelerating PyTorch operators using Triton.
+
+## Core Objectives
+
+1. **Functional Correctness**: ModelNew output must match Model output (fp16: rel error < 1e-2, fp32: < 1e-5)
+2. **Performance Optimization**: ${GOAL_TEXT}
+3. **Code Quality**: Readable and maintainable Triton Kernel code
+
+${GOAL_SECTION}
+
+## CRITICAL: Track Best Result
+
+You MUST track your best result across all optimization attempts:
+- After each successful test, record the speedup
+- Keep track of the BEST speedup achieved and its corresponding code
+- At the end, write the BEST performing code to target (not the last attempt)
+- Log all attempts to the history log file
+
+## Workflow
+
+1. Read and analyze the source file
+2. Design optimized Triton kernel
+3. Write implementation to the target file
+4. Test accuracy and performance
+5. **Log the result** to history file: \`${LOG_FILE}\`
+6. Check if this is the best result so far - if yes, remember this code
+7. If goal not met, iterate with different optimizations
+8. At the end, write the BEST code to target file
+
+## Validation Test Script
+
+IMPORTANT: Use get_init_inputs() if it exists to initialize Model and ModelNew!
+
+\`\`\`python
+import torch
+import time
+
+SRC = '${SRC_PATH}'
+TGT = '${TARGET_PATH}'
+
+exec(open(SRC).read())
+exec(open(TGT).read())
+
+# Check if get_init_inputs exists for Model initialization
+try:
+    init_inputs = get_init_inputs()
+except:
+    init_inputs = []
+
+# Initialize models with init_inputs if provided
+if init_inputs:
+    model_ref = Model(*init_inputs).cuda().eval()
+    model_new = ModelNew(*init_inputs).cuda().eval()
+else:
+    model_ref = Model().cuda().eval()
+    model_new = ModelNew().cuda().eval()
+
+# Get forward inputs
+inputs = [x.cuda() if hasattr(x, 'cuda') else x for x in get_inputs()]
+
+with torch.no_grad():
+    out_ref = model_ref(*inputs)
+    out_new = model_new(*inputs)
+
+rtol, atol = (1e-2, 1e-3) if out_ref.dtype == torch.float16 else (1e-5, 1e-6)
+max_diff = (out_ref - out_new).abs().max().item()
+rel_diff = ((out_ref - out_new).abs() / (out_ref.abs() + 1e-8)).max().item()
+is_close = torch.allclose(out_ref, out_new, rtol=rtol, atol=atol)
+
+print(f'=== Accuracy ===')
+print(f'Max abs error: {max_diff:.2e}, Max rel error: {rel_diff:.2e}')
+print(f'Accuracy: {"PASSED" if is_close else "FAILED"}')
+
+if not is_close:
+    print('ERROR: Accuracy test failed!')
+    exit(1)
+
+# Benchmark
+for _ in range(10): model_ref(*inputs); model_new(*inputs)
+torch.cuda.synchronize()
+
+N = 100
+torch.cuda.synchronize(); t0 = time.perf_counter()
+for _ in range(N): model_ref(*inputs)
+torch.cuda.synchronize(); t_ref = (time.perf_counter() - t0) / N * 1000
+
+torch.cuda.synchronize(); t0 = time.perf_counter()
+for _ in range(N): model_new(*inputs)
+torch.cuda.synchronize(); t_new = (time.perf_counter() - t0) / N * 1000
+
+speedup = t_ref / t_new
+print(f'=== Performance ===')
+print(f'PyTorch (ref): {t_ref:.4f} ms')
+print(f'Triton (opt):  {t_new:.4f} ms')
+print(f'Speedup: {speedup:.2f}x')
+\`\`\`
+
+## Logging Results
+
+After EVERY test, append results to the history log:
+
+\`\`\`bash
+echo "## Attempt N - \$(date -Iseconds)" >> ${LOG_FILE}
+echo "Speedup: X.XXx" >> ${LOG_FILE}
+echo "Ref time: X.XX ms" >> ${LOG_FILE}
+echo "Opt time: X.XX ms" >> ${LOG_FILE}
+echo "Optimization: <brief description of what you tried>" >> ${LOG_FILE}
+echo "" >> ${LOG_FILE}
+\`\`\`
+
+## Target File Header Format
+
+The target file MUST have this header format:
+
+\`\`\`python
+# ============================================
+# Kernel Optimization Result
+# ============================================
+# Source: ${SRC_PATH}
+# Speedup: X.XXx
+# Ref time: X.XXXX ms (PyTorch)
+# Opt time: X.XXXX ms (Triton)
+# ============================================
+# Optimization notes:
+# - Key optimization 1
+# - Key optimization 2
+# - ...
+# ============================================
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+...
+\`\`\`
+
+## Triton Tips (AMD GPU)
+- BLOCK_SIZE: multiples of 64 (wave size)
+- num_warps: 2-8 based on block size
+- Use tl.load with mask for boundaries
+- fp16->fp32 for intermediate calculations to avoid precision issues
+
+## CRITICAL INSTRUCTIONS
+- Source file: ${SRC_PATH}
+- Target file: ${TARGET_PATH}
+- History log: ${LOG_FILE}
+- ALWAYS write code to ${TARGET_PATH}, never to any other file
+- ALWAYS log each attempt to ${LOG_FILE}
+- ALWAYS track the BEST result and write it to target at the end
+- Use get_init_inputs() for Model/ModelNew initialization if it exists in source
+- ModelNew must accept same __init__ parameters as Model
+EOF
+
+# Create opencode.jsonc config
+cat > "$OPENCODE_DIR/opencode.jsonc" << EOF
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "model": "amd-anthropic/claude-opus-4-5",
+  "default_agent": "kernel-dev",
+  "provider": {
+    "amd-anthropic": {
+      "options": {
+        "timeout": 600000
+      }
+    }
+  },
+  "permission": {
+    "bash": "allow",
+    "edit": "allow",
+    "read": "allow",
+    "write": "allow",
+    "external_directory": "allow"
+  }
+}
+EOF
+
+# Create the prompt with goal information
+if [ -n "$GOAL_SPEEDUP" ]; then
+    GOAL_PROMPT="
+## Performance Goal
+- **Target**: ${GOAL_SPEEDUP}x speedup
+- Stop optimization when goal is reached (with correct accuracy)
+- If goal cannot be reached, save BEST result achieved"
+else
+    GOAL_PROMPT="
+## Performance Goal
+- Optimize for best possible speedup
+- Keep iterating until performance plateaus"
+fi
+
+PROMPT="# GPU Kernel Optimization Task
+
+## Files
+- **Source**: \`$SRC_PATH\` (PyTorch implementation to optimize)
+- **Target**: \`$TARGET_PATH\` (Write your Triton implementation HERE)
+- **History Log**: \`$LOG_FILE\` (Log all attempts here)
+$GOAL_PROMPT
+
+## Task
+1. Read and understand the PyTorch implementation in the source file
+2. Check if get_init_inputs() exists - use it for Model/ModelNew initialization
+3. Implement an optimized Triton kernel
+4. Write the complete implementation to the TARGET file: \`$TARGET_PATH\`
+5. Test accuracy and performance
+6. **Log the result** to: \`$LOG_FILE\`
+7. Track the BEST speedup achieved across all attempts
+8. Iterate until goal is achieved or performance plateaus
+9. **IMPORTANT**: At the end, ensure the TARGET file contains the BEST performing code
+
+## Target File Header Requirements
+The target file MUST include this header with actual measured values:
+\`\`\`
+# ============================================
+# Kernel Optimization Result
+# ============================================
+# Source: $SRC_PATH
+# Speedup: X.XXx
+# Ref time: X.XXXX ms (PyTorch)
+# Opt time: X.XXXX ms (Triton)
+# ============================================
+# Optimization notes:
+# - <key optimization techniques used>
+# ============================================
+\`\`\`
+
+## IMPORTANT
+- You MUST write your implementation to: \`$TARGET_PATH\`
+- You MUST log each attempt to: \`$LOG_FILE\`
+- You MUST track the BEST result and ensure it's saved to target
+- Use get_init_inputs() for Model initialization if it exists in source
+- ModelNew must accept same __init__ parameters as Model
+
+Start by reading the source file."
+
+# Run opencode from the working directory
+cd "$WORK_DIR"
+
+# Clean up config on exit
+cleanup() {
+    rm -rf "$OPENCODE_DIR"
+    echo ""
+    echo "============================================"
+    echo "Optimization Complete"
+    echo "============================================"
+    echo "Target file: $TARGET_PATH"
+    echo "History log: $LOG_FILE"
+    echo "============================================"
+}
+trap cleanup EXIT
+
+exec opencode run "$PROMPT"

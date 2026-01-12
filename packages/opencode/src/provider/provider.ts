@@ -438,6 +438,39 @@ export namespace Provider {
         },
       }
     },
+    "amd-anthropic": async () => {
+      const gatewayKey = Env.get("LLM_GATEWAY_KEY")
+      if (!gatewayKey) return { autoload: false }
+      return {
+        autoload: true,
+        options: {
+          baseURL: "https://llm-api.amd.com/Anthropic/v1",
+          apiKey: "dummy",
+          headers: {
+            "Ocp-Apim-Subscription-Key": gatewayKey,
+            "anthropic-beta":
+              "claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14",
+          },
+        },
+      }
+    },
+    "amd-openai": async () => {
+      const gatewayKey = Env.get("LLM_GATEWAY_KEY")
+      if (!gatewayKey) return { autoload: false }
+      return {
+        autoload: true,
+        async getModel(sdk: any, modelID: string, _options?: Record<string, any>) {
+          return sdk.responses(modelID)
+        },
+        options: {
+          baseURL: "https://llm-api.amd.com/OpenAI/v1",
+          apiKey: "dummy",
+          headers: {
+            "Ocp-Apim-Subscription-Key": gatewayKey,
+          },
+        },
+      }
+    },
   }
 
   export const Model = z
@@ -638,6 +671,45 @@ export namespace Provider {
         models: mapValues(githubCopilot.models, (model) => ({
           ...model,
           providerID: "github-copilot-enterprise",
+        })),
+      }
+    }
+
+    // Add AMD Gateway providers that proxy Anthropic and OpenAI APIs
+    if (database["anthropic"]) {
+      const anthropic = database["anthropic"]
+      database["amd-anthropic"] = {
+        ...anthropic,
+        id: "amd-anthropic",
+        name: "AMD Gateway (Anthropic)",
+        env: ["LLM_GATEWAY_KEY"],
+        models: mapValues(anthropic.models, (model) => ({
+          ...model,
+          providerID: "amd-anthropic",
+          api: {
+            ...model.api,
+            url: "https://llm-api.amd.com/Anthropic/v1",
+            npm: "@ai-sdk/anthropic",
+          },
+        })),
+      }
+    }
+
+    if (database["openai"]) {
+      const openai = database["openai"]
+      database["amd-openai"] = {
+        ...openai,
+        id: "amd-openai",
+        name: "AMD Gateway (OpenAI)",
+        env: ["LLM_GATEWAY_KEY"],
+        models: mapValues(openai.models, (model) => ({
+          ...model,
+          providerID: "amd-openai",
+          api: {
+            ...model.api,
+            url: "https://llm-api.amd.com/OpenAI/v1",
+            npm: "@ai-sdk/openai",
+          },
         })),
       }
     }
