@@ -150,13 +150,6 @@ for (const item of targets) {
 
   await $`rm -rf ./dist/${name}/bin/tui`
   
-  // Copy kernel-optimize tool
-  const kernelOptimizeSrc = path.resolve(dir, "src/kernel-dev/kernel-optimize")
-  if (fs.existsSync(kernelOptimizeSrc)) {
-    await $`cp ${kernelOptimizeSrc} dist/${name}/bin/kernel-optimize`
-    await $`chmod +x dist/${name}/bin/kernel-optimize`
-  }
-  
   await Bun.file(`dist/${name}/package.json`).write(
     JSON.stringify(
       {
