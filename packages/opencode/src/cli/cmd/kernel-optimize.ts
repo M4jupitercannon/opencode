@@ -220,16 +220,29 @@ The target file MUST include this header with actual measured values:
 # ============================================
 \`\`\`
 
-## Logging Results
-After EVERY test, append results to the history log:
-\`\`\`bash
-echo "## Attempt N - $(date -Iseconds)" >> ${logFile}
-echo "Speedup: X.XXx" >> ${logFile}
-echo "Ref time: X.XX ms" >> ${logFile}
-echo "Opt time: X.XX ms" >> ${logFile}
-echo "Optimization: <brief description>" >> ${logFile}
-echo "" >> ${logFile}
+## Logging Results (WITH CODE SNAPSHOT!)
+After EVERY successful test, append results AND full code to the history log:
+
+\`\`\`python
+# After benchmarking, append to log with CODE SNAPSHOT
+log_entry = f'''
+## Attempt N - {time.strftime('%Y-%m-%dT%H:%M:%S%z')}
+Speedup: {speedup:.2f}x
+Ref time: {t_ref:.4f} ms
+Opt time: {t_new:.4f} ms
+Optimization: <brief description>
+
+### Code Snapshot (for recovery)
+\`\`\`python
+{open('${targetPath}').read()}
 \`\`\`
+
+'''
+with open('${logFile}', 'a') as f:
+    f.write(log_entry)
+\`\`\`
+
+**CRITICAL**: The code snapshot allows recovery of the best result if tracking fails!
 
 ## Triton Tips (AMD GPU)
 - BLOCK_SIZE: multiples of 64 (wave size)
@@ -345,19 +358,31 @@ ${goalSection}
 You MUST maintain a "best result" tracker throughout optimization:
 
 1. **Initialize**: best_speedup = 0, best_code = None
-2. **After each test**: 
-   - If speedup > best_speedup: save current code as best_code, update best_speedup
-   - Log attempt to history file with speedup value
+2. **After each SUCCESSFUL test**: 
+   - **SAVE CODE SNAPSHOT** to history log (allows recovery!)
+   - If speedup > best_speedup: copy target file content to best_code, update best_speedup
+   - Log attempt with speedup AND full code to history file
 3. **At the end**: 
    - Write best_code (not last code!) to target file
    - Update header with best_speedup value
-   - Add "=== BEST RESULT ===" section to history log
+   - Mark "=== BEST RESULT ===" in history log
 
-**IMPORTANT**: The measurement now uses median of 5 rounds for stability.
-Do NOT save the last attempt - save the attempt with HIGHEST speedup!
+**CODE SNAPSHOT FORMAT** (append to history log after each test):
+\`\`\`
+## Attempt N - <timestamp>
+Speedup: X.XXx
+Ref time: X.XX ms
+Opt time: X.XX ms
 
-Example: If you get 2.67x on attempt 6, then 2.62x on attempt 7,
-the target file MUST contain the code from attempt 6 (2.67x).
+### Code Snapshot
+\\\`\\\`\\\`python
+<full target file content>
+\\\`\\\`\\\`
+\`\`\`
+
+**WHY**: Even if you lose track, we can recover best code from history!
+
+Example: If Attempt 6 = 2.67x and Attempt 7 = 2.62x, target must have Attempt 6 code.
 
 - **VERIFY: ModelNew uses ONLY Triton kernels, NO torch operators!**
 `
