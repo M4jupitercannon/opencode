@@ -113,11 +113,16 @@ ${goalSection}
 2. Check if get_init_inputs() exists - use it for Model/ModelNew initialization
 3. Implement an optimized Triton kernel
 4. Write the complete implementation to the TARGET file: \`${targetPath}\`
-5. Test accuracy and performance
+5. Test accuracy and performance (uses median of 5 rounds for stable measurement)
 6. **Log the result** to: \`${logFile}\`
-7. Track the BEST speedup achieved across all attempts
+7. **Track BEST speedup**: If current > best, SAVE current code and update best
 8. Iterate until goal is achieved or performance plateaus
-9. **IMPORTANT**: At the end, ensure the TARGET file contains the BEST performing code
+9. **CRITICAL**: At the end, write the code with HIGHEST speedup to target (NOT the last attempt!)
+
+**Best Result Tracking**:
+- Maintain: best_speedup variable and best_code snapshot
+- After each test: if speedup > best_speedup, save code to best_code
+- Final step: write best_code to target file with correct speedup in header
 
 ## Validation Test Script
 
@@ -167,23 +172,35 @@ if not is_close:
     print('ERROR: Accuracy test failed!')
     exit(1)
 
-# Benchmark
-for _ in range(10): model_ref(*inputs); model_new(*inputs)
+# Benchmark with multiple rounds for stable measurement
+import statistics
+
+# Warmup
+for _ in range(20): model_ref(*inputs); model_new(*inputs)
 torch.cuda.synchronize()
 
-N = 100
-torch.cuda.synchronize(); t0 = time.perf_counter()
-for _ in range(N): model_ref(*inputs)
-torch.cuda.synchronize(); t_ref = (time.perf_counter() - t0) / N * 1000
+# Run 5 rounds, take median for stability
+NUM_ROUNDS = 5
+N_PER_ROUND = 100
+ref_times = []
+new_times = []
 
-torch.cuda.synchronize(); t0 = time.perf_counter()
-for _ in range(N): model_new(*inputs)
-torch.cuda.synchronize(); t_new = (time.perf_counter() - t0) / N * 1000
+for round_idx in range(NUM_ROUNDS):
+    torch.cuda.synchronize(); t0 = time.perf_counter()
+    for _ in range(N_PER_ROUND): model_ref(*inputs)
+    torch.cuda.synchronize(); ref_times.append((time.perf_counter() - t0) / N_PER_ROUND * 1000)
+    
+    torch.cuda.synchronize(); t0 = time.perf_counter()
+    for _ in range(N_PER_ROUND): model_new(*inputs)
+    torch.cuda.synchronize(); new_times.append((time.perf_counter() - t0) / N_PER_ROUND * 1000)
 
+t_ref = statistics.median(ref_times)
+t_new = statistics.median(new_times)
 speedup = t_ref / t_new
-print(f'=== Performance ===')
-print(f'PyTorch (ref): {t_ref:.4f} ms')
-print(f'Triton (opt):  {t_new:.4f} ms')
+
+print(f'=== Performance (median of {NUM_ROUNDS} rounds) ===')
+print(f'PyTorch (ref): {t_ref:.4f} ms (std: {statistics.stdev(ref_times):.4f})')
+print(f'Triton (opt):  {t_new:.4f} ms (std: {statistics.stdev(new_times):.4f})')
 print(f'Speedup: {speedup:.2f}x')
 \`\`\`
 
@@ -324,10 +341,24 @@ ${goalSection}
   - Indexing and slicing
 
 ## CRITICAL: Track Best Result
-- After each successful test, record the speedup
-- Keep track of the BEST speedup achieved
-- At the end, write the BEST performing code to target
-- Log all attempts to the history log file
+
+You MUST maintain a "best result" tracker throughout optimization:
+
+1. **Initialize**: best_speedup = 0, best_code = None
+2. **After each test**: 
+   - If speedup > best_speedup: save current code as best_code, update best_speedup
+   - Log attempt to history file with speedup value
+3. **At the end**: 
+   - Write best_code (not last code!) to target file
+   - Update header with best_speedup value
+   - Add "=== BEST RESULT ===" section to history log
+
+**IMPORTANT**: The measurement now uses median of 5 rounds for stability.
+Do NOT save the last attempt - save the attempt with HIGHEST speedup!
+
+Example: If you get 2.67x on attempt 6, then 2.62x on attempt 7,
+the target file MUST contain the code from attempt 6 (2.67x).
+
 - **VERIFY: ModelNew uses ONLY Triton kernels, NO torch operators!**
 `
     fs.writeFileSync(path.join(agentDir, "kernel-dev.md"), agentConfig)
