@@ -40,6 +40,40 @@ export const KernelOptimizeCommand = cmd({
       process.exit(1)
     }
 
+    // Check source file contains Model class and get_inputs()
+    const srcContent = fs.readFileSync(srcFile, "utf-8")
+    const hasModel = srcContent.includes("class Model(") || srcContent.includes("class Model:")
+    const hasModelNew = srcContent.includes("class ModelNew(") || srcContent.includes("class ModelNew:")
+    const hasGetInputs = srcContent.includes("def get_inputs")
+
+    if (!hasModel && hasModelNew) {
+      // User passed an _opt.py file as source
+      UI.error(`Source file contains 'ModelNew' but not 'Model'`)
+      UI.println("")
+      UI.println("The --src file must contain 'class Model' as the accuracy reference.")
+      UI.println("")
+      UI.println("Usage options:")
+      UI.println("  1. torch2triton: opencode kernel-optimize --src original.py")
+      UI.println("  2. triton2triton: opencode kernel-optimize --src optimized.py")
+      UI.println("     (where optimized.py has 'class Model' using Triton)")
+      UI.println("  3. Continue from target: opencode kernel-optimize --src original.py --target optimized.py")
+      UI.println("")
+      UI.println("If you want to continue optimizing, rename 'ModelNew' to 'Model' in your source,")
+      UI.println("or use option 3 above.")
+      process.exit(1)
+    }
+    if (!hasModel) {
+      UI.error(`Source file must contain 'class Model' (reference implementation)`)
+      UI.println("")
+      UI.println("The Model class can use torch operators OR triton kernels.")
+      UI.println("It serves as the accuracy baseline for ModelNew.")
+      process.exit(1)
+    }
+    if (!hasGetInputs) {
+      UI.error(`Source file must contain 'def get_inputs()' function`)
+      process.exit(1)
+    }
+
     // Get absolute paths
     const srcPath = path.resolve(srcFile)
     const srcDir = path.dirname(srcPath)
@@ -98,21 +132,45 @@ ${goal ? `# Goal: ${goal}x speedup` : ""}
 - Optimize for best possible speedup
 - Keep iterating until performance plateaus`
 
+    // Check if target already exists (continue mode)
+    const targetExists = fs.existsSync(targetPath)
+    const continueSection = targetExists
+      ? `
+## CONTINUE MODE
+The target file already exists! This means you should:
+1. Read the EXISTING target file first: \`${targetPath}\`
+2. Use it as your starting point for further optimization
+3. Try to improve upon the existing implementation
+`
+      : ""
+
+    // Check if source already uses triton (triton2triton mode)
+    const srcUsesTriton = srcContent.includes("@triton.jit") || srcContent.includes("import triton")
+
     // Build the prompt
     const prompt = `# GPU Kernel Optimization Task
 
 ## Files
-- **Source**: \`${srcPath}\` (PyTorch implementation to optimize)
-- **Target**: \`${targetPath}\` (Write your Triton implementation HERE)
+- **Source**: \`${srcPath}\` (Reference implementation - contains Model class and get_inputs())
+- **Target**: \`${targetPath}\` (Optimized implementation - contains ModelNew class)
 - **History Log**: \`${logFile}\` (Log all attempts here)
 
+## Mode: ${srcUsesTriton ? "Triton-to-Triton (continue optimizing existing Triton)" : "Torch-to-Triton (convert PyTorch to Triton)"}
+${targetExists ? "**CONTINUE MODE**: Target file exists, use it as starting point!" : ""}
+
+**IMPORTANT**: 
+- Source file provides \`Model\` class + \`get_inputs()\` as ACCURACY BASELINE
+- Target file provides \`ModelNew\` class (your optimized implementation)
+- Model and ModelNew must produce identical outputs within tolerance
+
 ${goalSection}
+${continueSection}
 
 ## Task
-1. Read and understand the PyTorch implementation in the source file
-2. Check if get_init_inputs() exists - use it for Model/ModelNew initialization
-3. Implement an optimized Triton kernel
-4. Write the complete implementation to the TARGET file: \`${targetPath}\`
+1. Read the source file to understand the PyTorch implementation (Model class)
+2. ${targetExists ? "Read the EXISTING target file as your starting point" : "Implement an optimized Triton kernel"}
+3. Check if get_init_inputs() exists - use it for Model/ModelNew initialization
+4. Write the implementation to the TARGET file: \`${targetPath}\`
 5. Test accuracy and performance (uses median of 5 rounds for stable measurement)
 6. **Log the result** to: \`${logFile}\`
 7. **Track BEST speedup**: If current > best, SAVE current code and update best
