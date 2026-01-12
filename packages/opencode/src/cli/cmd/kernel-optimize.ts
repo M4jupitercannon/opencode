@@ -5,7 +5,6 @@ import { createOpencodeClient } from "@opencode-ai/sdk"
 import * as fs from "fs"
 import * as path from "path"
 import { UI } from "../ui"
-import { Env } from "../../env"
 
 export const KernelOptimizeCommand = cmd({
   command: "kernel-optimize",
@@ -26,8 +25,8 @@ export const KernelOptimizeCommand = cmd({
         describe: "target speedup ratio (e.g., 2.0 for 2x speedup)",
       }),
   async handler(args) {
-    // Check if LLM_GATEWAY_KEY is set
-    const gatewayKey = Env.get("LLM_GATEWAY_KEY")
+    // Check if LLM_GATEWAY_KEY is set (use process.env directly, not Env.get which requires bootstrap context)
+    const gatewayKey = process.env.LLM_GATEWAY_KEY
     if (!gatewayKey) {
       UI.error("LLM_GATEWAY_KEY environment variable is not set")
       UI.println("Please set it with: export LLM_GATEWAY_KEY=your-api-key")
@@ -221,6 +220,50 @@ echo "" >> ${logFile}
 - Use tl.load with mask for boundaries
 - fp16->fp32 for intermediate calculations
 
+## STRICT KERNEL REQUIREMENTS
+
+### Source File (Model)
+- Can use any operators: torch native operators, triton kernels, or custom CUDA kernels
+- This is the REFERENCE implementation - do NOT modify it
+
+### Target File (ModelNew)
+- **MUST use Triton kernels for ALL compute operations**
+- **FORBIDDEN**: Direct calls to torch operators like:
+  - torch.matmul, torch.mm, torch.bmm
+  - torch.add, torch.mul, torch.sub, torch.div
+  - torch.relu, torch.sigmoid, torch.tanh, torch.gelu, torch.silu
+  - torch.softmax, torch.layer_norm, torch.batch_norm
+  - torch.conv1d, torch.conv2d, torch.conv3d
+  - F.linear, F.relu, F.softmax, etc.
+  - Any torch.nn.functional operations
+- **ALLOWED** in ModelNew:
+  - Triton kernels (@triton.jit decorated functions)
+  - Data movement: .view(), .reshape(), .contiguous(), .to(), .cuda()
+  - Shape operations: .size(), .shape, .stride()
+  - Memory allocation: torch.empty(), torch.zeros() (for output buffers only)
+  - Indexing and slicing
+
+### Example - WRONG (uses torch.matmul):
+\`\`\`python
+class ModelNew(nn.Module):
+    def forward(self, a, b):
+        return torch.matmul(a, b)  # FORBIDDEN!
+\`\`\`
+
+### Example - CORRECT (uses Triton kernel):
+\`\`\`python
+@triton.jit
+def matmul_kernel(a_ptr, b_ptr, c_ptr, ...):
+    # Triton implementation
+    ...
+
+class ModelNew(nn.Module):
+    def forward(self, a, b):
+        c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+        matmul_kernel[grid](a, b, c, ...)  # Use Triton kernel!
+        return c
+\`\`\`
+
 ## CRITICAL INSTRUCTIONS
 - Source file: ${srcPath}
 - Target file: ${targetPath}
@@ -230,6 +273,7 @@ echo "" >> ${logFile}
 - ALWAYS track the BEST result and ensure it's saved to target
 - Use get_init_inputs() for Model/ModelNew initialization if it exists
 - ModelNew must accept same __init__ parameters as Model
+- **ModelNew MUST use Triton kernels - NO torch operators for compute!**
 
 Start by reading the source file.`
 
@@ -257,11 +301,34 @@ You are a professional GPU Kernel development expert, specializing in accelerati
 
 ${goalSection}
 
+## STRICT KERNEL REQUIREMENTS
+
+### Source File Rules
+- Source file can use ANY operators (torch, triton, CUDA)
+- This is the REFERENCE - do NOT modify it
+
+### Target File Rules (ModelNew)
+- **MUST use @triton.jit decorated Triton kernels for ALL compute**
+- **FORBIDDEN in ModelNew**:
+  - torch.matmul, torch.mm, torch.bmm, torch.addmm
+  - torch.add, torch.mul, torch.sub, torch.div (element-wise)
+  - torch.relu, torch.sigmoid, torch.tanh, torch.gelu, torch.silu
+  - torch.softmax, torch.layer_norm, torch.batch_norm
+  - torch.conv1d, torch.conv2d, torch.conv3d
+  - torch.nn.functional.* compute operations
+  - Any native torch compute operators
+- **ALLOWED in ModelNew**:
+  - Triton kernels (@triton.jit)
+  - Shape/memory: .view(), .reshape(), .contiguous(), .to()
+  - Allocation: torch.empty(), torch.zeros() for outputs
+  - Indexing and slicing
+
 ## CRITICAL: Track Best Result
 - After each successful test, record the speedup
 - Keep track of the BEST speedup achieved
 - At the end, write the BEST performing code to target
 - Log all attempts to the history log file
+- **VERIFY: ModelNew uses ONLY Triton kernels, NO torch operators!**
 `
     fs.writeFileSync(path.join(agentDir, "kernel-dev.md"), agentConfig)
 
