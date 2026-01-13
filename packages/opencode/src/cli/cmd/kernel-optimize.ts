@@ -519,53 +519,93 @@ The target file MUST include this header (finalize script updates values):
 7. Repeat 5-6 until goal reached or plateau
 8. **CRITICAL FINAL STEP**: Run \`python .kernel_finalize.py\`
 
-## Triton Optimization Guide (AMD MI300X)
+## Triton Optimization Guide
 
-### Block Sizes & Warps
-- BLOCK_SIZE: multiples of 64 (AMD wave size)
-- Large blocks often better: try 128, 256, even 256x256 for matmul
-- num_warps: 4-8 for large blocks, 2-4 for small blocks
-- num_stages: 2 is usually optimal for AMD, try 1-3
+### STEP 0: Get GPU Information (REQUIRED!)
+Before writing any kernel, run this to get actual GPU architecture:
+\`\`\`bash
+python3 -c "import torch; print(f'GPU: {torch.cuda.get_device_name()}'); print(f'Arch: {torch.cuda.get_device_capability()}')"
+\`\`\`
+This tells you:
+- AMD MI300X/MI355X: Use wave size 64, CDNA3 architecture
+- NVIDIA A100/H100: Use warp size 32, different optimal configs
+Adjust your optimization strategy based on actual hardware!
 
-### Autotune Strategy (CRITICAL!)
-- **Generate 10+ autotune configs** with varying block sizes
-- Include aggressive configs: BLOCK_M=256, BLOCK_N=128, BLOCK_K=64/128
-- Try GROUP_M swizzle: 4, 8, 16 for L2 cache locality
-- Example for matmul:
-  \`\`\`python
-  @triton.autotune(configs=[
-      triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 4}, num_warps=8, num_stages=2),
-      triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 4}, num_warps=8, num_stages=2),
-      triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 4}, num_warps=8, num_stages=2),
-      # ... add more configs with different BLOCK_K, GROUP_M values
-  ], key=['M', 'N', 'K'])
-  \`\`\`
+### STEP 1: Analyze the Problem
+Before optimizing, understand the operation:
+1. **What type of operation?**
+   - Matrix multiplication (GEMM): Focus on tiling, L2 cache reuse
+   - Elementwise: Focus on vectorization, memory bandwidth
+   - Reduction: Focus on parallel reduction, shared memory
+   - Attention: Consider Flash Attention patterns
+   
+2. **What are the tensor shapes?**
+   - Square vs rectangular matrices need different strategies
+   - Small vs large tensors: small may not benefit from complex tiling
+   - Power-of-2 vs arbitrary dimensions affect boundary handling
 
-### Memory Access Optimization
-- **Remove boundary checks** when dimensions are divisible by block sizes
-  - Check if M, N, K are multiples of BLOCK sizes
-  - Use \`tl.load(ptr)\` without mask when safe (10-15% speedup!)
-- **Swizzle pattern** for L2 cache reuse (GROUP_M parameter)
-- Ensure contiguous memory access patterns
-- Transpose handling: use strided access or explicit transpose
+3. **Compute-bound or Memory-bound?**
+   - Compute-bound: Increase arithmetic intensity, use larger tiles
+   - Memory-bound: Optimize memory access patterns, coalescing
 
-### Precision & Accumulation
-- **FP32 accumulation** for numerical stability: \`acc = tl.zeros(..., dtype=tl.float32)\`
-- Cast to output dtype only at the end: \`c = acc.to(tl.float16)\`
-- \`tl.dot(a, b, acc)\` uses acc's dtype for accumulation
+### STEP 2: Autotune Strategy (CRITICAL!)
+Use @triton.autotune to let Triton find optimal configurations:
 
-### Performance Expectations
-- **Know the baseline**: rocBLAS/cuBLAS is highly optimized
-- For standard matmul: ~85-95% of rocBLAS is excellent
-- For fused operations: can exceed rocBLAS (no kernel launch overhead)
-- **Profile first**: identify if kernel is memory-bound or compute-bound
+\`\`\`python
+@triton.autotune(
+    configs=[
+        # Generate configs with VARYING block sizes
+        # Start with powers of 2: 32, 64, 128, 256
+        # Vary num_warps: 2, 4, 8
+        # Vary num_stages: 1, 2, 3, 4
+        triton.Config({'BLOCK_SIZE': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=8, num_stages=2),
+        # ... add 10-20 configs covering the parameter space
+    ],
+    key=['N'],  # Key dimensions that affect optimal config
+)
+\`\`\`
 
-### Debugging Performance
-1. Start with a working kernel (correctness first!)
-2. Run with autotune to find best config
-3. Check if boundary checks can be removed
-4. Experiment with GROUP_M swizzle values
-5. Try different num_stages (1-3)
+**Key Principles:**
+- Generate 10-20 diverse configs, not just 2-3
+- Cover different block sizes (32 to 256)
+- Vary num_warps (2, 4, 8) and num_stages (1, 2, 3, 4)
+- Include both conservative and aggressive configs
+- Let autotune find what works for YOUR specific problem
+
+### STEP 3: Common Optimization Techniques
+
+**Memory Access:**
+- Ensure coalesced memory access (threads access consecutive memory)
+- Use \`tl.load\` with appropriate masks for boundary handling
+- Consider removing masks when dimensions are divisible by block size
+
+**Computation:**
+- Use FP32 accumulation for numerical stability, cast output at the end
+- For matrix ops: \`tl.dot(a, b, acc)\` accumulates in acc's dtype
+- Consider operation fusion to reduce memory traffic
+
+**Cache Optimization:**
+- For 2D operations: consider tile reordering (swizzle patterns)
+- Adjust block sizes to fit in L2 cache when beneficial
+- Use persistent kernels for small, repeated operations
+
+### STEP 4: Iterative Optimization Process
+1. Start with a CORRECT implementation (even if slow)
+2. Run autotune with diverse configs
+3. Analyze which config wins and why
+4. If performance plateaus, try:
+   - Different algorithm approach
+   - Fusing operations
+   - Adjusting for memory vs compute bound
+5. Use profiling tools when needed:
+   \`\`\`bash
+   # PyTorch profiler
+   python -c "import torch; from torch.profiler import profile, ProfilerActivity; ..."
+   # ROCm profiler (if available)
+   rocprof --stats python your_script.py
+   \`\`\`
 
 ## STRICT KERNEL REQUIREMENTS
 
@@ -691,44 +731,41 @@ Just run the test script after each change, and finalize at the end.
 
 - **VERIFY: ModelNew uses ONLY Triton kernels, NO torch operators!**
 
-## Optimization Strategy (Follow This Order!)
+## Optimization Workflow
 
-### Phase 1: Baseline (Get it Working)
-1. Implement correct Triton kernel with standard block sizes (64x64)
-2. Verify correctness first, then measure performance
-3. Use safe boundary checks initially
+### Phase 1: Understand & Baseline
+1. **Get GPU info first**: Run \`python3 -c "import torch; print(torch.cuda.get_device_name())"\`
+2. **Analyze the operation**: What type? What shapes? Compute or memory bound?
+3. Implement a CORRECT baseline kernel with safe boundary checks
+4. Test accuracy before any optimization
 
-### Phase 2: Autotune (Find Best Config)
-1. Add @triton.autotune with 10+ configurations
-2. Include large block sizes: 128x128, 256x128, 128x256, 256x256
-3. Vary GROUP_M for L2 cache swizzle: 4, 8, 16
-4. Test num_stages: 1, 2, 3
-5. num_warps: 4, 8 for large blocks
+### Phase 2: Autotune Exploration
+1. Add @triton.autotune with **10-20 diverse configurations**
+2. Cover the parameter space:
+   - Block sizes: 32, 64, 128, 256 (and combinations for 2D)
+   - num_warps: 2, 4, 8
+   - num_stages: 1, 2, 3, 4
+3. Let autotune find optimal config for YOUR specific problem
+4. Analyze winning config to understand what works
 
-### Phase 3: Remove Overhead
-1. **Check if dimensions are divisible by block sizes**
-2. If yes, REMOVE boundary masks from tl.load/tl.store (big win!)
-3. Remove unnecessary .contiguous() calls
-4. Minimize register pressure
+### Phase 3: Targeted Optimization
+Based on autotune results and problem analysis:
+- **If memory-bound**: Optimize access patterns, coalescing, vectorization
+- **If compute-bound**: Larger tiles, more arithmetic per memory access
+- **If boundaries hurt**: Check if dims are divisible, remove masks if safe
+- **If cache misses**: Try tile reordering, different block shapes
 
-### Phase 4: Advanced (if needed)
-1. Try different K-loop unrolling
-2. Experiment with persistent kernels for small problems
-3. Consider split-K for large K dimension
-4. Use tl.dot with explicit accumulator for precision
+### Phase 4: Advanced Techniques (if needed)
+- Algorithm changes (e.g., Flash Attention for attention)
+- Operation fusion (combine multiple kernels)
+- Persistent kernels for small, repeated operations
+- Split-K parallelism for very large reduction dimensions
 
-### Key Performance Tips (AMD MI300X)
-- Block sizes: 256x128 or 128x256 often optimal for matmul
-- GROUP_M=4 provides good L2 cache reuse
-- num_stages=2, num_warps=8 for large blocks
-- Removing boundary checks can give 10-15% speedup
-- FP32 accumulation with FP16 output is standard practice
-
-### Common Mistakes to Avoid
-- Don't use too many tl.atomic_* operations
-- Don't over-engineer with complex memory layouts
-- Don't forget to test multiple autotune configs
-- Don't keep boundary checks when not needed
+### Key Principles
+- **Correctness first**: A fast wrong answer is useless
+- **Let autotune work**: Don't over-constrain, explore the space
+- **Profile when stuck**: Use torch.profiler or rocprof to find bottlenecks
+- **Understand YOUR problem**: Generic tips may not apply to your specific case
 `
     fs.writeFileSync(path.join(agentDir, "kernel-dev.md"), agentConfig)
 
