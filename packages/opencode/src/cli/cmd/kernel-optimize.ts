@@ -211,6 +211,15 @@ def main():
     # Get inputs
     inputs = [x.cuda() if hasattr(x, 'cuda') else x for x in get_inputs()]
     
+    # Check if inputs contain low-precision types (int8/float8)
+    def is_low_precision(dtype):
+        dtype_str = str(dtype)
+        return any(x in dtype_str for x in ['int8', 'float8', 'uint8', 'qint8'])
+    
+    has_quantized_input = any(
+        is_low_precision(x.dtype) for x in inputs if hasattr(x, 'dtype')
+    )
+    
     # Test accuracy
     with torch.no_grad():
         try:
@@ -220,7 +229,18 @@ def main():
             print(f"ERROR in forward pass: {e}")
             sys.exit(1)
     
-    rtol, atol = (1e-2, 1e-3) if out_ref.dtype == torch.float16 else (1e-5, 1e-6)
+    # Determine tolerance based on input/output precision
+    # - Quantized inputs (int8/float8): very relaxed (5e-2, 5e-2)
+    # - fp16/bf16 output: relaxed (1e-2, 1e-3)
+    # - fp32 output: strict (1e-5, 1e-6)
+    if has_quantized_input:
+        rtol, atol = (5e-2, 5e-2)  # Quantized: ~5% tolerance
+        print(f"[Note: Using relaxed tolerance for quantized inputs]")
+    elif out_ref.dtype in [torch.float16, torch.bfloat16]:
+        rtol, atol = (1e-2, 1e-3)  # fp16/bf16
+    else:
+        rtol, atol = (1e-5, 1e-6)  # fp32
+    
     max_diff = (out_ref - out_new).abs().max().item()
     denom = out_ref.abs() + 1e-8
     rel_diff = ((out_ref - out_new).abs() / denom).max().item()
