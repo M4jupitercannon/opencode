@@ -208,8 +208,54 @@ def main():
         print(f"ERROR initializing models: {e}")
         sys.exit(1)
     
+    # Sync weights from Model to ModelNew (for fair comparison)
+    # This handles cases where ModelNew has trainable parameters (e.g., fused nn.Linear)
+    try:
+        ref_state = model_ref.state_dict()
+        new_state = model_new.state_dict()
+        if ref_state and new_state:
+            # Try to match parameters by name and shape
+            matched = 0
+            for name, param in ref_state.items():
+                if name in new_state and new_state[name].shape == param.shape:
+                    new_state[name].copy_(param)
+                    matched += 1
+                else:
+                    # Try common mappings (linear.weight -> weight, etc.)
+                    for new_name in new_state:
+                        if new_state[new_name].shape == param.shape:
+                            # Check if names are similar (e.g., 'gemm.weight' vs 'weight')
+                            ref_parts = name.split('.')
+                            new_parts = new_name.split('.')
+                            if ref_parts[-1] == new_parts[-1]:  # Same parameter type
+                                new_state[new_name].copy_(param)
+                                matched += 1
+                                break
+            if matched > 0:
+                model_new.load_state_dict(new_state)
+                print(f"[Note: Synced {matched} parameters from Model to ModelNew]")
+    except Exception as e:
+        # Weight sync is optional, continue if it fails
+        pass
+    
     # Get inputs
     inputs = [x.cuda() if hasattr(x, 'cuda') else x for x in get_inputs()]
+    
+    # Auto-convert model dtype to match input dtype (for models with nn.Linear etc.)
+    # Find the primary input dtype (first floating point tensor)
+    input_dtype = None
+    for x in inputs:
+        if hasattr(x, 'dtype') and x.dtype in [torch.float16, torch.bfloat16]:
+            input_dtype = x.dtype
+            break
+    
+    if input_dtype is not None:
+        # Check if model has parameters (nn.Module with layers)
+        if hasattr(model_ref, 'parameters') and any(True for _ in model_ref.parameters()):
+            model_ref = model_ref.to(input_dtype)
+            print(f"[Note: Model converted to {input_dtype} to match input dtype]")
+        if hasattr(model_new, 'parameters') and any(True for _ in model_new.parameters()):
+            model_new = model_new.to(input_dtype)
     
     # Check if inputs contain low-precision types (int8/float8)
     def is_low_precision(dtype):
