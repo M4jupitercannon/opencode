@@ -1,10 +1,11 @@
 import { cmd } from "./cmd"
 import { bootstrap } from "../bootstrap"
 import { Server } from "../../server/server"
-import { createOpencodeClient } from "@opencode-ai/sdk"
+import { createOpencodeClient } from "@opencode-ai/sdk/v2"
 import * as fs from "fs"
 import * as path from "path"
 import { UI } from "../ui"
+import { Provider } from "../../provider/provider"
 
 export const KernelOptimizeCommand = cmd({
   command: "kernel-optimize",
@@ -23,13 +24,25 @@ export const KernelOptimizeCommand = cmd({
       .option("goal", {
         type: "number",
         describe: "target speedup ratio (e.g., 2.0 for 2x speedup)",
+      })
+      .option("model", {
+        type: "string",
+        alias: "m",
+        describe: "model to use (e.g., opencode/glm-4.7-free, amd-anthropic/claude-opus-4-5)",
       }),
   async handler(args) {
-    // Check if LLM_GATEWAY_KEY is set (use process.env directly, not Env.get which requires bootstrap context)
+    const modelArg = args.model as string | undefined
+    
+    // Check if LLM_GATEWAY_KEY is set for amd-anthropic/amd-openai providers
     const gatewayKey = process.env.LLM_GATEWAY_KEY
-    if (!gatewayKey) {
+    const needsGatewayKey = !modelArg || modelArg.startsWith("amd-")
+    if (needsGatewayKey && !gatewayKey) {
       UI.error("LLM_GATEWAY_KEY environment variable is not set")
       UI.println("Please set it with: export LLM_GATEWAY_KEY=your-api-key")
+      UI.println("")
+      UI.println("Or use a free model that doesn't require a key:")
+      UI.println("  opencode kernel-optimize --src xxx.py -m opencode/glm-4.7-free")
+      UI.println("  opencode kernel-optimize --src xxx.py -m opencode/minimax-m2.1-free")
       process.exit(1)
     }
 
@@ -102,6 +115,9 @@ export const KernelOptimizeCommand = cmd({
     UI.println(`History log:  ${logFile}`)
     if (goal) {
       UI.println(`Goal:         ${goal}x speedup`)
+    }
+    if (modelArg) {
+      UI.println(`Model:        ${modelArg}`)
     }
     UI.println(`Working dir:  ${srcDir}`)
     UI.println("============================================")
@@ -864,7 +880,7 @@ Based on autotune results and problem analysis:
       const sdk = createOpencodeClient({ baseUrl: `http://${server.hostname}:${server.port}` })
 
       try {
-        const sessionResult = await sdk.session.create({})
+        const sessionResult = await sdk.session.create()
         const sessionID = sessionResult.data?.id
         if (!sessionID) {
           UI.error("Failed to create session")
@@ -903,11 +919,11 @@ Based on autotune results and problem analysis:
         })()
 
         // Send the prompt
+        const modelParam = modelArg ? Provider.parseModel(modelArg) : undefined
         await sdk.session.prompt({
-          path: { id: sessionID },
-          body: {
-            parts: [{ type: "text", text: prompt }],
-          },
+          sessionID,
+          model: modelParam,
+          parts: [{ type: "text", text: prompt }],
         })
 
         // Wait for completion
