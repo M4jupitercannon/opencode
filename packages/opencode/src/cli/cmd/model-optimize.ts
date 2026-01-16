@@ -31,6 +31,16 @@ export const ModelOptimizeCommand = cmd({
         type: "boolean",
         describe: "skip model download if already exists",
         default: false,
+      })
+      .option("resume", {
+        type: "boolean",
+        describe: "resume from last completed phase in existing project",
+        default: false,
+      })
+      .option("from-phase", {
+        type: "string",
+        alias: "f",
+        describe: "start from specific phase (demo, profile, problems, optimize, integrate, report)",
       }),
   async handler(args) {
     const llmArg = args.llm as string | undefined
@@ -80,6 +90,50 @@ export const ModelOptimizeCommand = cmd({
     }
     Object.values(dirs).forEach((d) => fs.mkdirSync(d, { recursive: true }))
 
+    // Handle resume / from-phase options
+    const resumeMode = args.resume as boolean
+    const fromPhase = args["from-phase"] as string | undefined
+    const progressFile = path.join(outputDir, "progress.json")
+    
+    let existingProgress: any = null
+    let startPhase = "download"
+    
+    if (resumeMode || fromPhase) {
+      // Check for existing progress
+      if (fs.existsSync(progressFile)) {
+        try {
+          existingProgress = JSON.parse(fs.readFileSync(progressFile, "utf-8"))
+          UI.println(UI.Style.TEXT_INFO_BOLD + "Found existing project progress")
+          
+          if (fromPhase) {
+            // Validate phase name
+            const validPhases = ["download", "demo", "compatibility", "profile", "problems", "optimize", "integrate", "report"]
+            if (!validPhases.includes(fromPhase)) {
+              UI.error(`Invalid phase: ${fromPhase}. Valid phases: ${validPhases.join(", ")}`)
+              process.exit(1)
+            }
+            startPhase = fromPhase
+            UI.println(`Starting from phase: ${startPhase}`)
+          } else if (resumeMode && existingProgress.phases_completed) {
+            // Resume from last completed phase
+            const phasesOrder = ["download", "demo", "compatibility", "profile", "problems", "optimize", "integrate", "report"]
+            const completed = existingProgress.phases_completed as string[]
+            for (let i = phasesOrder.length - 1; i >= 0; i--) {
+              if (completed.includes(phasesOrder[i])) {
+                startPhase = phasesOrder[i + 1] || "report"
+                break
+              }
+            }
+            UI.println(`Resuming from phase: ${startPhase}`)
+          }
+        } catch (e) {
+          UI.println(UI.Style.TEXT_WARNING + "Could not parse existing progress.json, starting fresh")
+        }
+      } else {
+        UI.println(UI.Style.TEXT_WARNING + "No existing progress.json found, starting from beginning")
+      }
+    }
+
     // Create config file for the agent
     const configFile = path.join(outputDir, "config.json")
     const config = {
@@ -88,12 +142,13 @@ export const ModelOptimizeCommand = cmd({
       dirs: dirs,
       created: new Date().toISOString(),
       skip_download: args["skip-download"],
+      start_phase: startPhase,
+      resume_mode: resumeMode || !!fromPhase,
     }
     fs.writeFileSync(configFile, JSON.stringify(config, null, 2))
 
-    // Create progress tracker
-    const progressFile = path.join(outputDir, "progress.json")
-    const progress = {
+    // Create or update progress tracker
+    const progress = existingProgress || {
       phase: "init",
       phases_completed: [] as string[],
       current_step: "",
@@ -101,10 +156,12 @@ export const ModelOptimizeCommand = cmd({
       optimizations: [] as { kernel: string; speedup: number }[],
       final_speedup: 0,
     }
-    fs.writeFileSync(progressFile, JSON.stringify(progress, null, 2))
+    if (!existingProgress) {
+      fs.writeFileSync(progressFile, JSON.stringify(progress, null, 2))
+    }
 
     // Create the main prompt for the agent
-    const prompt = buildAgentPrompt(hfModel, modelName, outputDir, dirs, args["skip-download"] as boolean)
+    const prompt = buildAgentPrompt(hfModel, modelName, outputDir, dirs, args["skip-download"] as boolean, startPhase, existingProgress)
 
     // Create temporary .opencode config
     const opencodeDir = path.join(outputDir, ".opencode")
@@ -190,8 +247,16 @@ export const ModelOptimizeCommand = cmd({
           }
         })()
 
-        // Send the prompt (uses model from opencode.jsonc if not specified)
-        const modelParam = llmArg ? Provider.parseModel(llmArg) : undefined
+        // Send the prompt
+        // If using AMD gateway (LLM_GATEWAY_KEY set) and no --llm specified, default to claude-opus-4-5
+        let modelParam
+        if (llmArg) {
+          modelParam = Provider.parseModel(llmArg)
+        } else if (gatewayKey) {
+          // Default to claude-opus-4-5 for AMD gateway
+          modelParam = Provider.parseModel("amd-anthropic/claude-opus-4-5")
+          UI.println(`Using default AMD gateway model: amd-anthropic/claude-opus-4-5`)
+        }
         UI.println(`Sending prompt to LLM...`)
         await sdk.session.prompt({
           sessionID,
@@ -229,14 +294,32 @@ function buildAgentPrompt(
   modelName: string,
   outputDir: string,
   dirs: Record<string, string>,
-  skipDownload: boolean
+  skipDownload: boolean,
+  startPhase: string = "download",
+  existingProgress: any = null
 ): string {
+  // Build resume context if applicable
+  const resumeContext = startPhase !== "download" ? `
+## RESUME MODE ACTIVE
+**Starting from Phase: ${startPhase}**
+${existingProgress ? `
+### Previous Progress
+- Phases completed: ${existingProgress.phases_completed?.join(", ") || "none"}
+- Previous optimizations: ${JSON.stringify(existingProgress.details?.optimization?.kernels_optimized || [], null, 2)}
+` : ""}
+
+**IMPORTANT**: Skip phases before "${startPhase}" - their artifacts already exist.
+Review existing files before proceeding to understand current state.
+
+---
+` : ""
+
   return `# End-to-End Model Optimization Pipeline
 
 ## Target Model
 - **HuggingFace Model**: ${hfModel}
 - **Model Name**: ${modelName}
-
+${resumeContext}
 ## Output Directory Structure
 \`\`\`
 ${outputDir}/
@@ -256,11 +339,11 @@ ${outputDir}/
 
 Update progress.json after completing each phase!
 
-## YOUR TASK: Complete all 7 phases sequentially
+## YOUR TASK: Complete phases starting from "${startPhase}"
 
 ---
 
-# Phase 1: Model Download ${skipDownload ? "(SKIP if exists)" : ""}
+# Phase 1: Model Download ${skipDownload ? "(SKIP if exists)" : ""} ${startPhase !== "download" ? "[SKIP - ALREADY DONE]" : ""}
 
 ## Goal
 Download the HuggingFace model to \`${dirs.model}\`
@@ -279,7 +362,7 @@ from transformers import AutoModel, AutoTokenizer
 
 ---
 
-# Phase 2: Generate Demo Script
+# Phase 2: Generate Demo Script ${startPhase === "download" ? "" : (startPhase === "demo" ? "" : "[SKIP - ALREADY DONE]")}
 
 ## Goal
 Create a working demo script that runs inference on the model.
@@ -351,7 +434,7 @@ python demo.py
 
 ---
 
-# Phase 3: Fix Compatibility Issues
+# Phase 3: Fix Compatibility Issues ${["download", "demo"].includes(startPhase) ? "" : (startPhase === "compatibility" ? "" : "[SKIP - ALREADY DONE]")}
 
 ## Goal
 If demo.py fails, diagnose and fix issues using monkey-patching (NO system library modifications).
@@ -400,7 +483,7 @@ def fixed_rope(x, seq_len):
 
 ---
 
-# Phase 4: Performance Profiling
+# Phase 4: Performance Profiling ${["download", "demo", "compatibility"].includes(startPhase) ? "" : (startPhase === "profile" ? "" : "[SKIP - ALREADY DONE]")}
 
 ## Goal
 Profile the model to identify bottleneck operators/kernels.
@@ -501,10 +584,174 @@ which rocprof && rocprof --stats python ${dirs.demo}/demo.py
 
 ---
 
-# Phase 5: Generate Problem Files for Kernel Optimization
+# Phase 5: Generate Problem Files for Kernel Optimization ${["download", "demo", "compatibility", "profile"].includes(startPhase) ? "" : "[SKIP - ALREADY DONE]"}
 
 ## Goal
 Convert bottleneck operators into Problem files for kernel-optimize.
+**IMPORTANT**: Analyze operators for fusion opportunities BEFORE creating individual problem files.
+
+## STEP 1: Operator Fusion Analysis (CRITICAL)
+
+Before creating individual problem files, analyze the profiling data for **fusable operator patterns**:
+
+### Common Fusion Opportunities in LLMs
+
+| Pattern | Operators to Fuse | Fused Name | Expected Speedup |
+|---------|-------------------|------------|------------------|
+| **ResidualNorm** | add + rmsnorm/layernorm | fused_residual_norm | 1.2-1.5x |
+| **SwiGLU/GeGLU** | silu/gelu + mul | fused_swiglu | 1.3-1.8x |
+| **BiasAdd** | matmul + add (bias) | fused_linear_bias | 1.1-1.3x |
+| **RotaryEmbed** | rope_cos + rope_sin + cat | fused_rope | 1.2-1.5x |
+| **QKV Projection** | 3x linear (q,k,v) | fused_qkv_proj | 1.2-1.4x |
+| **MLP Block** | linear + activation + linear | fused_mlp | 1.3-2.0x |
+
+### Fusion Detection Script: \`${dirs.profile}/analyze_fusion.py\`
+
+\`\`\`python
+"""Analyze operator patterns for fusion opportunities."""
+import json
+
+def analyze_fusion_opportunities(bottlenecks_file):
+    with open(bottlenecks_file) as f:
+        bottlenecks = json.load(f)
+    
+    # Extract operator names and percentages
+    ops = [(b["name"], b["cuda_time_percent"]) for b in bottlenecks]
+    
+    fusion_opportunities = []
+    
+    # Check for residual + norm pattern
+    has_add = any("add" in op[0].lower() for op in ops)
+    has_norm = any("norm" in op[0].lower() or "mean" in op[0].lower() for op in ops)
+    if has_add and has_norm:
+        add_pct = sum(op[1] for op in ops if "add" in op[0].lower())
+        norm_pct = sum(op[1] for op in ops if "norm" in op[0].lower() or "mean" in op[0].lower())
+        fusion_opportunities.append({
+            "name": "fused_residual_rmsnorm",
+            "operators": ["aten::add", "RMSNorm (aten::mean, aten::rsqrt, aten::mul)"],
+            "combined_percent": add_pct + norm_pct,
+            "expected_speedup": "1.3-1.5x",
+            "priority": "HIGH" if add_pct + norm_pct > 10 else "MEDIUM"
+        })
+    
+    # Check for SiLU + mul pattern (SwiGLU)
+    has_silu = any("silu" in op[0].lower() for op in ops)
+    has_mul = any("mul" in op[0].lower() and "norm" not in op[0].lower() for op in ops)
+    if has_silu and has_mul:
+        fusion_opportunities.append({
+            "name": "fused_swiglu",
+            "operators": ["aten::silu", "aten::mul"],
+            "combined_percent": sum(op[1] for op in ops if "silu" in op[0].lower() or ("mul" in op[0].lower() and "norm" not in op[0].lower())),
+            "expected_speedup": "1.3-1.8x",
+            "priority": "MEDIUM"
+        })
+    
+    # Check for consecutive linear layers (QKV projection)
+    mm_count = sum(1 for op in ops if "mm" in op[0].lower() or "linear" in op[0].lower())
+    if mm_count >= 3:
+        fusion_opportunities.append({
+            "name": "fused_qkv_proj",
+            "operators": ["3x aten::mm for Q, K, V"],
+            "combined_percent": sum(op[1] for op in ops if "mm" in op[0].lower()) / 3 * 1.5,
+            "expected_speedup": "1.2-1.4x (batch the projections)",
+            "priority": "LOW"  # rocBLAS already fast
+        })
+    
+    print("\\n=== Fusion Opportunities ===")
+    for f in sorted(fusion_opportunities, key=lambda x: x["combined_percent"], reverse=True):
+        print(f"\\n{f['name']} [{f['priority']}]")
+        print(f"  Operators: {', '.join(f['operators'])}")
+        print(f"  Combined time: {f['combined_percent']:.1f}%")
+        print(f"  Expected speedup: {f['expected_speedup']}")
+    
+    # Save to file
+    with open("${dirs.profile}/fusion_opportunities.json", "w") as f:
+        json.dump(fusion_opportunities, f, indent=2)
+    
+    return fusion_opportunities
+
+if __name__ == "__main__":
+    analyze_fusion_opportunities("${dirs.profile}/bottlenecks.json")
+\`\`\`
+
+### Run Fusion Analysis FIRST
+\`\`\`bash
+cd ${dirs.profile}
+python analyze_fusion.py
+cat fusion_opportunities.json
+\`\`\`
+
+## STEP 2: Create FUSED Problem Files (Priority)
+
+**Create fused kernels BEFORE individual kernels!**
+
+### Example: Fused Residual + RMSNorm
+\`\`\`python
+# problem_fused_residual_rmsnorm.py
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """Fused residual add + RMSNorm for LLM transformer layers."""
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.float16))
+        self.eps = eps
+    
+    def forward(self, hidden_states, residual):
+        # Fused: hidden = RMSNorm(hidden_states + residual)
+        hidden_states = hidden_states + residual
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
+        return self.weight * hidden_states, hidden_states  # Return both normalized and pre-norm for next residual
+
+# Typical shapes for Qwen3-8B
+batch_size = 1
+seq_len = 512
+hidden_size = 4096
+
+def get_inputs():
+    return [
+        torch.randn(batch_size, seq_len, hidden_size, dtype=torch.float16, device='cuda'),
+        torch.randn(batch_size, seq_len, hidden_size, dtype=torch.float16, device='cuda'),
+    ]
+
+def get_init_inputs():
+    return [hidden_size]
+\`\`\`
+
+### Example: Fused SwiGLU
+\`\`\`python
+# problem_fused_swiglu.py
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """Fused SiLU(gate) * up for SwiGLU MLP."""
+    def forward(self, gate, up):
+        # Fused: silu(gate) * up
+        return torch.nn.functional.silu(gate) * up
+
+batch_size = 1
+seq_len = 512
+intermediate_size = 11008  # Qwen3-8B intermediate
+
+def get_inputs():
+    return [
+        torch.randn(batch_size, seq_len, intermediate_size, dtype=torch.float16, device='cuda'),
+        torch.randn(batch_size, seq_len, intermediate_size, dtype=torch.float16, device='cuda'),
+    ]
+
+def get_init_inputs():
+    return []
+\`\`\`
+
+## STEP 3: Create Individual Problem Files (Lower Priority)
+
+Only create individual problem files for operators that:
+1. Cannot be fused with neighbors
+2. Take > 5% of total time individually
+3. Are not already optimized by vendor libraries (e.g., rocBLAS GEMM)
 
 ## Problem File Format
 Each problem file in \`${dirs.problems}/\` must have:
@@ -602,74 +849,141 @@ class Model(nn.Module):
 
 ---
 
-# Phase 6: Run Kernel Optimization
+# Phase 6: Run Kernel Optimization ${["download", "demo", "compatibility", "profile", "problems"].includes(startPhase) ? "" : "[SKIP - ALREADY DONE]"}
 
 ## Goal
 Optimize each bottleneck kernel using kernel-optimize.
 
-## Steps
-For each problem file in \`${dirs.problems}/\`:
+## IMPORTANT: Prioritize Fused Kernels
+Optimize fused kernels FIRST as they provide the highest speedup potential:
 
 \`\`\`bash
 cd ${dirs.problems}
 
-# Run kernel-optimize for each problem
-opencode kernel-optimize --src problem_linear.py --goal 1.5
-opencode kernel-optimize --src problem_attention.py --goal 1.2
-# ... etc
+# 1. FIRST: Optimize fused kernels (highest priority)
+opencode kernel-optimize --src problem_fused_residual_rmsnorm.py --goal 1.5
+opencode kernel-optimize --src problem_fused_swiglu.py --goal 1.5
+
+# 2. THEN: Optimize remaining individual kernels (if not already done)
+opencode kernel-optimize --src problem_rope.py --goal 1.3
+# Skip GEMM/Linear if rocBLAS is already fast
+# Skip simple elementwise ops (add, mul) - fusion handles these
 \`\`\`
+
+## Decision: When to Skip Individual Kernel Optimization
+- **SKIP** if operator is part of a fused kernel you already optimized
+- **SKIP** GEMM/Linear if profiling shows rocBLAS is already near-optimal (speedup < 1.1x)
+- **SKIP** simple elementwise (add, copy) - overhead of custom kernel exceeds benefit
 
 The optimized kernels will be saved as \`problem_<name>_opt.py\`.
 
 ## After Optimization
-1. Copy optimized kernels to \`${dirs.optimized}/\`
+1. Copy **successfully optimized** kernels (speedup > 1.0x) to \`${dirs.optimized}/\`
 2. Record speedup for each kernel in progress.json
-3. Note which kernels failed to optimize
+3. Note which kernels failed or were skipped
 
 ---
 
-# Phase 7: Integration & Final Testing
+# Phase 7: Integration & Final Testing ${["download", "demo", "compatibility", "profile", "problems", "optimize"].includes(startPhase) ? "" : "[SKIP - ALREADY DONE]"}
 
 ## Goal
 Integrate optimized kernels into the model using monkey-patching.
+
+## IMPORTANT: Integration Strategy for Fused Kernels
+
+Fused kernels require careful integration as they replace MULTIPLE operations:
+
+### Fused Residual + RMSNorm Integration Pattern
+\`\`\`python
+# Locate the RMSNorm class in transformers
+# Original pattern in forward():
+#   residual = hidden_states
+#   hidden_states = self.input_layernorm(hidden_states)
+#
+# Replace with fused version:
+#   hidden_states, residual = fused_residual_rmsnorm(hidden_states, residual)
+\`\`\`
 
 ## Create Integration Script: \`${dirs.optimized}/integrate.py\`
 
 \`\`\`python
 """
 Monkey-patch optimized Triton kernels into the model.
+Supports both individual and fused kernels.
 """
 import torch
 import sys
+import os
 
-# Import optimized kernels
-from problem_linear_opt import ModelNew as OptimizedLinear
-from problem_attention_opt import ModelNew as OptimizedAttention
-# ... import other optimized kernels
+# Add paths
+sys.path.insert(0, "${dirs.optimized}")
+sys.path.insert(0, "${dirs.problems}")
 
-# Create instances
-_opt_linear = OptimizedLinear()
-_opt_attention = OptimizedAttention()
+# Import optimized kernels (check which ones exist)
+_optimized_kernels = {}
+
+def try_import(name, module_name):
+    try:
+        mod = __import__(module_name)
+        _optimized_kernels[name] = mod.ModelNew()
+        print(f"Loaded optimized kernel: {name}")
+        return True
+    except ImportError as e:
+        print(f"Skipping {name}: {e}")
+        return False
+
+# Try to import fused kernels first
+try_import("fused_residual_rmsnorm", "problem_fused_residual_rmsnorm_opt")
+try_import("fused_swiglu", "problem_fused_swiglu_opt")
+
+# Then individual kernels
+try_import("rmsnorm", "problem_rmsnorm_opt")
+try_import("rope", "problem_rope_opt")
+
+def patch_rmsnorm_layers(model):
+    """Patch RMSNorm layers with optimized version."""
+    if "rmsnorm" not in _optimized_kernels and "fused_residual_rmsnorm" not in _optimized_kernels:
+        return 0
+    
+    patched = 0
+    opt_kernel = _optimized_kernels.get("rmsnorm")
+    
+    for name, module in model.named_modules():
+        # Match various RMSNorm implementations
+        class_name = module.__class__.__name__
+        if "RMSNorm" in class_name or "Qwen3RMSNorm" in class_name:
+            original_forward = module.forward
+            weight = module.weight
+            eps = getattr(module, 'variance_epsilon', getattr(module, 'eps', 1e-6))
+            
+            def make_opt_forward(w, e):
+                def opt_forward(hidden_states):
+                    return opt_kernel.forward(hidden_states)
+                return opt_forward
+            
+            if opt_kernel:
+                module.forward = make_opt_forward(weight, eps)
+                patched += 1
+    
+    return patched
+
+def patch_rope(model):
+    """Patch RoPE implementation with optimized version."""
+    if "rope" not in _optimized_kernels:
+        return False
+    
+    # Find and patch the rotary embedding function
+    # This varies by model architecture
+    return True
 
 def patch_model(model):
-    """Apply monkey-patches to replace slow operators with optimized versions."""
-    
-    # Example: Replace all Linear layers
-    for name, module in model.named_modules():
-        if isinstance(module, torch.nn.Linear):
-            # Create a patched forward method
-            original_forward = module.forward
-            def make_optimized_forward(mod):
-                def optimized_forward(x):
-                    # Use optimized kernel
-                    weight = mod.weight
-                    if mod.bias is not None:
-                        return _opt_linear.forward(x, weight) + mod.bias
-                    return _opt_linear.forward(x, weight)
-                return optimized_forward
-            module.forward = make_optimized_forward(module)
-    
-    return model
+    """Apply all monkey-patches to the model."""
+    stats = {
+        "rmsnorm_layers": patch_rmsnorm_layers(model),
+        "rope": patch_rope(model),
+    }
+    print(f"Patching complete: {stats}")
+    return model, stats
 \`\`\`
 
 ## Create Test Script: \`${dirs.optimized}/test_integration.py\`
@@ -776,7 +1090,7 @@ if __name__ == "__main__":
 
 ---
 
-# Phase 8: Generate Final Report
+# Phase 8: Generate Final Report ${startPhase === "report" ? "" : (["download", "demo", "compatibility", "profile", "problems", "optimize", "integrate"].includes(startPhase) ? "" : "[SKIP - ALREADY DONE]")}
 
 ## Goal
 Create a comprehensive optimization report.
@@ -874,15 +1188,37 @@ ${outputDir}/
 
 # EXECUTION INSTRUCTIONS
 
+${startPhase === "download" ? `
+## Fresh Start Mode
 1. **Execute phases in order**: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
-2. **Update progress.json after each phase**
-3. **If a phase fails, debug and fix before proceeding**
-4. **For kernel-optimize, use the existing opencode command**
-5. **All monkey patches go in ${dirs.demo}/patches/ or ${dirs.optimized}/**
-6. **NEVER modify system libraries - only use monkey patching**
+2. Begin with Phase 1: Model Download
+` : `
+## Resume Mode Active - Starting from "${startPhase}"
+1. **Skip phases before "${startPhase}"** - their artifacts already exist
+2. **Review existing files first** to understand current state
+3. **Continue from Phase: ${startPhase}**
+
+### Quick Start Checklist
+- [ ] Read existing progress.json
+- [ ] Verify artifacts from previous phases exist
+- [ ] Start working on Phase: ${startPhase}
+`}
+
+## General Rules
+1. **Update progress.json after each phase**
+2. **If a phase fails, debug and fix before proceeding**
+3. **For kernel-optimize, use the existing opencode command** (it inherits LLM_GATEWAY_KEY from the environment)
+4. **All monkey patches go in ${dirs.demo}/patches/ or ${dirs.optimized}/**
+5. **NEVER modify system libraries - only use monkey patching**
+
+## Optimization Priority (Phase 5-6)
+1. **FIRST**: Create and optimize FUSED kernels (residual+norm, swiglu)
+2. **THEN**: Optimize remaining individual kernels
+3. **SKIP**: Operators already optimized by vendor libs (rocBLAS GEMM)
+4. **SKIP**: Simple elementwise ops covered by fused kernels
 
 ## Start Now
-Begin with Phase 1: Model Download
+Begin with Phase: ${startPhase.charAt(0).toUpperCase() + startPhase.slice(1)}
 `
 }
 
