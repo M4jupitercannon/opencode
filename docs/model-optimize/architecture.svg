@@ -1,0 +1,172 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 680" width="900" height="680">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#5d4037"/>
+    </marker>
+  </defs>
+  
+  <!-- Background -->
+  <rect width="900" height="680" fill="#fefefe"/>
+  
+  <!-- Title -->
+  <text x="450" y="30" text-anchor="middle" font-family="Times New Roman, serif" font-size="18" font-weight="bold" fill="#3e2723">
+    Figure 1: model-optimize Pipeline Architecture
+  </text>
+  
+  <!-- Usage Example Box -->
+  <rect x="40" y="50" width="820" height="70" fill="none" stroke="#5d4037" stroke-width="1.5"/>
+  <text x="50" y="70" font-family="Times New Roman, serif" font-size="12" font-weight="bold" fill="#3e2723">Usage Example</text>
+  <text x="50" y="90" font-family="Courier New, monospace" font-size="11" fill="#4e342e">
+    $ export LLM_GATEWAY_KEY=your-api-key
+  </text>
+  <text x="50" y="108" font-family="Courier New, monospace" font-size="11" fill="#4e342e">
+    $ opencode model-optimize -m Qwen/Qwen3-8B -o ./qwen3_opt [--llm opencode/glm-4.7-free] [--skip-download]
+  </text>
+  
+  <!-- Pipeline Phases Section -->
+  <rect x="40" y="135" width="820" height="200" fill="none" stroke="#5d4037" stroke-width="1.5"/>
+  <text x="50" y="155" font-family="Times New Roman, serif" font-size="12" font-weight="bold" fill="#3e2723">Pipeline Phases (Agent-Driven Execution)</text>
+  
+  <!-- Phase boxes - Row 1 -->
+  <rect x="60" y="170" width="170" height="50" fill="#efebe9" stroke="#5d4037" stroke-width="1"/>
+  <text x="145" y="192" text-anchor="middle" font-family="Times New Roman, serif" font-size="11" font-weight="bold" fill="#3e2723">Phase 1: Download</text>
+  <text x="145" y="208" text-anchor="middle" font-family="Times New Roman, serif" font-size="10" fill="#5d4037">HuggingFace Model</text>
+  
+  <rect x="250" y="170" width="170" height="50" fill="#efebe9" stroke="#5d4037" stroke-width="1"/>
+  <text x="335" y="192" text-anchor="middle" font-family="Times New Roman, serif" font-size="11" font-weight="bold" fill="#3e2723">Phase 2: Demo</text>
+  <text x="335" y="208" text-anchor="middle" font-family="Times New Roman, serif" font-size="10" fill="#5d4037">Generate Inference Script</text>
+  
+  <rect x="440" y="170" width="170" height="50" fill="#efebe9" stroke="#5d4037" stroke-width="1"/>
+  <text x="525" y="192" text-anchor="middle" font-family="Times New Roman, serif" font-size="11" font-weight="bold" fill="#3e2723">Phase 3: Compatibility</text>
+  <text x="525" y="208" text-anchor="middle" font-family="Times New Roman, serif" font-size="10" fill="#5d4037">Monkey-Patch Fixes</text>
+  
+  <rect x="630" y="170" width="170" height="50" fill="#efebe9" stroke="#5d4037" stroke-width="1"/>
+  <text x="715" y="192" text-anchor="middle" font-family="Times New Roman, serif" font-size="11" font-weight="bold" fill="#3e2723">Phase 4: Profiling</text>
+  <text x="715" y="208" text-anchor="middle" font-family="Times New Roman, serif" font-size="10" fill="#5d4037">PyTorch Profiler</text>
+  
+  <!-- Arrows Row 1 -->
+  <line x1="230" y1="195" x2="248" y2="195" stroke="#5d4037" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="420" y1="195" x2="438" y2="195" stroke="#5d4037" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="610" y1="195" x2="628" y2="195" stroke="#5d4037" stroke-width="1.5" marker-end="url(#arrow)"/>
+  
+  <!-- Phase boxes - Row 2 -->
+  <rect x="630" y="250" width="170" height="50" fill="#efebe9" stroke="#5d4037" stroke-width="1"/>
+  <text x="715" y="272" text-anchor="middle" font-family="Times New Roman, serif" font-size="11" font-weight="bold" fill="#3e2723">Phase 5: Problems</text>
+  <text x="715" y="288" text-anchor="middle" font-family="Times New Roman, serif" font-size="10" fill="#5d4037">Generate Kernel Files</text>
+  
+  <rect x="440" y="250" width="170" height="50" fill="#a1887f" stroke="#5d4037" stroke-width="1.5"/>
+  <text x="525" y="272" text-anchor="middle" font-family="Times New Roman, serif" font-size="11" font-weight="bold" fill="#fff">Phase 6: Optimization</text>
+  <text x="525" y="288" text-anchor="middle" font-family="Times New Roman, serif" font-size="10" fill="#efebe9">kernel-optimize</text>
+  
+  <rect x="250" y="250" width="170" height="50" fill="#efebe9" stroke="#5d4037" stroke-width="1"/>
+  <text x="335" y="272" text-anchor="middle" font-family="Times New Roman, serif" font-size="11" font-weight="bold" fill="#3e2723">Phase 7: Integration</text>
+  <text x="335" y="288" text-anchor="middle" font-family="Times New Roman, serif" font-size="10" fill="#5d4037">Patch + Verify</text>
+  
+  <rect x="60" y="250" width="170" height="50" fill="#efebe9" stroke="#5d4037" stroke-width="1"/>
+  <text x="145" y="272" text-anchor="middle" font-family="Times New Roman, serif" font-size="11" font-weight="bold" fill="#3e2723">Phase 8: Report</text>
+  <text x="145" y="288" text-anchor="middle" font-family="Times New Roman, serif" font-size="10" fill="#5d4037">Generate Markdown</text>
+  
+  <!-- Arrows Row 2 -->
+  <path d="M 715 220 L 715 248" stroke="#5d4037" stroke-width="1.5" marker-end="url(#arrow)" fill="none"/>
+  <line x1="630" y1="275" x2="612" y2="275" stroke="#5d4037" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="440" y1="275" x2="422" y2="275" stroke="#5d4037" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="250" y1="275" x2="232" y2="275" stroke="#5d4037" stroke-width="1.5" marker-end="url(#arrow)"/>
+  
+  <!-- Output checkmark -->
+  <text x="145" y="320" text-anchor="middle" font-family="Times New Roman, serif" font-size="10" fill="#5d4037">✓ Complete</text>
+  
+  <!-- Output Artifacts Section -->
+  <rect x="40" y="350" width="820" height="100" fill="none" stroke="#5d4037" stroke-width="1.5"/>
+  <text x="50" y="370" font-family="Times New Roman, serif" font-size="12" font-weight="bold" fill="#3e2723">Output Artifacts</text>
+  
+  <!-- Output boxes -->
+  <rect x="60" y="385" width="110" height="50" fill="#efebe9" stroke="#5d4037" stroke-width="1"/>
+  <text x="115" y="407" text-anchor="middle" font-family="Courier New, monospace" font-size="10" fill="#3e2723">model/</text>
+  <text x="115" y="423" text-anchor="middle" font-family="Times New Roman, serif" font-size="9" fill="#5d4037">HF Files</text>
+  
+  <rect x="185" y="385" width="110" height="50" fill="#efebe9" stroke="#5d4037" stroke-width="1"/>
+  <text x="240" y="407" text-anchor="middle" font-family="Courier New, monospace" font-size="10" fill="#3e2723">demo/</text>
+  <text x="240" y="423" text-anchor="middle" font-family="Times New Roman, serif" font-size="9" fill="#5d4037">demo.py</text>
+  
+  <rect x="310" y="385" width="110" height="50" fill="#efebe9" stroke="#5d4037" stroke-width="1"/>
+  <text x="365" y="407" text-anchor="middle" font-family="Courier New, monospace" font-size="10" fill="#3e2723">profile/</text>
+  <text x="365" y="423" text-anchor="middle" font-family="Times New Roman, serif" font-size="9" fill="#5d4037">trace.json</text>
+  
+  <rect x="435" y="385" width="110" height="50" fill="#efebe9" stroke="#5d4037" stroke-width="1"/>
+  <text x="490" y="407" text-anchor="middle" font-family="Courier New, monospace" font-size="10" fill="#3e2723">problems/</text>
+  <text x="490" y="423" text-anchor="middle" font-family="Times New Roman, serif" font-size="9" fill="#5d4037">problem_*.py</text>
+  
+  <rect x="560" y="385" width="130" height="50" fill="#d7ccc8" stroke="#5d4037" stroke-width="1.5"/>
+  <text x="625" y="407" text-anchor="middle" font-family="Courier New, monospace" font-size="10" fill="#3e2723">optimized/</text>
+  <text x="625" y="423" text-anchor="middle" font-family="Times New Roman, serif" font-size="9" fill="#4e342e">Triton Kernels</text>
+  
+  <rect x="705" y="385" width="130" height="50" fill="#d7ccc8" stroke="#5d4037" stroke-width="1.5"/>
+  <text x="770" y="407" text-anchor="middle" font-family="Courier New, monospace" font-size="10" fill="#3e2723">report/</text>
+  <text x="770" y="423" text-anchor="middle" font-family="Times New Roman, serif" font-size="9" fill="#4e342e">report.md</text>
+  
+  <!-- kernel-optimize Integration -->
+  <rect x="40" y="465" width="400" height="100" fill="none" stroke="#5d4037" stroke-width="1.5"/>
+  <text x="50" y="485" font-family="Times New Roman, serif" font-size="12" font-weight="bold" fill="#3e2723">kernel-optimize Integration</text>
+  
+  <!-- Flow diagram -->
+  <rect x="60" y="505" width="120" height="40" fill="#efebe9" stroke="#5d4037" stroke-width="1"/>
+  <text x="120" y="522" text-anchor="middle" font-family="Courier New, monospace" font-size="9" fill="#3e2723">problem_*.py</text>
+  <text x="120" y="536" text-anchor="middle" font-family="Times New Roman, serif" font-size="8" fill="#5d4037">(PyTorch ref)</text>
+  
+  <line x1="180" y1="525" x2="205" y2="525" stroke="#5d4037" stroke-width="1.5" marker-end="url(#arrow)"/>
+  
+  <rect x="207" y="505" width="100" height="40" fill="#a1887f" stroke="#5d4037" stroke-width="1.5"/>
+  <text x="257" y="522" text-anchor="middle" font-family="Times New Roman, serif" font-size="9" fill="#fff">kernel-</text>
+  <text x="257" y="536" text-anchor="middle" font-family="Times New Roman, serif" font-size="9" fill="#fff">optimize</text>
+  
+  <line x1="307" y1="525" x2="332" y2="525" stroke="#5d4037" stroke-width="1.5" marker-end="url(#arrow)"/>
+  
+  <rect x="334" y="505" width="90" height="40" fill="#8d6e63" stroke="#5d4037" stroke-width="1.5"/>
+  <text x="379" y="522" text-anchor="middle" font-family="Courier New, monospace" font-size="9" fill="#fff">*_opt.py</text>
+  <text x="379" y="536" text-anchor="middle" font-family="Times New Roman, serif" font-size="8" fill="#efebe9">(Triton)</text>
+  
+  <!-- Supported Models -->
+  <rect x="460" y="465" width="400" height="100" fill="none" stroke="#5d4037" stroke-width="1.5"/>
+  <text x="470" y="485" font-family="Times New Roman, serif" font-size="12" font-weight="bold" fill="#3e2723">Supported Models</text>
+  
+  <!-- Text Generation -->
+  <text x="480" y="515" font-family="Times New Roman, serif" font-size="10" fill="#3e2723">Text Generation:</text>
+  <rect x="580" y="502" width="55" height="20" fill="#efebe9" stroke="#5d4037" stroke-width="1"/>
+  <text x="607" y="516" text-anchor="middle" font-family="Times New Roman, serif" font-size="9" fill="#3e2723">LLaMA</text>
+  <rect x="640" y="502" width="55" height="20" fill="#efebe9" stroke="#5d4037" stroke-width="1"/>
+  <text x="667" y="516" text-anchor="middle" font-family="Times New Roman, serif" font-size="9" fill="#3e2723">Qwen</text>
+  <rect x="700" y="502" width="55" height="20" fill="#efebe9" stroke="#5d4037" stroke-width="1"/>
+  <text x="727" y="516" text-anchor="middle" font-family="Times New Roman, serif" font-size="9" fill="#3e2723">Mistral</text>
+  <rect x="760" y="502" width="55" height="20" fill="#efebe9" stroke="#5d4037" stroke-width="1"/>
+  <text x="787" y="516" text-anchor="middle" font-family="Times New Roman, serif" font-size="9" fill="#3e2723">GPT</text>
+  
+  <!-- Image Generation -->
+  <text x="480" y="545" font-family="Times New Roman, serif" font-size="10" fill="#3e2723">Image Generation:</text>
+  <rect x="580" y="532" width="70" height="20" fill="none" stroke="#8d6e63" stroke-width="1" stroke-dasharray="4,2"/>
+  <text x="615" y="546" text-anchor="middle" font-family="Times New Roman, serif" font-size="9" fill="#8d6e63">Stable Diff</text>
+  <rect x="655" y="532" width="50" height="20" fill="none" stroke="#8d6e63" stroke-width="1" stroke-dasharray="4,2"/>
+  <text x="680" y="546" text-anchor="middle" font-family="Times New Roman, serif" font-size="9" fill="#8d6e63">SDXL</text>
+  <rect x="710" y="532" width="50" height="20" fill="none" stroke="#8d6e63" stroke-width="1" stroke-dasharray="4,2"/>
+  <text x="735" y="546" text-anchor="middle" font-family="Times New Roman, serif" font-size="9" fill="#8d6e63">Flux</text>
+  <text x="775" y="546" font-family="Times New Roman, serif" font-size="9" font-style="italic" fill="#8d6e63">(experimental)</text>
+  
+  <!-- Benchmark Results -->
+  <rect x="40" y="580" width="820" height="90" fill="none" stroke="#5d4037" stroke-width="1.5"/>
+  <text x="50" y="600" font-family="Times New Roman, serif" font-size="12" font-weight="bold" fill="#3e2723">Benchmark Results (Qwen3-8B, AMD MI300X)</text>
+  
+  <!-- Results table header -->
+  <line x1="60" y1="610" x2="840" y2="610" stroke="#5d4037" stroke-width="1"/>
+  <line x1="60" y1="630" x2="840" y2="630" stroke="#5d4037" stroke-width="0.5"/>
+  <text x="150" y="623" text-anchor="middle" font-family="Times New Roman, serif" font-size="10" font-weight="bold" fill="#3e2723">Kernel</text>
+  <text x="320" y="623" text-anchor="middle" font-family="Times New Roman, serif" font-size="10" font-weight="bold" fill="#3e2723">Speedup</text>
+  <text x="490" y="623" text-anchor="middle" font-family="Times New Roman, serif" font-size="10" font-weight="bold" fill="#3e2723">Status</text>
+  <text x="700" y="623" text-anchor="middle" font-family="Times New Roman, serif" font-size="10" font-weight="bold" fill="#3e2723">End-to-End</text>
+  
+  <!-- Results table data -->
+  <text x="150" y="650" text-anchor="middle" font-family="Times New Roman, serif" font-size="10" fill="#3e2723">RoPE / RMSNorm</text>
+  <text x="320" y="650" text-anchor="middle" font-family="Times New Roman, serif" font-size="10" fill="#3e2723">1.44× / 1.05×</text>
+  <text x="490" y="650" text-anchor="middle" font-family="Times New Roman, serif" font-size="10" fill="#3e2723">Integrated</text>
+  <text x="700" y="650" text-anchor="middle" font-family="Times New Roman, serif" font-size="10" font-weight="bold" fill="#5d4037">1.05× (607ms → 578ms)</text>
+  <line x1="60" y1="660" x2="840" y2="660" stroke="#5d4037" stroke-width="1"/>
+</svg>

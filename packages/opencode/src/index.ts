@@ -28,6 +28,7 @@ import { WebCommand } from "./cli/cmd/web"
 import { PrCommand } from "./cli/cmd/pr"
 import { SessionCommand } from "./cli/cmd/session"
 import { KernelOptimizeCommand } from "./cli/cmd/kernel-optimize"
+import { ModelOptimizeCommand } from "./cli/cmd/model-optimize"
 
 process.on("unhandledRejection", (e) => {
   Log.Default.error("rejection", {
@@ -101,6 +102,7 @@ const cli = yargs(hideBin(process.argv))
   .command(PrCommand)
   .command(SessionCommand)
   .command(KernelOptimizeCommand)
+  .command(ModelOptimizeCommand)
   .fail((msg, err) => {
     if (
       msg?.startsWith("Unknown argument") ||
