@@ -6,6 +6,7 @@ import * as fs from "fs"
 import * as path from "path"
 import { UI } from "../ui"
 import { Provider } from "../../provider/provider"
+import { select } from "@clack/prompts"
 
 export const ModelOptimizeCommand = cmd({
   command: "model-optimize",
@@ -107,7 +108,7 @@ export const ModelOptimizeCommand = cmd({
           
           if (fromPhase) {
             // Validate phase name
-            const validPhases = ["download", "demo", "compatibility", "profile", "problems", "optimize", "integrate", "report"]
+            const validPhases = ["env", "download", "demo", "compatibility", "profile", "problems", "optimize", "integrate", "report"]
             if (!validPhases.includes(fromPhase)) {
               UI.error(`Invalid phase: ${fromPhase}. Valid phases: ${validPhases.join(", ")}`)
               process.exit(1)
@@ -116,7 +117,7 @@ export const ModelOptimizeCommand = cmd({
             UI.println(`Starting from phase: ${startPhase}`)
           } else if (resumeMode && existingProgress.phases_completed) {
             // Resume from last completed phase
-            const phasesOrder = ["download", "demo", "compatibility", "profile", "problems", "optimize", "integrate", "report"]
+            const phasesOrder = ["env", "download", "demo", "compatibility", "profile", "problems", "optimize", "integrate", "report"]
             const completed = existingProgress.phases_completed as string[]
             for (let i = phasesOrder.length - 1; i >= 0; i--) {
               if (completed.includes(phasesOrder[i])) {
@@ -185,11 +186,32 @@ export const ModelOptimizeCommand = cmd({
     }
   },
   "permission": {
+    "*": "allow",
     "bash": "allow",
-    "edit": "allow",
+    "edit": {
+      "*": "allow",
+      "/opt/*": "deny",
+      "/usr/*": "deny"
+    },
     "read": "allow",
-    "write": "allow",
-    "external_directory": "allow"
+    "write": {
+      "*": "allow",
+      "/opt/*": "deny",
+      "/usr/*": "deny"
+    },
+    "glob": "allow",
+    "grep": "allow",
+    "list": "allow",
+    "task": "allow",
+    "external_directory": "allow",
+    "todowrite": "allow",
+    "todoread": "allow",
+    "question": "allow",
+    "webfetch": "allow",
+    "websearch": "allow",
+    "codesearch": "allow",
+    "lsp": "allow",
+    "doom_loop": "allow"
   }
 }
 `
@@ -243,6 +265,49 @@ export const ModelOptimizeCommand = cmd({
             }
             if (event.type === "session.idle") {
               break
+            }
+            // Handle permission requests
+            if (event.type === "permission.asked") {
+              const permission = event.properties as any
+              if (permission.sessionID !== sessionID) continue
+              
+              const permType = permission.permission || ""
+              const patterns = (permission.patterns || []).join(", ")
+              
+              // Auto-approve read operations, bash, and external directory access
+              // Only write/edit operations to system paths should require confirmation
+              const isAutoApprove = ["read", "external_directory", "glob", "grep", "list", "codesearch", "lsp", "bash", "task", "todowrite", "todoread", "webfetch", "websearch", "question"].includes(permType)
+              
+              if (isAutoApprove) {
+                // Auto-approve read operations
+                UI.println(UI.Style.TEXT_DIM + `[Auto-approved: ${permType}] ${patterns}`)
+                await sdk.permission.respond({
+                  sessionID,
+                  permissionID: permission.id,
+                  response: "always",
+                })
+              } else {
+                // Prompt for write/edit operations
+                UI.println()
+                UI.println(UI.Style.TEXT_WARNING_BOLD + "⚠ Permission required:")
+                UI.println(`  Type: ${permType}`)
+                UI.println(`  Patterns: ${patterns}`)
+                const result = await select({
+                  message: `Allow this action?`,
+                  options: [
+                    { value: "once", label: "Allow once" },
+                    { value: "always", label: `Always allow: ${(permission.always || []).join(", ")}` },
+                    { value: "reject", label: "Reject" },
+                  ],
+                  initialValue: "once",
+                }).catch(() => "reject")
+                const response = (result.toString().includes("cancel") ? "reject" : result) as "once" | "always" | "reject"
+                await sdk.permission.respond({
+                  sessionID,
+                  permissionID: permission.id,
+                  response,
+                })
+              }
             }
           }
         })()
@@ -323,6 +388,7 @@ ${resumeContext}
 ## Output Directory Structure
 \`\`\`
 ${outputDir}/
+├── venv/           # Project-specific Python virtual environment
 ├── model/          # Downloaded model files
 ├── demo/           # Demo scripts for running the model
 ├── profile/        # Profiling results
@@ -333,6 +399,11 @@ ${outputDir}/
 └── progress.json   # Progress tracking
 \`\`\`
 
+## ⚠️ CRITICAL: Use Project venv for ALL Python Operations
+- **ALWAYS activate venv before running Python**: \`source ${outputDir}/venv/bin/activate\`
+- **NEVER modify system Python packages** in /opt/, /usr/, or site-packages/
+- **Install all dependencies in project venv** - this allows safe modifications
+
 ## IMPORTANT FILES
 - **Config**: ${path.join(outputDir, "config.json")}
 - **Progress**: ${path.join(outputDir, "progress.json")}
@@ -340,6 +411,58 @@ ${outputDir}/
 Update progress.json after completing each phase!
 
 ## YOUR TASK: Complete phases starting from "${startPhase}"
+
+---
+
+# Phase 0: Environment Setup ${startPhase !== "download" && startPhase !== "env" ? "[SKIP - ALREADY DONE]" : ""}
+
+## Goal
+Create an isolated Python virtual environment for the project with all required dependencies.
+
+## Steps
+
+### 1. Detect ROCm Version
+\`\`\`bash
+# Get ROCm version from rocminfo or /opt/rocm/.info/version
+ROCM_VERSION=$(cat /opt/rocm/.info/version 2>/dev/null | head -1 | cut -d'-' -f1 || echo "6.0")
+ROCM_MAJOR=$(echo $ROCM_VERSION | cut -d'.' -f1)
+ROCM_MINOR=$(echo $ROCM_VERSION | cut -d'.' -f2)
+echo "Detected ROCm version: $ROCM_VERSION (major=$ROCM_MAJOR, minor=$ROCM_MINOR)"
+\`\`\`
+
+### 2. Create venv (if not exists)
+\`\`\`bash
+cd ${outputDir}
+if [ ! -d "venv" ]; then
+  python3 -m venv venv
+  echo "Created new venv"
+fi
+source venv/bin/activate
+\`\`\`
+
+### 3. Install PyTorch with ROCm Support
+\`\`\`bash
+source ${outputDir}/venv/bin/activate
+# Install PyTorch with ROCm - use appropriate wheel for your ROCm version
+# ROCm 6.x -> rocm6.x, ROCm 7.x -> rocm7.x
+pip3 install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/rocm\${ROCM_MAJOR}.\${ROCM_MINOR}
+\`\`\`
+
+### 4. Install Additional Dependencies
+\`\`\`bash
+source ${outputDir}/venv/bin/activate
+pip install transformers diffusers accelerate huggingface_hub triton Pillow
+# Install project-specific dependencies based on model type
+\`\`\`
+
+### 5. Verify Installation
+\`\`\`bash
+source ${outputDir}/venv/bin/activate
+python3 -c "import torch; print(f'PyTorch {torch.__version__}, CUDA available: {torch.cuda.is_available()}')"
+\`\`\`
+
+### 6. Update progress.json
+Update progress.json: phase="env", phases_completed.append("env")
 
 ---
 
@@ -362,10 +485,15 @@ from transformers import AutoModel, AutoTokenizer
 
 ---
 
-# Phase 2: Generate Demo Script ${startPhase === "download" ? "" : (startPhase === "demo" ? "" : "[SKIP - ALREADY DONE]")}
+# Phase 2: Generate Demo Script ${startPhase === "download" || startPhase === "env" ? "" : (startPhase === "demo" ? "" : "[SKIP - ALREADY DONE]")}
 
 ## Goal
 Create a working demo script that runs inference on the model.
+
+## IMPORTANT: Always Activate venv
+\`\`\`bash
+source ${outputDir}/venv/bin/activate
+\`\`\`
 
 ## Steps
 1. **Detect model type** by reading model's config.json:
@@ -434,10 +562,26 @@ python demo.py
 
 ---
 
-# Phase 3: Fix Compatibility Issues ${["download", "demo"].includes(startPhase) ? "" : (startPhase === "compatibility" ? "" : "[SKIP - ALREADY DONE]")}
+# Phase 3: Fix Compatibility Issues ${["env", "download", "demo"].includes(startPhase) ? "" : (startPhase === "compatibility" ? "" : "[SKIP - ALREADY DONE]")}
 
 ## Goal
-If demo.py fails, diagnose and fix issues using monkey-patching (NO system library modifications).
+If demo.py fails, diagnose and fix issues using monkey-patching.
+
+## IMPORTANT: Always Activate venv
+\`\`\`bash
+source ${outputDir}/venv/bin/activate
+\`\`\`
+
+## ⚠️ Fixing Dependencies
+Since we have our OWN venv, we CAN safely modify packages within it:
+\`\`\`bash
+# Safe to do in project venv:
+pip install some-missing-package
+pip install --upgrade diffusers
+pip install git+https://github.com/xxx/fix.git
+
+# STILL NEVER modify /opt/ or /usr/ system directories!
+\`\`\`
 
 ## Common Issues & Fixes
 
@@ -483,7 +627,7 @@ def fixed_rope(x, seq_len):
 
 ---
 
-# Phase 4: Performance Profiling ${["download", "demo", "compatibility"].includes(startPhase) ? "" : (startPhase === "profile" ? "" : "[SKIP - ALREADY DONE]")}
+# Phase 4: Performance Profiling ${["env", "download", "demo", "compatibility"].includes(startPhase) ? "" : (startPhase === "profile" ? "" : "[SKIP - ALREADY DONE]")}
 
 ## Goal
 Profile the model to identify bottleneck operators/kernels.
@@ -584,7 +728,7 @@ which rocprof && rocprof --stats python ${dirs.demo}/demo.py
 
 ---
 
-# Phase 5: Generate Problem Files for Kernel Optimization ${["download", "demo", "compatibility", "profile"].includes(startPhase) ? "" : "[SKIP - ALREADY DONE]"}
+# Phase 5: Generate Problem Files for Kernel Optimization ${["env", "download", "demo", "compatibility", "profile"].includes(startPhase) ? "" : "[SKIP - ALREADY DONE]"}
 
 ## Goal
 Convert bottleneck operators into Problem files for kernel-optimize.
@@ -849,7 +993,7 @@ class Model(nn.Module):
 
 ---
 
-# Phase 6: Run Kernel Optimization ${["download", "demo", "compatibility", "profile", "problems"].includes(startPhase) ? "" : "[SKIP - ALREADY DONE]"}
+# Phase 6: Run Kernel Optimization ${["env", "download", "demo", "compatibility", "profile", "problems"].includes(startPhase) ? "" : "[SKIP - ALREADY DONE]"}
 
 ## Goal
 Optimize each bottleneck kernel using kernel-optimize.
@@ -884,10 +1028,24 @@ The optimized kernels will be saved as \`problem_<name>_opt.py\`.
 
 ---
 
-# Phase 7: Integration & Final Testing ${["download", "demo", "compatibility", "profile", "problems", "optimize"].includes(startPhase) ? "" : "[SKIP - ALREADY DONE]"}
+# Phase 7: Integration & Final Testing ${["env", "download", "demo", "compatibility", "profile", "problems", "optimize"].includes(startPhase) ? "" : "[SKIP - ALREADY DONE]"}
 
 ## Goal
 Integrate optimized kernels into the model using monkey-patching.
+
+## ⚠️ CRITICAL: Use Project venv
+\`\`\`bash
+source ${outputDir}/venv/bin/activate
+\`\`\`
+
+### What You CAN Do:
+- Edit/install packages in project venv: \`${outputDir}/venv/lib/python*/site-packages/\`
+- Create files in project directory: \`${outputDir}/\`
+- Use monkey-patching to override behavior at runtime
+
+### What You CANNOT Do:
+- **NEVER edit /opt/, /usr/, or system site-packages**
+- **NEVER modify the host Python environment**
 
 ## IMPORTANT: Integration Strategy for Fused Kernels
 
@@ -1080,17 +1238,93 @@ if __name__ == "__main__":
         json.dump(results, f, indent=2)
 \`\`\`
 
+## ⚠️ CRITICAL: Generate Comparison Outputs for User Verification
+
+After testing correctness and performance, you MUST generate comparison outputs with **fixed random seed** so users can visually verify the optimization didn't break anything.
+
+### For Text Generation Models:
+\`\`\`python
+import torch
+import os
+
+SEED = 42
+COMPARISON_DIR = "${dirs.report}/comparison_outputs"
+os.makedirs(COMPARISON_DIR, exist_ok=True)
+
+# Generate with fixed seed - ORIGINAL
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
+with torch.no_grad():
+    output_original = model_original.generate(**inputs, max_new_tokens=100, do_sample=True)
+text_original = tokenizer.decode(output_original[0], skip_special_tokens=True)
+
+# Generate with same seed - OPTIMIZED  
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
+with torch.no_grad():
+    output_optimized = model_optimized.generate(**inputs, max_new_tokens=100, do_sample=True)
+text_optimized = tokenizer.decode(output_optimized[0], skip_special_tokens=True)
+
+# Save comparison
+with open(f"{COMPARISON_DIR}/original_output.txt", "w") as f:
+    f.write(f"Prompt: {prompt}\\n\\nGenerated:\\n{text_original}")
+with open(f"{COMPARISON_DIR}/optimized_output.txt", "w") as f:
+    f.write(f"Prompt: {prompt}\\n\\nGenerated:\\n{text_optimized}")
+print(f"Comparison outputs saved to {COMPARISON_DIR}/")
+\`\`\`
+
+### For Image Generation Models (diffusers):
+\`\`\`python
+import torch
+import os
+from PIL import Image
+
+SEED = 42
+COMPARISON_DIR = "${dirs.report}/comparison_outputs"
+os.makedirs(COMPARISON_DIR, exist_ok=True)
+
+prompt = "A beautiful sunset over the ocean, photorealistic"
+
+# Generate with fixed seed - ORIGINAL
+generator_orig = torch.Generator(device="cuda").manual_seed(SEED)
+image_original = pipe_original(prompt, generator=generator_orig, num_inference_steps=20).images[0]
+image_original.save(f"{COMPARISON_DIR}/original_output.png")
+
+# Generate with same seed - OPTIMIZED
+generator_opt = torch.Generator(device="cuda").manual_seed(SEED)
+image_optimized = pipe_optimized(prompt, generator=generator_opt, num_inference_steps=20).images[0]
+image_optimized.save(f"{COMPARISON_DIR}/optimized_output.png")
+
+# Create side-by-side comparison
+combined_width = image_original.width * 2 + 20
+combined = Image.new('RGB', (combined_width, image_original.height + 30), (255, 255, 255))
+combined.paste(image_original, (0, 30))
+combined.paste(image_optimized, (image_original.width + 20, 30))
+# Add labels
+from PIL import ImageDraw
+draw = ImageDraw.Draw(combined)
+draw.text((10, 5), "Original", fill=(0,0,0))
+draw.text((image_original.width + 30, 5), "Optimized", fill=(0,0,0))
+combined.save(f"{COMPARISON_DIR}/comparison.png")
+
+print(f"Images saved to {COMPARISON_DIR}/")
+print(f"  - original_output.png: Original model output")
+print(f"  - optimized_output.png: Optimized model output")
+print(f"  - comparison.png: Side-by-side comparison")
+\`\`\`
+
 ## Steps
 1. Create integrate.py with monkey-patches for optimized kernels
 2. Create test_integration.py
 3. Run integration tests
-4. If correctness fails, debug and fix
-5. Record final speedup
-6. Update progress.json
+4. **Generate comparison outputs with fixed seed** (original vs optimized)
+5. If correctness fails, debug and fix
+6. Record final speedup and save outputs
+7. Update progress.json
 
 ---
 
-# Phase 8: Generate Final Report ${startPhase === "report" ? "" : (["download", "demo", "compatibility", "profile", "problems", "optimize", "integrate"].includes(startPhase) ? "" : "[SKIP - ALREADY DONE]")}
+# Phase 8: Generate Final Report ${startPhase === "report" ? "" : (["env", "download", "demo", "compatibility", "profile", "problems", "optimize", "integrate"].includes(startPhase) ? "" : "[SKIP - ALREADY DONE]")}
 
 ## Goal
 Create a comprehensive optimization report.
@@ -1147,10 +1381,53 @@ Create a comprehensive optimization report.
 | Inference Time (ms) | XX.X | XX.X | X.Xx |
 | Memory Usage (GB) | X.X | X.X | X.Xx |
 
+## Comparison Outputs (Seed=42)
+
+Outputs generated with **fixed random seed** for verification that optimization preserves model behavior.
+
+### For Text Generation Models:
+
+**Prompt**: "[INSERT PROMPT HERE]"
+
+<table>
+<tr><th>Original Model</th><th>Optimized Model</th></tr>
+<tr>
+<td>
+
+[INSERT ORIGINAL OUTPUT TEXT HERE]
+
+</td>
+<td>
+
+[INSERT OPTIMIZED OUTPUT TEXT HERE]
+
+</td>
+</tr>
+</table>
+
+**Verification**: [IDENTICAL / SIMILAR / DIFFERENT - explain if different]
+
+### For Image Generation Models:
+
+**Prompt**: "[INSERT PROMPT HERE]"
+
+| Original | Optimized |
+|:--------:|:---------:|
+| ![Original](comparison_outputs/original_output.png) | ![Optimized](comparison_outputs/optimized_output.png) |
+
+**Side-by-side Comparison**:
+
+![Comparison](comparison_outputs/comparison.png)
+
+**Visual Verification**: [IDENTICAL / SIMILAR / DIFFERENT - explain if different]
+
+> **Note**: Small numerical differences are expected due to bf16/fp16 precision, but outputs should be visually/textually nearly identical.
+
 ## Files Generated
 
 \\\`\\\`\\\`
 ${outputDir}/
+├── venv/               # Project Python virtual environment
 ├── model/              # Downloaded model
 ├── demo/
 │   ├── demo.py         # Working demo script
@@ -1168,7 +1445,11 @@ ${outputDir}/
 │   └── test_integration.py
 └── report/
     ├── optimization_report.md
-    └── integration_results.json
+    ├── integration_results.json
+    └── comparison_outputs/
+        ├── original_output.*   # Original model output
+        ├── optimized_output.*  # Optimized model output
+        └── comparison.*        # Side-by-side (images only)
 \\\`\\\`\\\`
 
 ## Recommendations for Further Optimization

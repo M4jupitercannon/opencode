@@ -194,13 +194,19 @@ qwen3_8b_opt/
 │   ├── problem_rope.py         # RoPE problem
 │   ├── problem_rope_opt.py     # Optimized kernel
 │   └── ...
+├── venv/                        # Project Python virtual environment
+│   └── lib/python3.x/site-packages/
 ├── optimized/
 │   ├── integrate.py            # Model patching script
 │   ├── test_integration.py     # Integration test
 │   └── problem_*_opt.py        # Production kernels
 └── report/
     ├── optimization_report.md  # Comprehensive report
-    └── integration_results.json
+    ├── integration_results.json
+    └── comparison_outputs/     # For user verification
+        ├── original_output.*   # Original model output (txt/png)
+        ├── optimized_output.*  # Optimized model output (txt/png)
+        └── comparison.png      # Side-by-side (images only)
 ```
 
 ## Understanding the Report
@@ -223,7 +229,18 @@ The final report (`report/optimization_report.md`) includes:
 - Integration correctness verification
 - End-to-end performance improvement
 
-### 4. Recommendations
+### 4. Comparison Outputs (for Verification)
+
+The pipeline generates outputs with **fixed random seed** for user verification:
+
+| Model Type | Files Generated |
+|------------|----------------|
+| Text Generation | `original_output.txt`, `optimized_output.txt` |
+| Image Generation | `original_output.png`, `optimized_output.png`, `comparison.png` |
+
+These files allow you to visually/textually verify that the optimization didn't break the model's functionality. Small differences are expected due to floating-point precision (bf16/fp16).
+
+### 5. Recommendations
 - Suggestions for further optimization
 - Known limitations
 
