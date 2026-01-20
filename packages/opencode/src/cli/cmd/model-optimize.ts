@@ -234,28 +234,169 @@ export const ModelOptimizeCommand = cmd({
         const events = await sdk.event.subscribe()
         UI.println("Session created, sending prompt...")
 
-        // Event processor
+        // Create detailed log file
+        const logFilePath = path.join(outputDir, "optimization.log")
+        const logStream = fs.createWriteStream(logFilePath, { flags: "a" })
+        const log = (msg: string) => {
+          const timestamp = new Date().toISOString()
+          logStream.write(`[${timestamp}] ${msg}\n`)
+        }
+        log("=" .repeat(60))
+        log(`Model Optimization Started: ${modelName}`)
+        log(`Output Directory: ${outputDir}`)
+        log(`LLM Model: ${llmArg || "default"}`)
+        log("=" .repeat(60))
+        UI.println(UI.Style.TEXT_DIM + `Detailed log: ${logFilePath}`)
+
+        // Event processor with improved logging
+        let currentPhase = ""
         const eventProcessor = (async () => {
           for await (const event of events.stream) {
-            // Debug: show event types
-            if (event.type !== "message.part.updated") {
-              UI.println(UI.Style.TEXT_DIM + `[Event: ${event.type}]`)
-            }
+            // Only log meaningful events to file (skip raw JSON noise)
             if (event.type === "message.part.updated") {
               const part = event.properties.part
               if (part.sessionID !== sessionID) continue
-              if (part.type === "tool" && part.state.status === "completed") {
-                const title = part.state.title || JSON.stringify(part.state.input)
-                UI.println(UI.Style.TEXT_INFO_BOLD + `|`, UI.Style.TEXT_DIM + ` ${part.tool.padEnd(7)}`, title)
-                if (part.tool === "bash" && part.state.output?.trim()) {
-                  UI.println()
-                  UI.println(part.state.output)
-                }
-              }
+              
+              // Log agent's thinking/text to file
               if (part.type === "text") {
                 const textPart = part as any
-                if (textPart.state?.done) {
-                  UI.println(textPart.state.content)
+                if (textPart.state?.done && textPart.state.content?.trim()) {
+                  log(`\n[AGENT THINKING]\n${textPart.state.content.trim()}\n`)
+                }
+              }
+              
+              if (part.type === "tool" && part.state.status === "completed") {
+                const tool = part.tool
+                const title = part.state.title || ""
+                const input = (part.state.input || {}) as Record<string, any>
+                
+                // Format based on tool type for better readability
+                if (tool === "bash") {
+                  const cmd = input.command || title
+                  log(`\n$ ${cmd}`)
+                  UI.println(UI.Style.TEXT_INFO_BOLD + "$ " + UI.Style.TEXT_DIM + title)
+                  if (part.state.output?.trim()) {
+                    const output = part.state.output.trim()
+                    // Log full output to file, but truncate if very long
+                    if (output.length > 2000) {
+                      log(`${output.slice(0, 2000)}\n... (truncated, ${output.length} chars total)`)
+                    } else {
+                      log(output)
+                    }
+                    // Only show first few lines on console
+                    const lines = output.split("\n")
+                    if (lines.length > 10) {
+                      UI.println(lines.slice(0, 8).join("\n"))
+                      UI.println(UI.Style.TEXT_DIM + `... (${lines.length - 8} more lines)`)
+                    } else {
+                      UI.println(output)
+                    }
+                  }
+                } else if (tool === "write" || tool === "edit") {
+                  const filePath = input.target_file || input.file_path || title
+                  const shortPath = filePath.replace(outputDir + "/", "")
+                  log(`\n[FILE ${tool.toUpperCase()}] ${shortPath}`)
+                  UI.println(UI.Style.TEXT_SUCCESS + `✎ ${tool === "write" ? "Creating" : "Editing"}: ` + UI.Style.TEXT_DIM + shortPath)
+                } else if (tool === "read") {
+                  // Skip read logs - too noisy
+                } else if (tool === "todowrite") {
+                  // Parse todo updates to show progress
+                  const todos = input.todos || []
+                  const inProgress = todos.filter((t: any) => t.status === "in_progress")
+                  const completed = todos.filter((t: any) => t.status === "completed")
+                  if (inProgress.length > 0) {
+                    UI.println(UI.Style.TEXT_INFO + `▶ In Progress: ` + inProgress.map((t: any) => t.content).join(", "))
+                  }
+                  if (completed.length > 0) {
+                    UI.println(UI.Style.TEXT_SUCCESS + `✓ Completed: ` + completed.map((t: any) => t.content).join(", "))
+                  }
+                } else {
+                  // Other tools - show if non-empty title
+                  if (title) {
+                    UI.println(UI.Style.TEXT_DIM + `[${tool}] ${title}`)
+                  }
+                }
+              }
+              // Phase detection is handled in the text logging above
+              if (part.type === "text") {
+                const textPart = part as any
+                if (textPart.state?.done && textPart.state.content?.trim()) {
+                  // Detect phase changes from agent text for console output
+                  const content = textPart.state.content
+                  if (content.includes("Phase 0") || content.includes("Environment Setup")) {
+                    if (currentPhase !== "env") {
+                      currentPhase = "env"
+                      log("\n" + "=".repeat(50) + "\n  Phase 0: Environment Setup\n" + "=".repeat(50))
+                      UI.println()
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "═══════════════════════════════════════")
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "  Phase 0: Environment Setup")
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "═══════════════════════════════════════")
+                    }
+                  } else if (content.includes("Phase 1") || content.includes("Model Download")) {
+                    if (currentPhase !== "download") {
+                      currentPhase = "download"
+                      UI.println()
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "═══════════════════════════════════════")
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "  Phase 1: Model Download")
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "═══════════════════════════════════════")
+                    }
+                  } else if (content.includes("Phase 2") || content.includes("Demo Script")) {
+                    if (currentPhase !== "demo") {
+                      currentPhase = "demo"
+                      UI.println()
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "═══════════════════════════════════════")
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "  Phase 2: Generate Demo Script")
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "═══════════════════════════════════════")
+                    }
+                  } else if (content.includes("Phase 3") || content.includes("Compatibility")) {
+                    if (currentPhase !== "compatibility") {
+                      currentPhase = "compatibility"
+                      UI.println()
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "═══════════════════════════════════════")
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "  Phase 3: Fix Compatibility Issues")
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "═══════════════════════════════════════")
+                    }
+                  } else if (content.includes("Phase 4") || content.includes("Profiling")) {
+                    if (currentPhase !== "profile") {
+                      currentPhase = "profile"
+                      UI.println()
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "═══════════════════════════════════════")
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "  Phase 4: Performance Profiling")
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "═══════════════════════════════════════")
+                    }
+                  } else if (content.includes("Phase 5") || content.includes("Problem Files")) {
+                    if (currentPhase !== "problems") {
+                      currentPhase = "problems"
+                      UI.println()
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "═══════════════════════════════════════")
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "  Phase 5: Generate Problem Files")
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "═══════════════════════════════════════")
+                    }
+                  } else if (content.includes("Phase 6") || content.includes("Kernel Optimization")) {
+                    if (currentPhase !== "optimize") {
+                      currentPhase = "optimize"
+                      UI.println()
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "═══════════════════════════════════════")
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "  Phase 6: Kernel Optimization")
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "═══════════════════════════════════════")
+                    }
+                  } else if (content.includes("Phase 7") || content.includes("Integration")) {
+                    if (currentPhase !== "integrate") {
+                      currentPhase = "integrate"
+                      UI.println()
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "═══════════════════════════════════════")
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "  Phase 7: Integration & Testing")
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "═══════════════════════════════════════")
+                    }
+                  } else if (content.includes("Phase 8") || content.includes("Final Report")) {
+                    if (currentPhase !== "report") {
+                      currentPhase = "report"
+                      UI.println()
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "═══════════════════════════════════════")
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "  Phase 8: Generate Final Report")
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "═══════════════════════════════════════")
+                    }
+                  }
                 }
               }
             }
@@ -332,7 +473,10 @@ export const ModelOptimizeCommand = cmd({
 
         // Wait for completion
         await eventProcessor
+        log("Optimization completed")
+        logStream.end()
         UI.println("Event processor completed")
+        UI.println(UI.Style.TEXT_SUCCESS + `Full log saved to: ${logFilePath}`)
       } finally {
         // Cleanup opencode config (keep other files)
         try {
@@ -404,6 +548,19 @@ ${outputDir}/
 - **NEVER modify system Python packages** in /opt/, /usr/, or site-packages/
 - **Install all dependencies in project venv** - this allows safe modifications
 
+## 🎯 CRITICAL PRINCIPLE: Data-Driven Decisions Only
+
+**ALL optimization decisions MUST be based on actual profiling data, NOT assumptions or hardcoded rules.**
+
+- ✅ **DO**: Read shapes from \`inference_shapes.json\`, analyze \`bottlenecks.json\`
+- ✅ **DO**: Benchmark each optimization at actual inference shapes before applying
+- ✅ **DO**: Skip optimizations that don't show improvement - no explanation needed
+- ❌ **DON'T**: Use hardcoded shape values like "batch=8" or "hidden=4096"
+- ❌ **DON'T**: Add comments like "DISABLED for ModelX" - just don't apply it
+- ❌ **DON'T**: Assume any optimization will help without measuring
+
+**Code Quality**: Generate clean, reusable code without model-specific hacks.
+
 ## IMPORTANT FILES
 - **Config**: ${path.join(outputDir, "config.json")}
 - **Progress**: ${path.join(outputDir, "progress.json")}
@@ -430,29 +587,30 @@ ROCM_MINOR=$(echo $ROCM_VERSION | cut -d'.' -f2)
 echo "Detected ROCm version: $ROCM_VERSION (major=$ROCM_MAJOR, minor=$ROCM_MINOR)"
 \`\`\`
 
-### 2. Create venv (if not exists)
+### 2. Create venv with system site-packages access (FAST - no install needed!)
 \`\`\`bash
 cd ${outputDir}
+
+# Create venv with --system-site-packages to access system torch/triton directly
 if [ ! -d "venv" ]; then
-  python3 -m venv venv
-  echo "Created new venv"
+  python3 -m venv venv --system-site-packages
+  echo "Created venv with system site-packages access"
 fi
+
 source venv/bin/activate
+
+# Verify system packages are accessible
+python3 -c "import torch; print(f'PyTorch {torch.__version__} available')"
+python3 -c "import triton; print('Triton available')"
 \`\`\`
 
-### 3. Install PyTorch with ROCm Support
+### 3. Install Only Missing Small Packages (if needed)
 \`\`\`bash
 source ${outputDir}/venv/bin/activate
-# Install PyTorch with ROCm - use appropriate wheel for your ROCm version
-# ROCm 6.x -> rocm6.x, ROCm 7.x -> rocm7.x
-pip3 install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/rocm\${ROCM_MAJOR}.\${ROCM_MINOR}
-\`\`\`
-
-### 4. Install Additional Dependencies
-\`\`\`bash
-source ${outputDir}/venv/bin/activate
-pip install transformers diffusers accelerate huggingface_hub triton Pillow
-# Install project-specific dependencies based on model type
+# Most packages should be available from system. Only install if missing:
+python3 -c "import transformers" 2>/dev/null || pip install transformers
+python3 -c "import diffusers" 2>/dev/null || pip install diffusers
+python3 -c "import accelerate" 2>/dev/null || pip install accelerate
 \`\`\`
 
 ### 5. Verify Installation
@@ -632,92 +790,174 @@ def fixed_rope(x, seq_len):
 ## Goal
 Profile the model to identify bottleneck operators/kernels.
 
+## ⚠️ CRITICAL: Keep Profiling Lightweight
+- **For image/video generation models**: Use ONLY 2-3 diffusion steps (NOT the full 20-50 steps)
+- **For LLMs**: Generate only 10-20 tokens
+- **Trace file should be < 100MB** - if larger, reduce steps/tokens
+- Skip warmup iterations in profiler schedule to avoid huge traces
+- Focus on capturing operator patterns, not full inference
+
+## ⚠️ CRITICAL: Use rocprof for GPU profiling on ROCm
+**PyTorch's profiler.key_averages().table() does NOT show CUDA/GPU times on ROCm!**
+You MUST use rocprof for accurate GPU kernel timing.
+
 ## Create Profiling Script: \`${dirs.profile}/profile_model.py\`
 
 \`\`\`python
+"""
+Profile model using rocprof for accurate GPU kernel times on ROCm.
+PyTorch's profiler table() doesn't show GPU times on ROCm - only CPU times!
+"""
 import torch
-from torch.profiler import profile, ProfilerActivity, schedule
 import json
+import os
 import sys
+import time
+import subprocess
+import csv
+
 sys.path.insert(0, "${dirs.demo}")
 
-# Import the demo's model loading code
-from demo import MODEL_PATH  # Adjust based on actual demo.py structure
+# Import patches from demo
+try:
+    from patches import apply_all_patches
+    apply_all_patches()
+except ImportError:
+    pass
 
-def profile_model():
-    # Load model (reuse demo.py logic)
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+PROFILE_DIR = "${dirs.profile}"
+DEMO_DIR = "${dirs.demo}"
+SEED = 42
+NUM_PROFILE_STEPS = 3  # Keep small for diffusion models!
+
+def get_gpu_time(func, *args, **kwargs):
+    """Measure GPU execution time with proper synchronization."""
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    result = func(*args, **kwargs)
+    torch.cuda.synchronize()
+    end = time.perf_counter()
+    return result, (end - start) * 1000  # ms
+
+def run_rocprof():
+    """Run rocprof to get actual GPU kernel times."""
+    rocprof_output = os.path.join(PROFILE_DIR, "rocprof_results.csv")
+    demo_script = os.path.join(DEMO_DIR, "demo.py")
     
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_PATH, torch_dtype=torch.float16, device_map="cuda", trust_remote_code=True
-    )
+    # Create a minimal profiling script that runs the demo with limited steps
+    profile_script = os.path.join(PROFILE_DIR, "rocprof_run.py")
+    with open(profile_script, "w") as f:
+        f.write(f'''
+import sys
+sys.path.insert(0, "{DEMO_DIR}")
+try:
+    from patches import apply_all_patches
+    apply_all_patches()
+except ImportError:
+    pass
+
+# Import and run demo with minimal steps
+exec(open("{demo_script}").read())
+''')
     
-    prompt = "Hello, I am a language model"
-    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+    try:
+        cmd = ["rocprof", "--stats", "-o", rocprof_output, sys.executable, profile_script]
+        print(f"Running: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        
+        if result.returncode == 0:
+            stats_file = rocprof_output.replace(".csv", ".stats.csv")
+            if os.path.exists(stats_file):
+                return parse_rocprof_stats(stats_file)
+        else:
+            print(f"rocprof error: {result.stderr[:500]}")
+    except FileNotFoundError:
+        print("rocprof not found, using manual timing fallback")
+    except subprocess.TimeoutExpired:
+        print("rocprof timed out")
     
-    # Warmup
-    for _ in range(3):
-        with torch.no_grad():
-            model.generate(**inputs, max_new_tokens=10)
+    return None
+
+def parse_rocprof_stats(stats_file):
+    """Parse rocprof stats CSV and generate bottlenecks."""
+    print(f"\\n=== Parsing GPU kernel stats from {stats_file} ===")
     
-    # Profile
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True
-    ) as prof:
-        with torch.no_grad():
-            model.generate(**inputs, max_new_tokens=20)
-    
-    # Export results
-    prof.export_chrome_trace("${dirs.profile}/trace.json")
-    
-    # Print top operators
-    print("\\n=== Top CUDA Operators by Time ===")
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
-    
-    # Save summary
-    summary = prof.key_averages().table(sort_by="cuda_time_total", row_limit=50)
-    with open("${dirs.profile}/operator_summary.txt", "w") as f:
-        f.write(summary)
-    
-    # Extract bottleneck operators
-    bottlenecks = []
-    for evt in prof.key_averages():
-        if evt.cuda_time_total > 0:
-            bottlenecks.append({
-                "name": evt.key,
-                "cuda_time_ms": evt.cuda_time_total / 1000,
-                "cuda_time_percent": 0,  # Calculate later
-                "count": evt.count,
-                "input_shapes": str(evt.input_shapes) if evt.input_shapes else ""
+    kernels = []
+    with open(stats_file, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            name = row.get('Name', row.get('KernelName', ''))
+            time_ns = float(row.get('TotalDurationNs', row.get('DurationNs', 0)))
+            count = int(row.get('Calls', row.get('Count', 1)))
+            kernels.append({
+                'name': name,
+                'total_ms': time_ns / 1e6,
+                'count': count,
+                'avg_ms': (time_ns / 1e6) / count if count > 0 else 0
             })
     
-    # Sort by time and calculate percentages
-    total_cuda_time = sum(b["cuda_time_ms"] for b in bottlenecks)
-    bottlenecks = sorted(bottlenecks, key=lambda x: x["cuda_time_ms"], reverse=True)[:20]
-    for b in bottlenecks:
-        b["cuda_time_percent"] = (b["cuda_time_ms"] / total_cuda_time * 100) if total_cuda_time > 0 else 0
+    kernels = sorted(kernels, key=lambda x: x['total_ms'], reverse=True)
+    total_gpu_time = sum(k['total_ms'] for k in kernels)
     
-    with open("${dirs.profile}/bottlenecks.json", "w") as f:
+    # Aggregate by kernel type for bottleneck analysis
+    bottlenecks = []
+    gemm_time = sum(k['total_ms'] for k in kernels if 'Cijk_' in k['name'])
+    attn_time = sum(k['total_ms'] for k in kernels if 'attn' in k['name'].lower())
+    elem_time = sum(k['total_ms'] for k in kernels if 'elementwise' in k['name'] or 'vectorized' in k['name'])
+    reduce_time = sum(k['total_ms'] for k in kernels if 'reduce' in k['name'])
+    mem_time = sum(k['total_ms'] for k in kernels if 'Cat' in k['name'] or 'copy' in k['name'].lower())
+    
+    bottlenecks = [
+        {"name": "GEMM (Cijk_* kernels)", "cuda_time_ms": gemm_time, 
+         "cuda_time_percent": gemm_time/total_gpu_time*100 if total_gpu_time > 0 else 0,
+         "count": sum(k['count'] for k in kernels if 'Cijk_' in k['name']),
+         "input_shapes": "[batch, seq, hidden] x [hidden, hidden]",
+         "optimizable": False, "reason": "Already optimized by rocBLAS/Tensile"},
+        {"name": "Attention (attn_fwd)", "cuda_time_ms": attn_time,
+         "cuda_time_percent": attn_time/total_gpu_time*100 if total_gpu_time > 0 else 0,
+         "count": sum(k['count'] for k in kernels if 'attn' in k['name'].lower()),
+         "input_shapes": "[batch, heads, seq, head_dim]",
+         "optimizable": True, "reason": "Can use AITER Flash Attention"},
+        {"name": "Elementwise operations", "cuda_time_ms": elem_time,
+         "cuda_time_percent": elem_time/total_gpu_time*100 if total_gpu_time > 0 else 0,
+         "count": sum(k['count'] for k in kernels if 'elementwise' in k['name'] or 'vectorized' in k['name']),
+         "input_shapes": "various",
+         "optimizable": True, "reason": "Can be fused using Triton"},
+        {"name": "Reduce operations (LayerNorm)", "cuda_time_ms": reduce_time,
+         "cuda_time_percent": reduce_time/total_gpu_time*100 if total_gpu_time > 0 else 0,
+         "count": sum(k['count'] for k in kernels if 'reduce' in k['name']),
+         "input_shapes": "[batch, seq, hidden]",
+         "optimizable": True, "reason": "Can be fused with residual add"},
+        {"name": "Memory operations (copy, concat)", "cuda_time_ms": mem_time,
+         "cuda_time_percent": mem_time/total_gpu_time*100 if total_gpu_time > 0 else 0,
+         "count": sum(k['count'] for k in kernels if 'Cat' in k['name'] or 'copy' in k['name'].lower()),
+         "input_shapes": "various",
+         "optimizable": False, "reason": "Memory bandwidth limited"},
+    ]
+    
+    # Sort by time
+    bottlenecks = sorted(bottlenecks, key=lambda x: x['cuda_time_ms'], reverse=True)
+    
+    print(f"\\nTotal GPU time: {total_gpu_time:.2f}ms")
+    print("\\n=== Bottleneck Analysis ===")
+    for i, b in enumerate(bottlenecks, 1):
+        opt = "✓" if b.get("optimizable") else "✗"
+        print(f"{i}. {b['name'][:40]:40s} {b['cuda_time_percent']:5.1f}% ({b['cuda_time_ms']:.1f}ms) {opt}")
+    
+    # Save results
+    with open(os.path.join(PROFILE_DIR, "bottlenecks.json"), "w") as f:
         json.dump(bottlenecks, f, indent=2)
     
-    print("\\n=== Top 10 Bottleneck Operators ===")
-    for i, b in enumerate(bottlenecks[:10], 1):
-        print(f"{i}. {b['name']}: {b['cuda_time_ms']:.2f}ms ({b['cuda_time_percent']:.1f}%)")
+    # Also save raw kernel data for detailed analysis
+    with open(os.path.join(PROFILE_DIR, "gpu_kernels.json"), "w") as f:
+        json.dump(kernels[:50], f, indent=2)
     
     return bottlenecks
 
 if __name__ == "__main__":
-    profile_model()
-\`\`\`
-
-## Additional: AMD ROCm Profiling (if available)
-\`\`\`bash
-# Check if rocprof is available
-which rocprof && rocprof --stats python ${dirs.demo}/demo.py
+    bottlenecks = run_rocprof()
+    if bottlenecks is None:
+        print("Failed to get GPU profiling data. Check if rocprof is installed.")
 \`\`\`
 
 ## Steps
@@ -733,6 +973,313 @@ which rocprof && rocprof --stats python ${dirs.demo}/demo.py
 ## Goal
 Convert bottleneck operators into Problem files for kernel-optimize.
 **IMPORTANT**: Analyze operators for fusion opportunities BEFORE creating individual problem files.
+
+## ⚠️ CRITICAL: Capture Dynamic Shape Ranges
+
+**PROBLEM**: Kernel speedups at fixed shapes often DON'T translate to actual inference which has VARIABLE shapes.
+
+**SOLUTION**: Use lightweight hooks to capture shape ranges during actual inference, then optimize for the RANGE.
+
+### Create Shape Capture System: \`${dirs.profile}/shape_capture.py\`
+
+\`\`\`python
+"""
+Dynamic Shape Capture System
+Hooks into PyTorch operators to capture actual shapes during inference.
+Generates shape_ranges.json with min/typical/max for each dimension.
+"""
+import torch
+import torch.nn as nn
+from collections import defaultdict
+from typing import Dict, List, Any, Tuple, Optional
+import json
+import numpy as np
+
+class ShapeCapture:
+    """Lightweight hook system to capture operator shapes during inference."""
+    
+    def __init__(self):
+        self.shape_records: Dict[str, List[Dict]] = defaultdict(list)
+        self.hooks = []
+        self.op_counts: Dict[str, int] = defaultdict(int)
+        
+    def _create_hook(self, name: str, op_type: str):
+        """Create a forward hook that records shapes."""
+        def hook(module, inputs, output):
+            record = {
+                "op_type": op_type,
+                "input_shapes": [],
+                "output_shape": None,
+                "dtype": None
+            }
+            
+            # Capture input shapes
+            for inp in inputs:
+                if isinstance(inp, torch.Tensor):
+                    record["input_shapes"].append(list(inp.shape))
+                    if record["dtype"] is None:
+                        record["dtype"] = str(inp.dtype)
+                elif inp is None:
+                    record["input_shapes"].append(None)
+            
+            # Capture output shape
+            if isinstance(output, torch.Tensor):
+                record["output_shape"] = list(output.shape)
+            elif isinstance(output, tuple) and len(output) > 0:
+                if isinstance(output[0], torch.Tensor):
+                    record["output_shape"] = list(output[0].shape)
+            
+            self.shape_records[name].append(record)
+            self.op_counts[name] += 1
+            
+        return hook
+    
+    def register_hooks(self, model: nn.Module, target_ops: Optional[List[str]] = None):
+        """
+        Register hooks on model modules.
+        
+        Args:
+            model: PyTorch model
+            target_ops: List of op types to capture (e.g., ["LayerNorm", "Linear", "Attention"])
+                       If None, captures common ops
+        """
+        if target_ops is None:
+            target_ops = ["LayerNorm", "RMSNorm", "Linear", "Attention", "Conv", "Embedding"]
+        
+        for name, module in model.named_modules():
+            class_name = module.__class__.__name__
+            for op in target_ops:
+                if op in class_name:
+                    hook = module.register_forward_hook(self._create_hook(name, class_name))
+                    self.hooks.append(hook)
+                    break
+        
+        print(f"Registered {len(self.hooks)} shape capture hooks")
+        return self
+    
+    def remove_hooks(self):
+        """Remove all registered hooks."""
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks = []
+        
+    def compute_shape_ranges(self) -> Dict[str, Any]:
+        """
+        Compute shape ranges (min/typical/max) for each operator.
+        
+        Returns:
+            Dict with shape ranges for each captured operator
+        """
+        ranges = {}
+        
+        for name, records in self.shape_records.items():
+            if not records:
+                continue
+                
+            op_type = records[0]["op_type"]
+            dtype = records[0]["dtype"]
+            
+            # Collect all input shapes
+            input_shapes_list = [r["input_shapes"] for r in records if r["input_shapes"]]
+            output_shapes_list = [r["output_shape"] for r in records if r["output_shape"]]
+            
+            if not input_shapes_list:
+                continue
+            
+            # Compute ranges for each input
+            input_ranges = []
+            num_inputs = len(input_shapes_list[0])
+            
+            for i in range(num_inputs):
+                shapes_i = [s[i] for s in input_shapes_list if s[i] is not None]
+                if not shapes_i:
+                    input_ranges.append(None)
+                    continue
+                
+                # Compute per-dimension ranges
+                ndim = len(shapes_i[0])
+                dim_ranges = []
+                for d in range(ndim):
+                    dims = [s[d] for s in shapes_i]
+                    dim_ranges.append({
+                        "min": int(min(dims)),
+                        "max": int(max(dims)),
+                        "typical": int(np.median(dims)),
+                        "values": sorted(list(set(dims)))[:10]  # Top 10 unique values
+                    })
+                input_ranges.append(dim_ranges)
+            
+            # Compute output ranges
+            output_range = None
+            if output_shapes_list:
+                ndim = len(output_shapes_list[0])
+                output_range = []
+                for d in range(ndim):
+                    dims = [s[d] for s in output_shapes_list]
+                    output_range.append({
+                        "min": int(min(dims)),
+                        "max": int(max(dims)),
+                        "typical": int(np.median(dims))
+                    })
+            
+            ranges[name] = {
+                "op_type": op_type,
+                "dtype": dtype,
+                "call_count": len(records),
+                "input_shape_ranges": input_ranges,
+                "output_shape_range": output_range
+            }
+        
+        return ranges
+    
+    def save_shape_ranges(self, filepath: str):
+        """Save shape ranges to JSON file."""
+        ranges = self.compute_shape_ranges()
+        
+        # Add metadata
+        output = {
+            "metadata": {
+                "total_ops_captured": sum(self.op_counts.values()),
+                "unique_ops": len(self.shape_records)
+            },
+            "shape_ranges": ranges
+        }
+        
+        with open(filepath, 'w') as f:
+            json.dump(output, f, indent=2)
+        
+        print(f"Saved shape ranges to {filepath}")
+        return output
+
+
+def capture_shapes_during_inference(model, run_inference_fn, num_runs: int = 10) -> Dict:
+    """
+    Convenience function to capture shapes during inference.
+    
+    Args:
+        model: The model to profile
+        run_inference_fn: A function that runs one inference pass
+        num_runs: Number of inference passes to capture
+        
+    Returns:
+        Shape ranges dictionary
+    """
+    capture = ShapeCapture()
+    capture.register_hooks(model)
+    
+    print(f"Running {num_runs} inference passes to capture shape ranges...")
+    for i in range(num_runs):
+        with torch.no_grad():
+            run_inference_fn()
+    
+    capture.remove_hooks()
+    return capture.compute_shape_ranges()
+\`\`\`
+
+### Use Shape Capture in Profiling: \`${dirs.profile}/profile_with_shapes.py\`
+
+\`\`\`python
+"""Profile model AND capture dynamic shape ranges."""
+import torch
+import json
+import sys
+sys.path.insert(0, "${dirs.demo}")
+sys.path.insert(0, "${dirs.profile}")
+
+from shape_capture import ShapeCapture
+
+def profile_with_shape_capture():
+    # Load model (adapt to your model type)
+    # ... model loading code from demo.py ...
+    
+    # Create shape capture
+    capture = ShapeCapture()
+    capture.register_hooks(model)
+    
+    # Run multiple inference passes with different inputs
+    print("Capturing shapes during inference...")
+    
+    # For text models - vary prompt lengths
+    prompts = [
+        "Hello",  # Short
+        "The quick brown fox jumps over the lazy dog",  # Medium
+        "In a hole in the ground there lived a hobbit. Not a nasty, dirty, wet hole...",  # Long
+    ]
+    
+    for prompt in prompts:
+        for _ in range(3):  # Multiple runs per prompt
+            inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+            with torch.no_grad():
+                model.generate(**inputs, max_new_tokens=20)
+    
+    # For image models - vary resolutions
+    # resolutions = [(256, 256), (512, 512), (768, 768)]
+    # for h, w in resolutions:
+    #     for _ in range(3):
+    #         pipe(prompt, height=h, width=w, num_inference_steps=5)
+    
+    capture.remove_hooks()
+    
+    # Save shape ranges
+    capture.save_shape_ranges("${dirs.profile}/shape_ranges.json")
+    
+    print("\\n=== Shape Ranges Summary ===")
+    ranges = capture.compute_shape_ranges()
+    for name, info in list(ranges.items())[:10]:
+        print(f"\\n{name} ({info['op_type']}):")
+        print(f"  Calls: {info['call_count']}")
+        for i, inp_range in enumerate(info['input_shape_ranges']):
+            if inp_range:
+                dims_str = ", ".join([f"[{r['min']}-{r['max']}]" for r in inp_range])
+                print(f"  Input {i}: ({dims_str})")
+
+if __name__ == "__main__":
+    profile_with_shape_capture()
+\`\`\`
+
+### Shape Ranges Output Format: \`shape_ranges.json\`
+
+\`\`\`json
+{
+  "metadata": {
+    "total_ops_captured": 15000,
+    "unique_ops": 150
+  },
+  "shape_ranges": {
+    "model.layers.0.self_attn.q_proj": {
+      "op_type": "Linear",
+      "dtype": "torch.bfloat16",
+      "call_count": 100,
+      "input_shape_ranges": [
+        [
+          {"min": 1, "max": 1, "typical": 1},
+          {"min": 1, "max": 512, "typical": 64},
+          {"min": 4096, "max": 4096, "typical": 4096}
+        ]
+      ],
+      "output_shape_range": [
+        {"min": 1, "max": 1, "typical": 1},
+        {"min": 1, "max": 512, "typical": 64},
+        {"min": 4096, "max": 4096, "typical": 4096}
+      ]
+    },
+    "model.layers.0.input_layernorm": {
+      "op_type": "RMSNorm",
+      "dtype": "torch.bfloat16", 
+      "call_count": 100,
+      "input_shape_ranges": [
+        [
+          {"min": 1, "max": 1, "typical": 1, "values": [1]},
+          {"min": 1, "max": 512, "typical": 64, "values": [1, 32, 64, 128, 256, 512]},
+          {"min": 4096, "max": 4096, "typical": 4096, "values": [4096]}
+        ]
+      ]
+    }
+  }
+}
+\`\`\`
+
+**USE shape_ranges.json TO CREATE PROBLEM FILES** with dynamic shape support!
 
 ## STEP 1: Operator Fusion Analysis (CRITICAL)
 
@@ -829,11 +1376,16 @@ cat fusion_opportunities.json
 
 **Create fused kernels BEFORE individual kernels!**
 
-### Example: Fused Residual + RMSNorm
+### ⚠️ NEW: Problem Files with Dynamic Shape Ranges
+
+Problem files now support **shape ranges** for dynamic input sizes. This allows kernel-optimize to generate kernels that work efficiently across the entire shape range observed during inference.
+
+### Example: Fused Residual + RMSNorm with Shape Ranges
 \`\`\`python
 # problem_fused_residual_rmsnorm.py
 import torch
 import torch.nn as nn
+import json
 
 class Model(nn.Module):
     """Fused residual add + RMSNorm for LLM transformer layers."""
@@ -843,28 +1395,60 @@ class Model(nn.Module):
         self.eps = eps
     
     def forward(self, hidden_states, residual):
-        # Fused: hidden = RMSNorm(hidden_states + residual)
         hidden_states = hidden_states + residual
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
-        return self.weight * hidden_states, hidden_states  # Return both normalized and pre-norm for next residual
+        return self.weight * hidden_states
 
-# Typical shapes for Qwen3-8B
-batch_size = 1
-seq_len = 512
-hidden_size = 4096
+# ============================================================
+# DYNAMIC SHAPE CONFIGURATION (from shape_ranges.json)
+# ============================================================
+
+# Load shape ranges from profiling
+SHAPE_RANGES = {
+    "batch_size": {"min": 1, "max": 1, "typical": 1},
+    "seq_len": {"min": 1, "max": 512, "typical": 64},      # Dynamic!
+    "hidden_size": {"min": 4096, "max": 4096, "typical": 4096}
+}
+
+# For backward compatibility with fixed-shape kernel-optimize
+batch_size = SHAPE_RANGES["batch_size"]["typical"]
+seq_len = SHAPE_RANGES["seq_len"]["typical"]
+hidden_size = SHAPE_RANGES["hidden_size"]["typical"]
 
 def get_inputs():
+    """Return inputs at typical shape for baseline benchmarking."""
     return [
         torch.randn(batch_size, seq_len, hidden_size, dtype=torch.float16, device='cuda'),
         torch.randn(batch_size, seq_len, hidden_size, dtype=torch.float16, device='cuda'),
+    ]
+
+def get_inputs_for_shape(batch, seq, hidden):
+    """Return inputs at specified shape for dynamic benchmarking."""
+    return [
+        torch.randn(batch, seq, hidden, dtype=torch.float16, device='cuda'),
+        torch.randn(batch, seq, hidden, dtype=torch.float16, device='cuda'),
+    ]
+
+def get_shape_ranges():
+    """Return shape ranges for dynamic kernel optimization."""
+    return SHAPE_RANGES
+
+def get_benchmark_shapes():
+    """Return list of shapes to benchmark for dynamic optimization."""
+    return [
+        # (batch, seq, hidden) - cover the range
+        (1, 1, hidden_size),      # Autoregressive decoding
+        (1, 64, hidden_size),     # Short prompt
+        (1, 256, hidden_size),    # Medium prompt
+        (1, 512, hidden_size),    # Long prompt (max)
     ]
 
 def get_init_inputs():
     return [hidden_size]
 \`\`\`
 
-### Example: Fused SwiGLU
+### Example: Fused SwiGLU with Shape Ranges
 \`\`\`python
 # problem_fused_swiglu.py
 import torch
@@ -873,12 +1457,18 @@ import torch.nn as nn
 class Model(nn.Module):
     """Fused SiLU(gate) * up for SwiGLU MLP."""
     def forward(self, gate, up):
-        # Fused: silu(gate) * up
         return torch.nn.functional.silu(gate) * up
 
-batch_size = 1
-seq_len = 512
-intermediate_size = 11008  # Qwen3-8B intermediate
+# Dynamic shape configuration
+SHAPE_RANGES = {
+    "batch_size": {"min": 1, "max": 1, "typical": 1},
+    "seq_len": {"min": 1, "max": 512, "typical": 64},
+    "intermediate_size": {"min": 11008, "max": 11008, "typical": 11008}
+}
+
+batch_size = SHAPE_RANGES["batch_size"]["typical"]
+seq_len = SHAPE_RANGES["seq_len"]["typical"]
+intermediate_size = SHAPE_RANGES["intermediate_size"]["typical"]
 
 def get_inputs():
     return [
@@ -900,6 +1490,8 @@ Only create individual problem files for operators that:
 ## Problem File Format
 Each problem file in \`${dirs.problems}/\` must have:
 
+**⚠️ CRITICAL**: Use ACTUAL inference shapes from \`inference_shapes.json\`, NOT arbitrary shapes!
+
 \`\`\`python
 # problem_<operator_name>.py
 import torch
@@ -915,18 +1507,38 @@ class Model(nn.Module):
         # PyTorch implementation of the operator
         return output
 
-# Define typical input shapes from profiling
-batch_size = 1
-seq_len = 512
-hidden_size = 4096
+# ⚠️ CRITICAL: Use shapes from actual inference profiling!
+# Check ${dirs.profile}/inference_shapes.json for real shapes
+# DO NOT use large batch sizes (8, 16) if inference uses batch=1
+
+batch_size = 1      # ALWAYS 1 for image generation inference
+seq_len = 4096      # Check actual latent size (e.g., 64x64=4096 for 512x512 images)
+hidden_size = 4096  # From model config
 
 def get_inputs():
-    """Return list of input tensors with typical shapes."""
-    return [torch.randn(batch_size, seq_len, hidden_size, dtype=torch.float16, device='cuda')]
+    """Return list of input tensors with ACTUAL INFERENCE shapes."""
+    return [torch.randn(batch_size, seq_len, hidden_size, dtype=torch.bfloat16, device='cuda')]
 
 def get_init_inputs():
     """Return list of arguments for Model.__init__"""
     return []
+\`\`\`
+
+### Shape Validation
+Before running kernel-optimize, verify:
+\`\`\`bash
+# Run a quick benchmark at actual shapes vs benchmark shapes
+python -c "
+import torch
+import time
+
+# Actual inference shape
+x_real = torch.randn(1, 4096, 4096, dtype=torch.bfloat16, device='cuda')
+# Benchmark shape (often wrong!)
+x_bench = torch.randn(8, 4096, 4096, dtype=torch.bfloat16, device='cuda')
+
+# If kernel is slower at x_real but faster at x_bench, the problem file has WRONG shapes!
+"
 \`\`\`
 
 ## Common Operators to Optimize
@@ -990,48 +1602,248 @@ class Model(nn.Module):
 3. Use shapes from profiling data
 4. Ensure get_inputs() returns realistic input tensors
 5. Update progress.json with list of created problems
+6. **Generate optimization_manifest.json** (see below)
+
+## ⚠️ CRITICAL: Generate Optimization Manifest
+
+Create \`${dirs.problems}/optimization_manifest.json\` - allows users to enable/disable specific optimizations:
+
+\`\`\`json
+{
+  "model": "${hfModel}",
+  "generated_at": "[ISO DATE]",
+  "description": "Edit 'enabled' to true/false to control which optimizations to apply",
+  "optimizations": [
+    {
+      "name": "fused_residual_rmsnorm",
+      "file": "problem_fused_residual_rmsnorm.py",
+      "type": "fused",
+      "priority": "HIGH",
+      "cuda_time_percent": 12.5,
+      "expected_speedup": "1.3-1.5x",
+      "enabled": true,
+      "notes": "Fuses residual add + RMSNorm - high impact"
+    },
+    {
+      "name": "fused_rmsnorm",
+      "file": "problem_fused_rmsnorm.py",
+      "type": "fused",
+      "priority": "HIGH",
+      "cuda_time_percent": 7.28,
+      "expected_speedup": "1.2-1.5x",
+      "enabled": true,
+      "notes": "Standalone RMSNorm optimization"
+    },
+    {
+      "name": "fused_rope",
+      "file": "problem_fused_rope.py",
+      "type": "fused",
+      "priority": "MEDIUM",
+      "cuda_time_percent": 2.91,
+      "expected_speedup": "1.2-1.5x",
+      "enabled": true,
+      "notes": "Rotary Position Embedding"
+    },
+    {
+      "name": "linear_gemm",
+      "file": "problem_linear.py",
+      "type": "individual",
+      "priority": "LOW",
+      "cuda_time_percent": 42.46,
+      "expected_speedup": "1.0-1.1x",
+      "enabled": false,
+      "notes": "rocBLAS usually optimal - skip unless specific issues"
+    },
+    {
+      "name": "aiter_flash_attention",
+      "file": null,
+      "type": "aggressive",
+      "priority": "HIGH",
+      "cuda_time_percent": 35.0,
+      "expected_speedup": "1.5-2.0x",
+      "enabled": false,
+      "notes": "Use AITER Flash Attention instead of PyTorch SDPA (experimental)"
+    }
+  ],
+  "integration_options": {
+    "patch_transformer_rmsnorm": true,
+    "patch_text_encoder_rmsnorm": false,
+    "use_aiter_attention": false,
+    "run_correctness_test": true,
+    "generate_comparison_outputs": true
+  }
+}
+\`\`\`
+
+### Using the Manifest
+Users can edit \`optimization_manifest.json\` to:
+- Set \`"enabled": false\` to skip specific optimizations
+- Set \`"enabled": true\` on experimental optimizations like \`aiter_flash_attention\`
+- Configure \`integration_options\` for fine-grained control
+
+Then re-run: \`opencode model-optimize ... --from-phase optimize\`
 
 ---
 
 # Phase 6: Run Kernel Optimization ${["env", "download", "demo", "compatibility", "profile", "problems"].includes(startPhase) ? "" : "[SKIP - ALREADY DONE]"}
 
 ## Goal
-Optimize each bottleneck kernel using kernel-optimize.
+Optimize bottleneck kernels using kernel-optimize, running **in parallel** for speed.
 
-## IMPORTANT: Prioritize Fused Kernels
-Optimize fused kernels FIRST as they provide the highest speedup potential:
+## ⚠️ PARALLEL OPTIMIZATION
+Run multiple kernel-optimize processes simultaneously to speed up optimization:
 
 \`\`\`bash
 cd ${dirs.problems}
 
-# 1. FIRST: Optimize fused kernels (highest priority)
-opencode kernel-optimize --src problem_fused_residual_rmsnorm.py --goal 1.5
-opencode kernel-optimize --src problem_fused_swiglu.py --goal 1.5
+# Run optimizations in PARALLEL using background processes
+# HIGH priority (fused kernels) - run these in parallel
+opencode kernel-optimize --src problem_fused_residual_rmsnorm.py --goal 1.5 &
+opencode kernel-optimize --src problem_fused_rmsnorm.py --goal 1.5 &
+opencode kernel-optimize --src problem_fused_rope.py --goal 1.5 &
 
-# 2. THEN: Optimize remaining individual kernels (if not already done)
-opencode kernel-optimize --src problem_rope.py --goal 1.3
-# Skip GEMM/Linear if rocBLAS is already fast
-# Skip simple elementwise ops (add, mul) - fusion handles these
+# Wait for all background jobs to complete
+wait
+
+# MEDIUM priority - run in parallel
+opencode kernel-optimize --src problem_rope.py --goal 1.3 &
+opencode kernel-optimize --src problem_silu_mul.py --goal 1.3 &
+wait
+
+# Check results and copy successful ones
 \`\`\`
 
-## Decision: When to Skip Individual Kernel Optimization
-- **SKIP** if operator is part of a fused kernel you already optimized
-- **SKIP** GEMM/Linear if profiling shows rocBLAS is already near-optimal (speedup < 1.1x)
-- **SKIP** simple elementwise (add, copy) - overhead of custom kernel exceeds benefit
+## Optimization Priority Order
+| Priority | Kernel Type | Goal | Reason |
+|----------|-------------|------|--------|
+| **HIGH** | Fused Residual+RMSNorm | 1.5x | Memory traffic reduction |
+| **HIGH** | Fused RMSNorm | 1.5x | Repeated many times |
+| **HIGH** | Fused RoPE | 1.5x | Custom AMD optimization |
+| MEDIUM | Individual RoPE | 1.3x | If not using fused version |
+| MEDIUM | SwiGLU/GELU | 1.3x | Activation functions |
+| LOW | Linear/GEMM | 1.1x | rocBLAS usually optimal |
+| **SKIP** | Simple add/copy | - | Overhead > benefit |
 
-The optimized kernels will be saved as \`problem_<name>_opt.py\`.
+## Decision: When to Skip Optimization
+- **SKIP** if operator is part of a fused kernel you already optimized
+- **SKIP** GEMM/Linear if profiling shows rocBLAS is already near-optimal
+- **SKIP** simple elementwise (add, copy) - overhead exceeds benefit
 
 ## After Optimization
-1. Copy **successfully optimized** kernels (speedup > 1.0x) to \`${dirs.optimized}/\`
+
+**⚠️ CRITICAL: Verify speedup at ACTUAL inference shapes!**
+
+\`\`\`bash
+# After kernel-optimize produces *_opt.py, verify it's faster at real shapes:
+cd ${dirs.problems}
+python -c "
+import torch, time
+from problem_XXX import Model as RefModel, get_inputs
+from problem_XXX_opt import ModelNew as OptModel
+
+# Get inputs at ACTUAL inference shape
+inputs = get_inputs()  # Should be batch=1!
+ref = RefModel(*get_init_inputs()).cuda().eval()
+opt = OptModel(*get_init_inputs()).cuda().eval()
+
+# Warmup
+for _ in range(20):
+    ref(*inputs); opt(*inputs)
+torch.cuda.synchronize()
+
+# Benchmark
+t0 = time.perf_counter()
+for _ in range(500): ref(*inputs)
+torch.cuda.synchronize()
+t_ref = (time.perf_counter()-t0)/500*1000
+
+t0 = time.perf_counter()
+for _ in range(500): opt(*inputs)
+torch.cuda.synchronize()
+t_opt = (time.perf_counter()-t0)/500*1000
+
+speedup = t_ref/t_opt
+print(f'Speedup: {speedup:.2f}x')
+if speedup < 1.0:
+    print('WARNING: Kernel is SLOWER at inference shapes! Do not integrate!')
+"
+\`\`\`
+
+1. **Only copy kernels that are faster at ACTUAL inference shapes** to \`${dirs.optimized}/\`
 2. Record speedup for each kernel in progress.json
-3. Note which kernels failed or were skipped
+3. Note which kernels failed or were **slower at inference shapes**
+
+---
+
+# Phase 6.5: Explore Additional Optimization Opportunities
+
+## Goal
+Evaluate additional optimizations based on profiling data - apply ONLY if they provide measurable benefit.
+
+## ⚠️ CRITICAL: Data-Driven Decision Making
+
+**Before enabling ANY optimization:**
+1. Check profiling data to see if the operation is actually a bottleneck
+2. Benchmark the optimization at ACTUAL inference shapes
+3. Only apply if measured speedup > 1.0x
+
+## Potential Optimization Areas (Evaluate Based on Profiling)
+
+### 1. AITER Flash Attention
+**When to consider**: If attention operations are > 10% of total runtime AND sequence length is typically > 64.
+
+**Location**: \`/sgl-workspace/aiter/\` or via pip
+
+**Important**: AITER benefits depend on sequence length:
+- Short sequences (seq < 64): Often SLOWER due to transpose overhead
+- Long sequences (seq > 512): Often FASTER
+
+**ALWAYS benchmark before applying**:
+\`\`\`python
+# Benchmark AITER vs PyTorch SDPA at YOUR actual shapes
+# Only use AITER if it's faster at your actual inference shapes
+\`\`\`
+
+## Installation (if profiling suggests benefit)
+
+\`\`\`bash
+source ${outputDir}/venv/bin/activate
+
+# Try to install AITER
+pip install -e /sgl-workspace/aiter/ 2>/dev/null || echo "AITER not available"
+
+# Verify
+python -c "from aiter.ops.mha import flash_attn_func; print('AITER available')" 2>&1
+\`\`\`
+
+### 2. Additional AMD Optimizations (Evaluate Based on Need)
+
+If profiling shows specific bottlenecks, consider:
+- AITER GEMM operations for MoE or FP8 workloads
+- hipBLASLt for specific GEMM shapes
+- ROCm environment tuning
+
+## Decision Framework
+
+**ALWAYS measure before deciding**:
+1. Profile to identify actual bottlenecks
+2. Benchmark candidate optimizations at ACTUAL inference shapes
+3. Only apply optimizations that show > 1.0x speedup
+4. Document actual measured speedup, not theoretical estimates
+
+**If an optimization doesn't help at actual shapes, simply don't apply it.**
 
 ---
 
 # Phase 7: Integration & Final Testing ${["env", "download", "demo", "compatibility", "profile", "problems", "optimize"].includes(startPhase) ? "" : "[SKIP - ALREADY DONE]"}
 
 ## Goal
-Integrate optimized kernels into the model using monkey-patching.
+Integrate optimized kernels into the model using monkey-patching and **MEASURE ACTUAL end-to-end performance**.
+
+## ⚠️ CRITICAL REQUIREMENTS - THIS PHASE MUST:
+1. **MEASURE ACTUAL end-to-end speedup** - NOT estimated speedup using Amdahl's law
+2. **Generate BOTH original AND optimized outputs** with same random seed
+3. **Run the SAME inference with and without optimizations** to get real numbers
 
 ## ⚠️ CRITICAL: Use Project venv
 \`\`\`bash
@@ -1042,10 +1854,15 @@ source ${outputDir}/venv/bin/activate
 - Edit/install packages in project venv: \`${outputDir}/venv/lib/python*/site-packages/\`
 - Create files in project directory: \`${outputDir}/\`
 - Use monkey-patching to override behavior at runtime
+- **Install AITER in the project venv** if needed:
+  \`\`\`bash
+  pip install aiter  # or install from source if needed
+  \`\`\`
 
 ### What You CANNOT Do:
 - **NEVER edit /opt/, /usr/, or system site-packages**
 - **NEVER modify the host Python environment**
+- **NEVER report only "estimated" speedup - MUST measure actual performance**
 
 ## IMPORTANT: Integration Strategy for Fused Kernels
 
@@ -1068,6 +1885,7 @@ Fused kernels require careful integration as they replace MULTIPLE operations:
 """
 Monkey-patch optimized Triton kernels into the model.
 Supports both individual and fused kernels.
+CRITICAL: Must provide apply_all_patches() function for e2e measurement.
 """
 import torch
 import sys
@@ -1079,69 +1897,121 @@ sys.path.insert(0, "${dirs.problems}")
 
 # Import optimized kernels (check which ones exist)
 _optimized_kernels = {}
+_patch_stats = {}
 
 def try_import(name, module_name):
     try:
         mod = __import__(module_name)
-        _optimized_kernels[name] = mod.ModelNew()
-        print(f"Loaded optimized kernel: {name}")
-        return True
-    except ImportError as e:
-        print(f"Skipping {name}: {e}")
-        return False
+        if hasattr(mod, 'ModelNew'):
+            _optimized_kernels[name] = mod.ModelNew
+            print(f"  [OK] Loaded optimized kernel: {name}")
+            return True
+    except Exception as e:
+        print(f"  [SKIP] {name}: {e}")
+    return False
 
-# Try to import fused kernels first
+print("Loading optimized Triton kernels...")
+# Try to import all available optimized kernels
+# Fused kernels (higher priority)
 try_import("fused_residual_rmsnorm", "problem_fused_residual_rmsnorm_opt")
+try_import("fused_residual_layernorm", "problem_fused_residual_layernorm_opt")
 try_import("fused_swiglu", "problem_fused_swiglu_opt")
-
-# Then individual kernels
+try_import("fused_silu_mul", "problem_fused_silu_mul_opt")
+try_import("fused_gelu_mul", "problem_fused_gelu_mul_opt")
+try_import("fused_rmsnorm", "problem_fused_rmsnorm_opt")
+try_import("fused_rope", "problem_fused_rope_opt")
+# Individual kernels
 try_import("rmsnorm", "problem_rmsnorm_opt")
+try_import("layernorm", "problem_layer_norm_opt")
 try_import("rope", "problem_rope_opt")
+try_import("gelu", "problem_gelu_opt")
 
-def patch_rmsnorm_layers(model):
-    """Patch RMSNorm layers with optimized version."""
-    if "rmsnorm" not in _optimized_kernels and "fused_residual_rmsnorm" not in _optimized_kernels:
+print(f"Loaded kernels: {list(_optimized_kernels.keys())}")
+
+def patch_normalization_layers(model, hidden_size=None):
+    """Patch RMSNorm/LayerNorm layers with optimized versions."""
+    patched = 0
+    
+    # Detect hidden_size from model
+    if hidden_size is None:
+        for name, module in model.named_modules():
+            if hasattr(module, 'weight') and module.weight is not None:
+                if len(module.weight.shape) == 1 and module.weight.shape[0] > 256:
+                    hidden_size = module.weight.shape[0]
+                    break
+        if hidden_size is None:
+            print("WARNING: Could not auto-detect hidden_size, check model config")
+            return 0  # Don't apply without knowing correct size
+    
+    # Get appropriate kernel
+    kernel_cls = (_optimized_kernels.get("fused_residual_rmsnorm") or 
+                  _optimized_kernels.get("fused_residual_layernorm") or
+                  _optimized_kernels.get("fused_rmsnorm") or
+                  _optimized_kernels.get("rmsnorm") or
+                  _optimized_kernels.get("layernorm"))
+    
+    if kernel_cls is None:
+        print("No normalization kernel available")
         return 0
     
-    patched = 0
-    opt_kernel = _optimized_kernels.get("rmsnorm")
-    
     for name, module in model.named_modules():
-        # Match various RMSNorm implementations
         class_name = module.__class__.__name__
-        if "RMSNorm" in class_name or "Qwen3RMSNorm" in class_name:
-            original_forward = module.forward
-            weight = module.weight
-            eps = getattr(module, 'variance_epsilon', getattr(module, 'eps', 1e-6))
-            
-            def make_opt_forward(w, e):
-                def opt_forward(hidden_states):
-                    return opt_kernel.forward(hidden_states)
-                return opt_forward
-            
-            if opt_kernel:
-                module.forward = make_opt_forward(weight, eps)
+        if "RMSNorm" in class_name or "LayerNorm" in class_name:
+            try:
+                opt_module = kernel_cls(hidden_size)
+                # Copy weights
+                if hasattr(module, 'weight') and hasattr(opt_module, 'weight'):
+                    opt_module.weight.data = module.weight.data.clone()
+                if hasattr(module, 'bias') and hasattr(opt_module, 'bias') and module.bias is not None:
+                    opt_module.bias.data = module.bias.data.clone()
+                
+                # Replace forward
+                original_forward = module.forward
+                def make_opt_forward(opt_mod):
+                    def opt_forward(x, *args, **kwargs):
+                        return opt_mod(x)
+                    return opt_forward
+                module.forward = make_opt_forward(opt_module)
                 patched += 1
+            except Exception as e:
+                pass  # Skip layers that don't match
     
     return patched
 
-def patch_rope(model):
-    """Patch RoPE implementation with optimized version."""
-    if "rope" not in _optimized_kernels:
-        return False
-    
-    # Find and patch the rotary embedding function
-    # This varies by model architecture
-    return True
+def patch_activations(model):
+    """Patch activation functions with fused versions."""
+    patched = 0
+    # Implement based on model architecture
+    return patched
 
-def patch_model(model):
-    """Apply all monkey-patches to the model."""
+def apply_all_patches(model_or_pipe):
+    """
+    CRITICAL: Main entry point for applying all optimizations.
+    Works with both raw models and diffusers pipelines.
+    Returns: (patched_model_or_pipe, stats_dict)
+    """
     stats = {
-        "rmsnorm_layers": patch_rmsnorm_layers(model),
-        "rope": patch_rope(model),
+        "normalization_layers": 0,
+        "activations": 0,
+        "attention": False,
+        "kernels_loaded": list(_optimized_kernels.keys())
     }
-    print(f"Patching complete: {stats}")
-    return model, stats
+    
+    # Handle diffusers pipelines
+    if hasattr(model_or_pipe, 'transformer'):
+        stats["normalization_layers"] = patch_normalization_layers(model_or_pipe.transformer)
+    elif hasattr(model_or_pipe, 'unet'):
+        stats["normalization_layers"] = patch_normalization_layers(model_or_pipe.unet)
+    elif hasattr(model_or_pipe, 'model'):
+        stats["normalization_layers"] = patch_normalization_layers(model_or_pipe.model)
+    else:
+        stats["normalization_layers"] = patch_normalization_layers(model_or_pipe)
+    
+    print(f"\\nPatch stats: {stats}")
+    return model_or_pipe, stats
+
+# Alias for backward compatibility
+patch_model = apply_all_patches
 \`\`\`
 
 ## Create Test Script: \`${dirs.optimized}/test_integration.py\`
@@ -1313,14 +2183,155 @@ print(f"  - optimized_output.png: Optimized model output")
 print(f"  - comparison.png: Side-by-side comparison")
 \`\`\`
 
+## ⚠️ MANDATORY: End-to-End Performance Measurement
+
+You MUST create and run a script that measures ACTUAL end-to-end performance:
+
+\`\`\`python
+"""
+CRITICAL: measure_actual_e2e.py
+Measures ACTUAL end-to-end performance with and without optimizations.
+"""
+import torch
+import time
+import json
+import os
+import sys
+
+sys.path.insert(0, "${dirs.optimized}")
+sys.path.insert(0, "${dirs.demo}")
+
+COMPARISON_DIR = "${dirs.report}/comparison_outputs"
+os.makedirs(COMPARISON_DIR, exist_ok=True)
+
+SEED = 42
+NUM_WARMUP = 2
+NUM_RUNS = 5
+
+def measure_inference():
+    results = {}
+    
+    # Load model/pipeline (adapt for your model type)
+    # For diffusers image models:
+    from diffusers import AutoPipelineForText2Image
+    pipe = AutoPipelineForText2Image.from_pretrained(
+        "${dirs.model}",
+        torch_dtype=torch.bfloat16,
+        device_map="cuda"
+    )
+    
+    prompt = "A beautiful sunset over the ocean, photorealistic, high quality"
+    gen_kwargs = {
+        "prompt": prompt,
+        "height": 512,
+        "width": 512, 
+        "num_inference_steps": 20,
+        "guidance_scale": 1.5,
+    }
+    
+    # ========== ORIGINAL (baseline) ==========
+    print("\\n=== Measuring ORIGINAL (baseline) performance ===")
+    
+    # Warmup
+    for _ in range(NUM_WARMUP):
+        generator = torch.Generator(device="cuda").manual_seed(SEED)
+        _ = pipe(**gen_kwargs, generator=generator)
+    torch.cuda.synchronize()
+    
+    # Generate original output for comparison
+    generator = torch.Generator(device="cuda").manual_seed(SEED)
+    t0 = time.perf_counter()
+    image_original = pipe(**gen_kwargs, generator=generator).images[0]
+    torch.cuda.synchronize()
+    t_original_single = time.perf_counter() - t0
+    image_original.save(f"{COMPARISON_DIR}/original_output.png")
+    
+    # Multiple runs for timing
+    times_original = []
+    for i in range(NUM_RUNS):
+        generator = torch.Generator(device="cuda").manual_seed(SEED + i)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        _ = pipe(**gen_kwargs, generator=generator)
+        torch.cuda.synchronize()
+        times_original.append(time.perf_counter() - t0)
+    
+    t_original = sum(times_original) / len(times_original)
+    print(f"Original avg time: {t_original:.3f}s ({NUM_RUNS} runs)")
+    
+    # ========== APPLY OPTIMIZATIONS ==========
+    print("\\n=== Applying optimized kernels ===")
+    from integrate import patch_model, apply_all_patches
+    pipe, patch_stats = apply_all_patches(pipe)
+    print(f"Patches applied: {patch_stats}")
+    
+    # ========== OPTIMIZED ==========
+    print("\\n=== Measuring OPTIMIZED performance ===")
+    
+    # Warmup with optimizations
+    for _ in range(NUM_WARMUP):
+        generator = torch.Generator(device="cuda").manual_seed(SEED)
+        _ = pipe(**gen_kwargs, generator=generator)
+    torch.cuda.synchronize()
+    
+    # Generate optimized output for comparison (same seed!)
+    generator = torch.Generator(device="cuda").manual_seed(SEED)
+    t0 = time.perf_counter()
+    image_optimized = pipe(**gen_kwargs, generator=generator).images[0]
+    torch.cuda.synchronize()
+    t_optimized_single = time.perf_counter() - t0
+    image_optimized.save(f"{COMPARISON_DIR}/optimized_output.png")
+    
+    # Multiple runs for timing
+    times_optimized = []
+    for i in range(NUM_RUNS):
+        generator = torch.Generator(device="cuda").manual_seed(SEED + i)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        _ = pipe(**gen_kwargs, generator=generator)
+        torch.cuda.synchronize()
+        times_optimized.append(time.perf_counter() - t0)
+    
+    t_optimized = sum(times_optimized) / len(times_optimized)
+    print(f"Optimized avg time: {t_optimized:.3f}s ({NUM_RUNS} runs)")
+    
+    # Calculate speedup
+    speedup = t_original / t_optimized
+    print(f"\\n=== ACTUAL END-TO-END SPEEDUP: {speedup:.2f}x ===")
+    
+    # Save results
+    results = {
+        "original_time_s": t_original,
+        "optimized_time_s": t_optimized,
+        "speedup": speedup,
+        "prompt": prompt,
+        "seed": SEED,
+        "num_runs": NUM_RUNS,
+        "patches_applied": patch_stats,
+        "files": {
+            "original": f"{COMPARISON_DIR}/original_output.png",
+            "optimized": f"{COMPARISON_DIR}/optimized_output.png"
+        }
+    }
+    
+    with open(f"{COMPARISON_DIR}/comparison_results.json", "w") as f:
+        json.dump(results, f, indent=2)
+    
+    print(f"\\nResults saved to {COMPARISON_DIR}/comparison_results.json")
+    return results
+
+if __name__ == "__main__":
+    measure_inference()
+\`\`\`
+
 ## Steps
-1. Create integrate.py with monkey-patches for optimized kernels
-2. Create test_integration.py
-3. Run integration tests
-4. **Generate comparison outputs with fixed seed** (original vs optimized)
+1. Create integrate.py with monkey-patches for optimized kernels  
+2. Create the **CRITICAL** measure_actual_e2e.py script above
+3. Run the measurement script to get ACTUAL end-to-end timing
+4. **Generate BOTH original AND optimized outputs** with same seed
 5. If correctness fails, debug and fix
-6. Record final speedup and save outputs
-7. Update progress.json
+6. Record ACTUAL (not estimated) speedup in progress.json
+7. Update progress.json with actual_speedup (not estimated)
 
 ---
 
@@ -1331,6 +2342,8 @@ Create a comprehensive optimization report.
 
 ## Create Report: \`${dirs.report}/optimization_report.md\`
 
+**⚠️ CRITICAL**: The report MUST include **ACTUAL MEASURED** end-to-end speedup from the comparison_results.json, NOT estimated/theoretical speedup.
+
 \`\`\`markdown
 # Model Optimization Report
 
@@ -1340,8 +2353,10 @@ Create a comprehensive optimization report.
 
 ## Summary
 - **Total Optimization Time**: X hours
-- **Final Speedup**: X.Xx
+- **ACTUAL End-to-End Speedup**: X.Xx (measured, NOT estimated)
 - **Kernels Optimized**: N
+- **Baseline Inference Time**: X.Xs
+- **Optimized Inference Time**: X.Xs
 
 ## Bottleneck Analysis
 
@@ -1374,12 +2389,21 @@ Create a comprehensive optimization report.
 - Max logits difference: X.XXXXXX
 - Status: PASSED/FAILED
 
-## Performance Results
+## Performance Results (ACTUAL MEASURED - NOT ESTIMATED)
 
-| Metric | Original | Optimized | Improvement |
-|--------|----------|-----------|-------------|
-| Inference Time (ms) | XX.X | XX.X | X.Xx |
-| Memory Usage (GB) | X.X | X.X | X.Xx |
+**⚠️ These numbers MUST come from measure_actual_e2e.py output, NOT from kernel-level estimates!**
+
+| Metric | Original | Optimized | Speedup |
+|--------|----------|-----------|---------|
+| End-to-End Inference Time | X.Xs | X.Xs | **X.Xx** |
+| Per-Token Latency (if applicable) | XXms | XXms | X.Xx |
+
+### Kernel-Level Benchmarks (for reference)
+
+| Kernel | Baseline | Optimized | Speedup |
+|--------|----------|-----------|---------|
+| Fused Residual+Norm | X.XX ms | X.XX ms | X.Xx |
+| ... | ... | ... | ... |
 
 ## Comparison Outputs (Seed=42)
 

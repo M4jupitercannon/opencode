@@ -29,6 +29,11 @@ export const KernelOptimizeCommand = cmd({
         type: "string",
         alias: "m",
         describe: "model to use (e.g., opencode/glm-4.7-free, amd-anthropic/claude-opus-4-5)",
+      })
+      .option("dynamic", {
+        type: "boolean",
+        describe: "enable dynamic shape optimization (uses get_shape_ranges() and get_benchmark_shapes())",
+        default: false,
       }),
   async handler(args) {
     const modelArg = args.model as string | undefined
@@ -58,6 +63,11 @@ export const KernelOptimizeCommand = cmd({
     const hasModel = srcContent.includes("class Model(") || srcContent.includes("class Model:")
     const hasModelNew = srcContent.includes("class ModelNew(") || srcContent.includes("class ModelNew:")
     const hasGetInputs = srcContent.includes("def get_inputs")
+    const hasShapeRanges = srcContent.includes("def get_shape_ranges") || srcContent.includes("SHAPE_RANGES")
+    const hasBenchmarkShapes = srcContent.includes("def get_benchmark_shapes")
+    
+    // Auto-enable dynamic mode if shape functions are present
+    const dynamicMode = (args.dynamic as boolean) || hasShapeRanges
 
     if (!hasModel && hasModelNew) {
       // User passed an _opt.py file as source
@@ -118,6 +128,9 @@ export const KernelOptimizeCommand = cmd({
     }
     if (modelArg) {
       UI.println(`Model:        ${modelArg}`)
+    }
+    if (dynamicMode) {
+      UI.println(`Dynamic Mode: ENABLED (will benchmark across shape ranges)`)
     }
     UI.println(`Working dir:  ${srcDir}`)
     UI.println("============================================")
@@ -327,43 +340,93 @@ Max abs error: {max_diff:.2e}, Max rel error: {rel_diff:.2e}
             json.dump(tracker, f, indent=2)
         sys.exit(1)
     
+    # Check for dynamic shape support
+    has_benchmark_shapes = hasattr(src_module, 'get_benchmark_shapes')
+    has_inputs_for_shape = hasattr(src_module, 'get_inputs_for_shape')
+    dynamic_mode = has_benchmark_shapes and has_inputs_for_shape
+    
+    if dynamic_mode:
+        print("\\n=== Dynamic Shape Benchmarking ===")
+        benchmark_shapes = src_module.get_benchmark_shapes()
+        print(f"Testing {len(benchmark_shapes)} shapes: {benchmark_shapes}")
+    
+    def benchmark_at_shape(shape_inputs, num_rounds=5, n_per_round=100):
+        """Benchmark at specific input shape."""
+        # Warmup
+        for _ in range(10):
+            model_ref(*shape_inputs)
+            model_new(*shape_inputs)
+        torch.cuda.synchronize()
+        
+        ref_times = []
+        new_times = []
+        
+        for r in range(num_rounds):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(n_per_round):
+                model_ref(*shape_inputs)
+            torch.cuda.synchronize()
+            ref_times.append((time.perf_counter() - t0) / n_per_round * 1000)
+            
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(n_per_round):
+                model_new(*shape_inputs)
+            torch.cuda.synchronize()
+            new_times.append((time.perf_counter() - t0) / n_per_round * 1000)
+        
+        return statistics.median(ref_times), statistics.median(new_times)
+    
     # Benchmark
     print("\\n=== Benchmarking ===")
     
-    # Warmup
-    for _ in range(20):
-        model_ref(*inputs)
-        model_new(*inputs)
-    torch.cuda.synchronize()
-    
-    # Multiple rounds for stability
-    NUM_ROUNDS = 5
-    N_PER_ROUND = 100
-    ref_times = []
-    new_times = []
-    
-    for r in range(NUM_ROUNDS):
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(N_PER_ROUND):
-            model_ref(*inputs)
-        torch.cuda.synchronize()
-        ref_times.append((time.perf_counter() - t0) / N_PER_ROUND * 1000)
+    if dynamic_mode:
+        # Benchmark across all shapes
+        shape_results = []
+        speedups = []
         
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(N_PER_ROUND):
-            model_new(*inputs)
-        torch.cuda.synchronize()
-        new_times.append((time.perf_counter() - t0) / N_PER_ROUND * 1000)
+        for shape in benchmark_shapes:
+            shape_inputs = [x.cuda() if hasattr(x, 'cuda') else x 
+                          for x in src_module.get_inputs_for_shape(*shape)]
+            t_ref, t_new = benchmark_at_shape(shape_inputs)
+            sp = t_ref / t_new
+            shape_results.append({
+                "shape": shape,
+                "ref_ms": t_ref,
+                "opt_ms": t_new,
+                "speedup": sp
+            })
+            speedups.append(sp)
+            print(f"  Shape {shape}: Ref={t_ref:.3f}ms, Opt={t_new:.3f}ms, Speedup={sp:.2f}x")
+        
+        # Geometric mean speedup (better for ratios)
+        import math
+        speedup = math.exp(sum(math.log(s) for s in speedups) / len(speedups))
+        t_ref = sum(r["ref_ms"] for r in shape_results) / len(shape_results)
+        t_new = sum(r["opt_ms"] for r in shape_results) / len(shape_results)
+        
+        print(f"\\n=== Dynamic Shape Summary ===")
+        print(f"Shapes tested: {len(benchmark_shapes)}")
+        print(f"Geometric mean speedup: {speedup:.2f}x")
+        print(f"Min speedup: {min(speedups):.2f}x at {benchmark_shapes[speedups.index(min(speedups))]}")
+        print(f"Max speedup: {max(speedups):.2f}x at {benchmark_shapes[speedups.index(max(speedups))]}")
+        
+        # IMPORTANT: Use min speedup to avoid regressions
+        effective_speedup = min(speedups)
+        if effective_speedup < 1.0:
+            print(f"\\n*** WARNING: Kernel is SLOWER at some shapes! Min speedup: {effective_speedup:.2f}x ***")
+    else:
+        # Standard fixed-shape benchmarking
+        NUM_ROUNDS = 5
+        N_PER_ROUND = 100
+        t_ref, t_new = benchmark_at_shape(inputs, NUM_ROUNDS, N_PER_ROUND)
+        speedup = t_ref / t_new
+        shape_results = None
     
-    t_ref = statistics.median(ref_times)
-    t_new = statistics.median(new_times)
-    speedup = t_ref / t_new
-    
-    print(f"\\n=== Performance (median of {NUM_ROUNDS} rounds) ===")
-    print(f"PyTorch (ref): {t_ref:.4f} ms (std: {statistics.stdev(ref_times):.4f})")
-    print(f"Triton (opt):  {t_new:.4f} ms (std: {statistics.stdev(new_times):.4f})")
+    print(f"\\n=== Performance Summary ===")
+    print(f"PyTorch (ref): {t_ref:.4f} ms")
+    print(f"Triton (opt):  {t_new:.4f} ms")
     print(f"Speedup: {speedup:.2f}x")
     
     # Check if this is the best result
@@ -376,22 +439,31 @@ Max abs error: {max_diff:.2e}, Max rel error: {rel_diff:.2e}
         tracker['best_ref_time'] = t_ref
         tracker['best_opt_time'] = t_new
         tracker['best_attempt'] = attempt
+        if dynamic_mode and shape_results:
+            tracker['shape_results'] = shape_results
     else:
         print(f"\\nNot best. Current best: {tracker['best_speedup']:.2f}x (Attempt {tracker.get('best_attempt', '?')})")
     
     tracker['attempt'] = attempt
+    tracker['dynamic_mode'] = dynamic_mode
     
     # Save tracker
     with open(TRACKER, 'w') as f:
         json.dump(tracker, f, indent=2)
     
     # Log the attempt
+    shape_log = ""
+    if dynamic_mode and shape_results:
+        shape_log = "\\n### Shape-wise Results\\n"
+        for sr in shape_results:
+            shape_log += f"- {sr['shape']}: {sr['speedup']:.2f}x (ref={sr['ref_ms']:.3f}ms, opt={sr['opt_ms']:.3f}ms)\\n"
+    
     log_entry = f"""
 ## Attempt {attempt} - {time.strftime('%Y-%m-%dT%H:%M:%S')}{'  *** BEST ***' if is_best else ''}
-Speedup: {speedup:.2f}x
+Speedup: {speedup:.2f}x {'(geometric mean)' if dynamic_mode else ''}
 Ref time: {t_ref:.4f} ms
 Opt time: {t_new:.4f} ms
-
+{shape_log}
 ### Code Snapshot
 \`\`\`python
 {target_code}
@@ -530,6 +602,22 @@ The target file already exists! This means you should:
 
 ## Mode: ${srcUsesTriton ? "Triton-to-Triton (continue optimizing existing Triton)" : "Torch-to-Triton (convert PyTorch to Triton)"}
 ${targetExists ? "**CONTINUE MODE**: Target file exists, use it as starting point!" : ""}
+${dynamicMode ? `
+## ⚠️ DYNAMIC SHAPE MODE ENABLED
+
+This kernel will be benchmarked across **multiple shapes**! The source file provides:
+- \`get_shape_ranges()\`: Returns shape range configuration
+- \`get_benchmark_shapes()\`: Returns list of shapes to benchmark
+- \`get_inputs_for_shape(*shape)\`: Returns inputs at specified shape
+
+**Your kernel MUST work efficiently across all shapes, not just one!**
+
+**Key Requirements for Dynamic Shape Kernels:**
+1. Use autotune with configs that work for BOTH small and large inputs
+2. Include block sizes appropriate for the full range (e.g., 32 for small seq, 256 for large)
+3. Handle boundary conditions properly with masks
+4. Test passes if kernel is faster at ALL shapes in the range
+` : ""}
 
 **IMPORTANT**: 
 - Source file provides \`Model\` class + \`get_inputs()\` as ACCURACY BASELINE
@@ -636,12 +724,15 @@ Use @triton.autotune to let Triton find optimal configurations:
 \`\`\`python
 @triton.autotune(
     configs=[
-        # Generate configs with VARYING block sizes
-        # Start with powers of 2: 32, 64, 128, 256
-        # Vary num_warps: 2, 4, 8
-        # Vary num_stages: 1, 2, 3, 4
+        # IMPORTANT: Cover configs for BOTH small and large inputs!
+        # Small inputs (seq=1-64): Need smaller blocks, fewer warps
+        triton.Config({'BLOCK_SIZE': 32}, num_warps=2, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 64}, num_warps=2, num_stages=1),
+        # Medium inputs
         triton.Config({'BLOCK_SIZE': 64}, num_warps=4, num_stages=2),
         triton.Config({'BLOCK_SIZE': 128}, num_warps=4, num_stages=2),
+        # Large inputs (seq=256+)
+        triton.Config({'BLOCK_SIZE': 128}, num_warps=8, num_stages=3),
         triton.Config({'BLOCK_SIZE': 256}, num_warps=8, num_stages=2),
         # ... add 10-20 configs covering the parameter space
     ],
@@ -654,7 +745,29 @@ Use @triton.autotune to let Triton find optimal configurations:
 - Cover different block sizes (32 to 256)
 - Vary num_warps (2, 4, 8) and num_stages (1, 2, 3, 4)
 - Include both conservative and aggressive configs
+- **For dynamic shapes**: Include small block configs (32, 64) for short sequences!
 - Let autotune find what works for YOUR specific problem
+
+### Dynamic Shape Best Practices
+
+When optimizing for shape ranges (e.g., seq_len: 1-512):
+
+1. **Include configs for the FULL range**:
+   - Small (seq<64): \`BLOCK_SIZE=32\`, \`num_warps=2\`
+   - Medium (64-256): \`BLOCK_SIZE=64-128\`, \`num_warps=4\`
+   - Large (>256): \`BLOCK_SIZE=128-256\`, \`num_warps=8\`
+
+2. **Handle edge cases**:
+   - When input size < BLOCK_SIZE, use proper masks
+   - Avoid warp divergence at boundaries
+
+3. **Key the autotune on dynamic dimensions**:
+\`\`\`python
+@triton.autotune(
+    configs=[...],
+    key=['seq_len', 'hidden_size'],  # Include ALL dimensions that vary
+)
+\`\`\`
 
 ### STEP 3: Common Optimization Techniques
 
