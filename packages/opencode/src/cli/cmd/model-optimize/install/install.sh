@@ -6,7 +6,7 @@
 #   bash install.sh
 #
 # Or from remote:
-#   curl -fsSL https://raw.githubusercontent.com/amd/opencode/dev/packages/opencode/src/cli/cmd/model-optimize/install/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/vivienfanghuagood/opencode/skill/packages/opencode/src/cli/cmd/model-optimize/install/install.sh | bash
 #
 # After install, use in opencode TUI:
 #   /model-optimize Qwen/Qwen3-8B
@@ -41,7 +41,7 @@ if [ -f "$SCRIPT_DIR/agent/model-opt.md" ]; then
     cp "$SCRIPT_DIR/scripts/"*.py "$OPENCODE_DIR/scripts/"
 else
     echo "Downloading from GitHub..."
-    BASE_URL="https://raw.githubusercontent.com/amd/opencode/dev/packages/opencode/src/cli/cmd/model-optimize/install"
+    BASE_URL="https://raw.githubusercontent.com/vivienfanghuagood/opencode/skill/packages/opencode/src/cli/cmd/model-optimize/install"
     curl -fsSL "$BASE_URL/agent/model-opt.md" -o "$OPENCODE_DIR/agent/model-opt.md"
     curl -fsSL "$BASE_URL/command/model-optimize.md" -o "$OPENCODE_DIR/command/model-optimize.md"
     curl -fsSL "$BASE_URL/scripts/shape_capture.py" -o "$OPENCODE_DIR/scripts/shape_capture.py"
