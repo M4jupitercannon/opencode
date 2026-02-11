@@ -91,6 +91,7 @@ def run_bench_serve(model: str, port: int, num_prompts: int, concurrency: int,
         "--num-prompts", str(num_prompts),
         "--max-concurrency", str(concurrency),
         "--request-rate", "inf",
+        "--save-result",
         "--result-dir", result_dir,
         "--result-filename", result_filename,
     ]

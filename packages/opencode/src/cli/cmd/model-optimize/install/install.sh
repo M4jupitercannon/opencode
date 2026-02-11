@@ -1,73 +1,69 @@
 #!/bin/bash
 #
-# model-optimize installer for opencode
+# model-optimize & kernel-optimize installer for opencode
 #
 # One-click install:
 #   bash install.sh
 #
 # Or from remote:
-#   curl -fsSL https://raw.githubusercontent.com/vivienfanghuagood/opencode/skill/packages/opencode/src/cli/cmd/model-optimize/install/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/vivienfanghuagood/opencode/opt-vllm/packages/opencode/src/cli/cmd/model-optimize/install/install.sh | bash
 #
 # After install, use in opencode TUI:
 #   /model-optimize Qwen/Qwen3-8B
-#   /model-optimize Qwen/Qwen3-8B ./my_output_dir
+#   /kernel-optimize problem_rmsnorm.py 1.5
 #
 
 set -e
 
-# Detect install directory
 OPENCODE_DIR="${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}" 2>/dev/null || echo ".")" && pwd)"
 
-echo "╔════════════════════════════════════════════╗"
-echo "║  model-optimize installer for opencode     ║"
-echo "╚════════════════════════════════════════════╝"
+echo "╔═══════════════════════════════════════════════════╗"
+echo "║  model-optimize & kernel-optimize for opencode    ║"
+echo "╚═══════════════════════════════════════════════════╝"
 echo ""
 echo "Install directory: $OPENCODE_DIR"
 echo ""
 
-# Determine script directory (works for both local and piped execution)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}" 2>/dev/null || echo ".")" && pwd)"
+mkdir -p "$OPENCODE_DIR/agent" "$OPENCODE_DIR/command" "$OPENCODE_DIR/scripts"
 
-# Create directories
-mkdir -p "$OPENCODE_DIR/agent"
-mkdir -p "$OPENCODE_DIR/command"
-mkdir -p "$OPENCODE_DIR/scripts"
+BASE_URL="https://raw.githubusercontent.com/vivienfanghuagood/opencode/opt-vllm/packages/opencode/src/cli/cmd/model-optimize/install"
 
-# Check if files exist locally (local install) or need to be downloaded
+AGENT_FILES="model-opt.md"
+COMMAND_FILES="model-optimize.md kernel-optimize.md"
+SCRIPT_FILES="kernel_test_runner.py kernel_finalize.py shape_capture.py analyze_fusion.py vllm_trace_extractor.py vllm_benchmark.py patch_vllm.py"
+
 if [ -f "$SCRIPT_DIR/agent/model-opt.md" ]; then
     echo "Installing from local files..."
     cp "$SCRIPT_DIR/agent/model-opt.md" "$OPENCODE_DIR/agent/"
-    cp "$SCRIPT_DIR/command/model-optimize.md" "$OPENCODE_DIR/command/"
+    for f in $COMMAND_FILES; do cp "$SCRIPT_DIR/command/$f" "$OPENCODE_DIR/command/"; done
     cp "$SCRIPT_DIR/scripts/"*.py "$OPENCODE_DIR/scripts/"
 else
     echo "Downloading from GitHub..."
-    BASE_URL="https://raw.githubusercontent.com/vivienfanghuagood/opencode/skill/packages/opencode/src/cli/cmd/model-optimize/install"
-    curl -fsSL "$BASE_URL/agent/model-opt.md" -o "$OPENCODE_DIR/agent/model-opt.md"
-    curl -fsSL "$BASE_URL/command/model-optimize.md" -o "$OPENCODE_DIR/command/model-optimize.md"
-    curl -fsSL "$BASE_URL/scripts/shape_capture.py" -o "$OPENCODE_DIR/scripts/shape_capture.py"
-    curl -fsSL "$BASE_URL/scripts/analyze_fusion.py" -o "$OPENCODE_DIR/scripts/analyze_fusion.py"
+    for f in $AGENT_FILES; do curl -fsSL "$BASE_URL/agent/$f" -o "$OPENCODE_DIR/agent/$f"; done
+    for f in $COMMAND_FILES; do curl -fsSL "$BASE_URL/command/$f" -o "$OPENCODE_DIR/command/$f"; done
+    for f in $SCRIPT_FILES; do curl -fsSL "$BASE_URL/scripts/$f" -o "$OPENCODE_DIR/scripts/$f"; done
 fi
 
 echo ""
 echo "✅ Installed successfully!"
 echo ""
-echo "Files installed:"
-echo "  $OPENCODE_DIR/agent/model-opt.md"
-echo "  $OPENCODE_DIR/command/model-optimize.md"
-echo "  $OPENCODE_DIR/scripts/shape_capture.py"
-echo "  $OPENCODE_DIR/scripts/analyze_fusion.py"
+echo "Commands installed:"
+echo "  /model-optimize  — end-to-end HuggingFace model optimization"
+echo "  /kernel-optimize — optimize a single PyTorch op to Triton"
 echo ""
-echo "╔════════════════════════════════════════════╗"
-echo "║  Usage (in opencode TUI):                  ║"
-echo "║                                            ║"
-echo "║  /model-optimize Qwen/Qwen3-8B             ║"
-echo "║  /model-optimize Qwen/Qwen3-8B ./output    ║"
-echo "║                                            ║"
-echo "╚════════════════════════════════════════════╝"
+echo "Scripts installed (${OPENCODE_DIR}/scripts/):"
+for f in $SCRIPT_FILES; do echo "  $f"; done
+echo ""
+echo "╔═══════════════════════════════════════════════════╗"
+echo "║  Usage (in opencode TUI):                         ║"
+echo "║                                                   ║"
+echo "║  /model-optimize Qwen/Qwen3-8B                    ║"
+echo "║  /kernel-optimize problem_rmsnorm.py 1.5           ║"
+echo "║                                                   ║"
+echo "╚═══════════════════════════════════════════════════╝"
 echo ""
 echo "To uninstall:"
 echo "  rm $OPENCODE_DIR/agent/model-opt.md"
-echo "  rm $OPENCODE_DIR/command/model-optimize.md"
-echo "  rm $OPENCODE_DIR/scripts/shape_capture.py"
-echo "  rm $OPENCODE_DIR/scripts/analyze_fusion.py"
-
+echo "  rm $OPENCODE_DIR/command/{model-optimize,kernel-optimize}.md"
+echo "  rm $OPENCODE_DIR/scripts/{$(echo $SCRIPT_FILES | tr ' ' ',')}"

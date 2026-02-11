@@ -40,6 +40,7 @@ vllm bench serve \
   --num-prompts {{NUM_PROMPTS}} \
   --max-concurrency {{CONCURRENCY}} \
   --request-rate inf \
+  --save-result \
   --result-dir {{PROFILE_DIR}} \
   --result-filename baseline_benchmark.json \
   --label baseline
@@ -92,6 +93,7 @@ vllm bench serve \
   --num-prompts 30 \
   --max-concurrency {{CONCURRENCY}} \
   --request-rate inf \
+  --save-result \
   --result-dir {{PROFILE_DIR}} \
   --result-filename trace_benchmark.json \
   --label trace
