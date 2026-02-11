@@ -55,6 +55,26 @@ export const ModelOptimizeCommand = cmd({
         type: "string",
         alias: "f",
         describe: "start from specific phase (demo, profile, problems, optimize, integrate, report)",
+      })
+      .option("concurrency", {
+        type: "number",
+        describe: "max concurrent requests for benchmarking (default: 16)",
+        default: 16,
+      })
+      .option("input-len", {
+        type: "number",
+        describe: "input sequence length for benchmarking (default: 1024)",
+        default: 1024,
+      })
+      .option("output-len", {
+        type: "number",
+        describe: "output sequence length for benchmarking (default: 1024)",
+        default: 1024,
+      })
+      .option("num-prompts", {
+        type: "number",
+        describe: "number of prompts for benchmarking (default: 100)",
+        default: 100,
       }),
   async handler(args) {
     const llmArg = args.llm as string | undefined
@@ -183,6 +203,10 @@ export const ModelOptimizeCommand = cmd({
       skipDownload: args["skip-download"] as boolean,
       startPhase,
       existingProgress,
+      concurrency: args.concurrency as number,
+      inputLen: args["input-len"] as number,
+      outputLen: args["output-len"] as number,
+      numPrompts: args["num-prompts"] as number,
     }
 
     // Copy reusable Python scripts to output directory

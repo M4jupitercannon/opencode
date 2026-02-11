@@ -1,140 +1,214 @@
-# Phase 7: Integration & Final Testing {{SKIP_LABEL}}
+# Phase 7: Integration & End-to-End Testing {{SKIP_LABEL}}
 
 ## Goal
-Integrate optimized kernels into vLLM serving and **MEASURE ACTUAL end-to-end performance**.
+Apply optimized kernels to vLLM and measure ACTUAL serving throughput improvement.
 
-## ⚠️ CRITICAL REQUIREMENTS
-1. **MEASURE ACTUAL end-to-end speedup** using vLLM benchmark tools
-2. **Compare original vs optimized** vLLM serving throughput
-3. **Run the SAME workload** with and without optimizations
+## ⚠️ CRITICAL: The ONLY meaningful metric is end-to-end serving throughput
+- Kernel-level speedup numbers are reference only
+- **MUST compare vLLM bench serve results: baseline vs patched**
+- Same concurrency, same input/output lengths, same number of prompts
 
-## Use Project venv
-```bash
-source {{OUTPUT_DIR}}/venv/bin/activate
+## Overview: Before/After Comparison
+
+```
+┌─────────────────────────────┐     ┌─────────────────────────────┐
+│   BASELINE vLLM serve       │     │   PATCHED vLLM serve        │
+│   (no modifications)        │     │   (with optimized kernels)  │
+│                             │     │                             │
+│   vllm bench serve          │ vs  │   vllm bench serve          │
+│   → throughput, TPOT, TTFT  │     │   → throughput, TPOT, TTFT  │
+└─────────────────────────────┘     └─────────────────────────────┘
 ```
 
-## vLLM Integration Strategy
+## Step 1: Prepare Patched vLLM Launcher
 
-For vLLM, optimizations are integrated via:
-1. **Custom attention backends** (e.g., AITER Flash Attention)
-2. **Monkey-patching** vLLM's internal modules at startup
-3. **Environment variables** to select optimized paths
+A `patch_vllm.py` script is provided at `{{OUTPUT_DIR}}/scripts/patch_vllm.py`.
+It monkey-patches vLLM's internal layers (RMSNorm, activations) with your optimized Triton kernels.
 
-### Create Integration Script: `{{OPTIMIZED_DIR}}/integrate_vllm.py`
+Create a wrapper script that:
+1. Imports `patch_vllm` to apply monkey-patches
+2. Then starts vLLM serve normally
 
-Write an `integrate_vllm.py` that:
-1. Imports optimized Triton kernels from `*_opt.py` files
-2. Monkey-patches vLLM's model modules (e.g., RMSNorm, attention)
-3. Can be loaded before vLLM serve starts
-
-```python
-"""
-Usage: Import this before starting vLLM to apply optimized kernels.
-  python -c "import integrate_vllm; integrate_vllm.apply_patches()" && vllm serve ...
-OR:
-  VLLM_PLUGINS=integrate_vllm vllm serve ...
-"""
-import sys, os
-sys.path.insert(0, os.path.dirname(__file__))
-
-# Import optimized kernels
-_optimized = {}
-for name in ["fused_rmsnorm", "fused_residual_rmsnorm", "fused_rope", "fused_swiglu"]:
-    try:
-        mod = __import__(f"problem_{name}_opt")
-        if hasattr(mod, 'ModelNew'):
-            _optimized[name] = mod.ModelNew
-            print(f"  [OK] Loaded: {name}")
-    except Exception as e:
-        print(f"  [SKIP] {name}: {e}")
-
-def apply_patches():
-    """Apply optimized kernels to vLLM model layers."""
-    # Monkey-patch approach depends on which kernels succeeded
-    # Example: patch RMSNorm in vllm.model_executor.layers
-    pass
-```
-
-## MANDATORY: End-to-End Performance Measurement
-
-### Baseline (original vLLM)
 ```bash
 source {{OUTPUT_DIR}}/venv/bin/activate
 
-# Start original vLLM
-vllm serve {{HF_MODEL}} --dtype auto --max-model-len 2048 --port 8192 &
+cat > {{OPTIMIZED_DIR}}/run_patched_vllm.py << 'LAUNCHER'
+#!/usr/bin/env python3
+"""Launch vLLM with optimized kernel patches applied."""
+import sys
+import os
+
+# Add paths for optimized kernels and patch script
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "scripts"))
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "problems"))
+
+# Apply patches BEFORE vLLM loads the model
+os.environ["PATCH_DIR"] = SCRIPT_DIR
+import patch_vllm
+stats = patch_vllm.apply_all(SCRIPT_DIR)
+
+print(f"\nPatches applied: {stats}")
+print("Starting vLLM serve with optimized kernels...\n")
+
+# Now start vLLM - it will use patched modules
+from vllm.entrypoints.openai.api_server import run_server
+import asyncio
+# Pass through command line args
+asyncio.run(run_server())
+LAUNCHER
+
+chmod +x {{OPTIMIZED_DIR}}/run_patched_vllm.py
+```
+
+## Step 2: Copy optimized kernels to integration directory
+
+```bash
+# Copy all successful *_opt.py to optimized/
+cd {{PROBLEMS_DIR}}
+for f in *_opt.py; do
+  if [ -f "$f" ]; then
+    cp "$f" {{OPTIMIZED_DIR}}/
+    echo "Copied: $f"
+  fi
+done
+
+# Also copy the patch script
+cp {{OUTPUT_DIR}}/scripts/patch_vllm.py {{OPTIMIZED_DIR}}/
+```
+
+## Step 3: Benchmark BASELINE (original vLLM)
+
+This should already be done in Phase 4. If not:
+
+```bash
+source {{OUTPUT_DIR}}/venv/bin/activate
+
+vllm serve {{HF_MODEL}} --dtype auto --max-model-len 4096 --port 8192 --disable-log-requests &
 VLLM_PID=$!
-sleep 60
+timeout 300 bash -c 'until curl -s http://localhost:8192/health > /dev/null 2>&1; do sleep 5; done'
 
-# Benchmark with vLLM's built-in benchmark
-python3 -m vllm.entrypoints.openai.run_batch_benchmark \
-  --model {{HF_MODEL}} \
-  --endpoint /v1/completions \
-  --num-prompts 50 \
-  --prompt-len 128 \
-  --output-len 64 \
-  --port 8192 \
-  2>&1 | tee {{REPORT_DIR}}/baseline_benchmark.txt
-
-# Or use simple timing
-python3 -c "
-import time, requests, json
-url = 'http://localhost:8192/v1/completions'
-prompts = ['The future of AI is'] * 20
-times = []
-for p in prompts:
-    t0 = time.perf_counter()
-    r = requests.post(url, json={'model': '{{HF_MODEL}}', 'prompt': p, 'max_tokens': 64})
-    times.append(time.perf_counter() - t0)
-avg_ms = sum(times)/len(times)*1000
-print(f'Baseline avg latency: {avg_ms:.1f}ms')
-with open('{{REPORT_DIR}}/baseline_latency.json', 'w') as f:
-    json.dump({'avg_ms': avg_ms, 'times_ms': [t*1000 for t in times]}, f, indent=2)
-"
+vllm bench serve \
+  --model {{HF_MODEL}} --port 8192 \
+  --dataset-name random \
+  --input-len {{INPUT_LEN}} --output-len {{OUTPUT_LEN}} \
+  --num-prompts {{NUM_PROMPTS}} \
+  --max-concurrency {{CONCURRENCY}} \
+  --request-rate inf \
+  --result-dir {{REPORT_DIR}} \
+  --result-filename baseline_serving.json \
+  --label baseline
 
 kill $VLLM_PID 2>/dev/null; wait $VLLM_PID 2>/dev/null
 ```
 
-### Optimized (with kernel patches)
-```bash
-# Start vLLM with optimized kernels
-# Method 1: Pre-import patches
-python3 -c "
-import sys; sys.path.insert(0, '{{OPTIMIZED_DIR}}')
-import integrate_vllm; integrate_vllm.apply_patches()
-import vllm
-# ... continue with vLLM serve
-"
+## Step 4: Benchmark PATCHED vLLM
 
-# Method 2: If using AITER or env-based optimizations
-# Set appropriate environment variables and re-run benchmark
+```bash
+source {{OUTPUT_DIR}}/venv/bin/activate
+
+# Start patched vLLM
+python3 {{OPTIMIZED_DIR}}/run_patched_vllm.py \
+  --model {{HF_MODEL}} --dtype auto --max-model-len 4096 \
+  --port 8193 --disable-log-requests &
+PATCHED_PID=$!
+
+echo "Waiting for patched vLLM to be ready..."
+timeout 300 bash -c 'until curl -s http://localhost:8193/health > /dev/null 2>&1; do sleep 5; done'
+echo "Patched server ready!"
+
+# Same benchmark parameters as baseline
+vllm bench serve \
+  --model {{HF_MODEL}} --port 8193 \
+  --dataset-name random \
+  --input-len {{INPUT_LEN}} --output-len {{OUTPUT_LEN}} \
+  --num-prompts {{NUM_PROMPTS}} \
+  --max-concurrency {{CONCURRENCY}} \
+  --request-rate inf \
+  --result-dir {{REPORT_DIR}} \
+  --result-filename optimized_serving.json \
+  --label optimized
+
+kill $PATCHED_PID 2>/dev/null; wait $PATCHED_PID 2>/dev/null
 ```
 
-### Compare Results
+## Step 5: Compare Results
+
 ```bash
 python3 -c "
-import json
-with open('{{REPORT_DIR}}/baseline_latency.json') as f:
+import json, os
+
+report_dir = '{{REPORT_DIR}}'
+os.makedirs(os.path.join(report_dir, 'comparison_outputs'), exist_ok=True)
+
+with open(os.path.join(report_dir, 'baseline_serving.json')) as f:
     baseline = json.load(f)
-with open('{{REPORT_DIR}}/optimized_latency.json') as f:
+with open(os.path.join(report_dir, 'optimized_serving.json')) as f:
     optimized = json.load(f)
-speedup = baseline['avg_ms'] / optimized['avg_ms']
-print(f'Baseline:  {baseline[\"avg_ms\"]:.1f}ms')
-print(f'Optimized: {optimized[\"avg_ms\"]:.1f}ms')
-print(f'Speedup:   {speedup:.2f}x')
-results = {
-    'baseline_ms': baseline['avg_ms'],
-    'optimized_ms': optimized['avg_ms'],
-    'speedup': speedup,
+
+def safe_get(d, key, default=0):
+    v = d.get(key, default)
+    return float(v) if v is not None else default
+
+metrics = [
+    ('request_throughput', 'req/s', True),       # higher is better
+    ('output_throughput', 'tok/s', True),         # higher is better (OTPS)
+    ('input_throughput', 'tok/s', True),          # higher is better (ITPS)
+    ('mean_tpot_ms', 'ms', False),               # lower is better
+    ('median_tpot_ms', 'ms', False),             # lower is better
+    ('p99_tpot_ms', 'ms', False),                # lower is better
+    ('mean_ttft_ms', 'ms', False),               # lower is better
+    ('median_ttft_ms', 'ms', False),             # lower is better
+    ('mean_itl_ms', 'ms', False),                # lower is better
+]
+
+print('=' * 70)
+print(f'{\"Metric\":<25} {\"Baseline\":>12} {\"Optimized\":>12} {\"Change\":>12}')
+print('=' * 70)
+
+comparison = {}
+for metric, unit, higher_better in metrics:
+    b = safe_get(baseline, metric)
+    o = safe_get(optimized, metric)
+    if b > 0:
+        if higher_better:
+            change = (o - b) / b * 100
+        else:
+            change = (b - o) / b * 100  # positive = improvement for latency
+        symbol = '+' if change > 0 else ''
+        print(f'{metric:<25} {b:>10.2f}{unit:>2} {o:>10.2f}{unit:>2} {symbol}{change:>8.1f}%')
+    else:
+        print(f'{metric:<25} {b:>10.2f}{unit:>2} {o:>10.2f}{unit:>2} {\"N/A\":>9}')
+    comparison[metric] = {'baseline': b, 'optimized': o}
+
+# Calculate overall speedup based on output throughput
+b_otps = safe_get(baseline, 'output_throughput')
+o_otps = safe_get(optimized, 'output_throughput')
+speedup = o_otps / b_otps if b_otps > 0 else 1.0
+print(f'\\n>>> OVERALL SERVING SPEEDUP (OTPS): {speedup:.3f}x <<<')
+
+result = {
+    'baseline': {k: safe_get(baseline, k) for k, _, _ in metrics},
+    'optimized': {k: safe_get(optimized, k) for k, _, _ in metrics},
+    'speedup_otps': speedup,
+    'concurrency': {{CONCURRENCY}},
+    'input_len': {{INPUT_LEN}},
+    'output_len': {{OUTPUT_LEN}},
+    'num_prompts': {{NUM_PROMPTS}},
 }
-with open('{{REPORT_DIR}}/comparison_outputs/comparison_results.json', 'w') as f:
-    json.dump(results, f, indent=2)
+with open(os.path.join(report_dir, 'comparison_outputs', 'comparison_results.json'), 'w') as f:
+    json.dump(result, f, indent=2)
+print(f'\\nResults saved to {report_dir}/comparison_outputs/comparison_results.json')
 "
 ```
 
-## Steps
-1. Create integrate_vllm.py with kernel patches
-2. Benchmark original vLLM (baseline)
-3. Apply patches and benchmark optimized vLLM
-4. Record ACTUAL speedup in progress.json
-5. Update progress.json: phases_completed.append("integrate")
+## Steps Summary
+1. Create patched vLLM launcher with `run_patched_vllm.py`
+2. Copy optimized kernels to integration directory
+3. Benchmark baseline vLLM (`vllm bench serve`)
+4. Benchmark patched vLLM (same parameters)
+5. Compare throughput metrics (OTPS, TPOT, TTFT)
+6. Record results in progress.json
+
+Update progress.json: phases_completed.append("integrate")

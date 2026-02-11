@@ -84,6 +84,11 @@ export function buildAgentPrompt(config: ModelOptConfig): string {
     PROGRESS_FILE: path.join(outputDir, "progress.json"),
     START_PHASE: startPhase,
     SKIP_DOWNLOAD_LABEL: skipDownload ? "(SKIP if exists)" : "",
+    // Benchmark parameters (configurable via ModelOptConfig)
+    CONCURRENCY: String((config as any).concurrency ?? 16),
+    INPUT_LEN: String((config as any).inputLen ?? 1024),
+    OUTPUT_LEN: String((config as any).outputLen ?? 1024),
+    NUM_PROMPTS: String((config as any).numPrompts ?? 100),
   }
 
   // Add per-phase skip labels

@@ -29,6 +29,14 @@ export interface ModelOptConfig {
   startPhase: string
   /** Existing progress data when resuming */
   existingProgress: any
+  /** Max concurrent requests for benchmarking (default: 16) */
+  concurrency: number
+  /** Input sequence length for benchmarking (default: 1024) */
+  inputLen: number
+  /** Output sequence length for benchmarking (default: 1024) */
+  outputLen: number
+  /** Number of prompts for benchmarking (default: 100) */
+  numPrompts: number
 }
 
 /** Ordered list of pipeline phases */
