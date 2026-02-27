@@ -34,58 +34,215 @@ python <output_dir>/scripts/validate_pipeline.py --project-dir <output_dir> --ph
 
 ## Goal
 Search for latest docker images such as rocm/vllm-dev in dockerhub is compatible to vllm and platform, and create a container as isolated environment and install all required dependencies.
+
 If there is no docker images available, then Create an isolated Python virtual environment with vLLM-rocm and all required dependencies.
 
 ## Steps
 
-### 1. Detect ROCm Version
-```bash
-ROCM_VERSION=$(cat /opt/rocm/.info/version 2>/dev/null | head -1 | cut -d'-' -f1 || echo "6.0")
-echo "Detected ROCm version: $ROCM_VERSION"
-```
+### 1. Detect host platform
 
-### 2. Create venv with system site-packages
 ```bash
-cd <output_dir>
+ROCM_VERSION=$(cat /opt/rocm/.info/version 2>/dev/null | head -1 | cut -d'-' -f1 || echo "unknown")
 
-if [ ! -d "venv" ]; then
-  python3 -m venv venv --system-site-packages
-  echo "Created venv with system site-packages access"
+# Try rocminfo first, fall back to kfd sysfs (works without /dev/kfd permissions)
+GPU_ARCH=$(rocminfo 2>/dev/null | grep -oP 'gfx\w+' | head -1 || true)
+if [ -z "$GPU_ARCH" ]; then
+  # gfx_target_version is packed decimal: major*10000 + minor*100 + stepping
+  # gfx string format: gfx{major}{minor:hex}{stepping:hex} e.g. 120001→gfx1201, 90010→gfx90a
+  GPU_ARCH=$(cat /sys/class/kfd/kfd/topology/nodes/*/properties 2>/dev/null \
+    | grep gfx_target_version | awk '$2 > 0 {v=$2; maj=int(v/10000); min=int((v%10000)/100); step=v%100; printf "gfx%d%x%x\n", maj, min, step}' \
+    | head -1 || echo "unknown")
 fi
 
-source venv/bin/activate
+DOCKER_OK=$(docker info >/dev/null 2>&1 && echo "yes" || echo "no")
 
-python3 -c "import torch; print(f'PyTorch {torch.__version__}, CUDA: {torch.cuda.is_available()}')"
-python3 -c "import triton; print('Triton available')"
+echo "ROCm: $ROCM_VERSION  GPU: $GPU_ARCH  Docker: $DOCKER_OK"
 ```
 
-### 3. Install vLLM-rocm
+### 2. Search for a compatible Docker image (preferred path)
+
+Look for a `rocm/vllm-dev` nightly image whose ROCm version and GPU architecture match the host.
+Use [Docker Hub tags](https://hub.docker.com/r/rocm/vllm-dev/tags) or the Docker CLI to find candidates.
+
 ```bash
-source <output_dir>/venv/bin/activate
-python3 -c "import vllm; print(f'vLLM {vllm.__version__}')" 2>/dev/null || \
-  pip install vllm --extra-index-url https://wheels.vllm.ai/rocm/
+# Determine target tag pattern based on GPU arch
+# CDNA (gfx90a, gfx942, …) → mainline tags
+# RDNA (gfx1100, gfx1201, …) → navi-specific tags
+if [[ "$GPU_ARCH" == gfx9* ]]; then
+  TAG_PATTERN="nightly_main"
+elif [[ "$GPU_ARCH" == gfx1* ]]; then
+  TAG_PATTERN="navi"
+else
+  TAG_PATTERN=""
+fi
+
+echo "Searching rocm/vllm-dev tags matching: $TAG_PATTERN"
+
+# List recent tags from Docker Hub (requires internet)
+TAGS=$(curl -sL "https://hub.docker.com/v2/repositories/rocm/vllm-dev/tags?page_size=20&ordering=last_updated" \
+  | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for t in data.get('results', []):
+    name = t['name']
+    if '${TAG_PATTERN}' in name.lower():
+        print(name)
+" 2>/dev/null)
+  if [ -n "$MATCHES" ]; then
+    echo "Found matching tags (page $page):"
+    echo "$MATCHES" | head -5
+    # Prefer tag matching host ROCm version
+    BEST=$(echo "$MATCHES" | grep "rocm${ROCM_MAJOR_MINOR}" | head -1)
+    if [ -z "$BEST" ]; then
+      BEST=$(echo "$MATCHES" | head -1)
+    fi
+    IMAGE_TAG="$BEST"
+    break
+  fi
+done
+
+if [ -z "$IMAGE_TAG" ]; then
+  echo "No matching Docker image found — will fall back to venv setup"
+fi
 ```
 
-### 4. Install other missing packages
+### 3. Create container (if image found)
+
 ```bash
-source <output_dir>/venv/bin/activate
-python3 -c "import transformers" 2>/dev/null || pip install transformers
-python3 -c "import accelerate" 2>/dev/null || pip install accelerate
+CONTAINER_NAME="vllm_model_opt"
+
+if [ -n "$IMAGE_TAG" ]; then
+  IMAGE="rocm/vllm-dev:$IMAGE_TAG"
+  echo "Using image: $IMAGE"
+
+  # Pull if not already local
+  docker pull "$IMAGE" 2>/dev/null
+
+  # Check if container already exists
+  if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+    echo "Container $CONTAINER_NAME already exists — starting it"
+    docker start "$CONTAINER_NAME"
+  else
+    docker run -d \
+      --name "$CONTAINER_NAME" \
+      --device=/dev/kfd --device=/dev/dri \
+      --group-add video --group-add render \
+      --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+      --shm-size 16G \
+      -v <output_dir>:/workspace/output \
+      -p 8192:8192 -p 8193:8193 \
+      "$IMAGE" sleep infinity
+    echo "Created container: $CONTAINER_NAME"
+  fi
+
+  # Verify inside container
+  docker exec "$CONTAINER_NAME" bash -c "
+    python3 -c \"
+import torch, vllm
+print(f'PyTorch {torch.__version__}, CUDA: {torch.cuda.is_available()}')
+print(f'vLLM {vllm.__version__}')
+print(f'GPU count: {torch.cuda.device_count()}')
+for i in range(torch.cuda.device_count()):
+    free, total = torch.cuda.mem_get_info(i)
+    print(f'  cuda:{i} — {torch.cuda.get_device_name(i)}, free={free/1e9:.1f}GB, total={total/1e9:.1f}GB')
+\"
+  "
+
+  # Record which GPU to use (pick the one with most free memory)
+  BEST_GPU=$(docker exec "$CONTAINER_NAME" python3 -c "
+import torch
+best, best_free = 0, 0
+for i in range(torch.cuda.device_count()):
+    free, _ = torch.cuda.mem_get_info(i)
+    if free > best_free:
+        best, best_free = i, free
+print(best)
+")
+  echo "Best GPU: cuda:$BEST_GPU"
+
+  # Save environment info
+  docker exec "$CONTAINER_NAME" bash -c "
+    mkdir -p /workspace/output
+    python3 -c \"
+import json, torch, vllm
+info = {
+    'env_type': 'docker',
+    'container': '$CONTAINER_NAME',
+    'image': '$IMAGE',
+    'pytorch': torch.__version__,
+    'vllm': vllm.__version__,
+    'gpu_count': torch.cuda.device_count(),
+    'best_gpu': $BEST_GPU,
+}
+with open('/workspace/output/env_info.json', 'w') as f:
+    json.dump(info, f, indent=2)
+print(json.dumps(info, indent=2))
+\"
+  "
+fi
 ```
 
-### 5. Verify Installation
+### 4. Fallback: venv setup (if no Docker image)
+
+Only execute this section if Step 2/3 did not find a suitable image.
+
 ```bash
-source <output_dir>/venv/bin/activate
-python3 -c "
+if [ -z "$IMAGE_TAG" ]; then
+  echo "Setting up venv environment..."
+  cd <output_dir>
+
+  if [ ! -d "venv" ]; then
+    python3 -m venv venv --system-site-packages
+    echo "Created venv with system site-packages access"
+  fi
+
+  source venv/bin/activate
+
+  # Install vLLM
+  python3 -c "import vllm; print(f'vLLM {vllm.__version__}')" 2>/dev/null || \
+    pip install vllm --extra-index-url https://wheels.vllm.ai/rocm/
+
+  # Install other dependencies
+  python3 -c "import transformers" 2>/dev/null || pip install transformers
+  python3 -c "import accelerate" 2>/dev/null || pip install accelerate
+
+  # Verify
+  python3 -c "
 import torch, vllm
 print(f'PyTorch {torch.__version__}, CUDA: {torch.cuda.is_available()}')
 print(f'vLLM {vllm.__version__}')
 print(f'GPU: {torch.cuda.get_device_name()}')
 "
+
+  # Save environment info
+  python3 -c "
+import json, torch, vllm
+info = {
+    'env_type': 'venv',
+    'pytorch': torch.__version__,
+    'vllm': vllm.__version__,
+    'gpu_count': torch.cuda.device_count(),
+}
+with open('<output_dir>/env_info.json', 'w') as f:
+    json.dump(info, f, indent=2)
+print(json.dumps(info, indent=2))
+"
+fi
+```
+
+### 5. Copy helper scripts into the output directory
+
+```bash
+mkdir -p <output_dir>/scripts
+cp ~/.config/opencode/scripts/*.py <output_dir>/scripts/ 2>/dev/null
+ls <output_dir>/scripts/
 ```
 
 ### 6. Update progress.json
+
 Update progress.json: phase="env", phases_completed.append("env")
+
+⚠️ **For all subsequent phases**: if `env_type` is `docker`, prefix commands with `docker exec $CONTAINER_NAME bash -c "..."` and use `/workspace/output` as the output directory inside the container.
 
 
 ---
