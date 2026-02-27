@@ -5,7 +5,7 @@ set -e
 # Usage: curl -fsSL https://raw.githubusercontent.com/vivienfanghuagood/opencode/dev/install.sh | bash
 
 REPO="vivienfanghuagood/opencode"
-BRANCH="dev"
+BRANCH="opt-vllm"
 INSTALL_DIR="/usr/local/bin"
 
 echo "Installing OpenCode with AMD Gateway support..."
@@ -26,11 +26,29 @@ curl -fsSL "https://github.com/$REPO/archive/refs/heads/$BRANCH.tar.gz" | tar xz
 cd opencode-*
 
 echo "Installing dependencies..."
-bun install
+# Use a fresh cache dir to avoid stale root-owned bun cache entries
+export BUN_INSTALL_CACHE_DIR="$TMPDIR/.bun-cache"
+mkdir -p "$BUN_INSTALL_CACHE_DIR"
+bun install --ignore-scripts
 
 echo "Building..."
+
+# The build internally runs 'bun add' which triggers husky (#!/usr/bin/env node).
+# Create a temporary node -> bun symlink if node is not installed.
+NODE_LINK=""
+if ! command -v node >/dev/null 2>&1; then
+    BUN_DIR="$(dirname "$(command -v bun)")"
+    NODE_LINK="$BUN_DIR/node"
+    ln -sf "$(command -v bun)" "$NODE_LINK"
+fi
+
 cd packages/opencode
 bun run build --single
+
+# Clean up temporary symlink
+if [ -n "$NODE_LINK" ] && [ -L "$NODE_LINK" ]; then
+    rm -f "$NODE_LINK"
+fi
 
 echo "Installing to $INSTALL_DIR..."
 sudo cp dist/opencode-linux-x64/bin/opencode "$INSTALL_DIR/"
