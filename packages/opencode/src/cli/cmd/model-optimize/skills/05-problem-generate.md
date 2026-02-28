@@ -4,6 +4,25 @@
 Convert bottleneck operators into Problem files for kernel-optimize.
 **IMPORTANT**: Analyze operators for fusion opportunities BEFORE creating individual problem files.
 
+## STEP 0: Review Per-Shape Kernel Analysis (from Phase 4)
+
+Before creating problem files, review `{{PROFILE_DIR}}/kernel_shape_analysis.json` to understand:
+- Which **operator categories** dominate GPU time (GEMM, Attention, Norm, Activation, ...)
+- For each category, which **specific shapes** are the hottest
+- Use the top (category, shape) pairs to set **priorities** and pick **exact dimensions** for problem files
+
+```bash
+cat {{PROFILE_DIR}}/kernel_shape_analysis.json | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(f'Total GPU time: {data[\"total_gpu_time_ms\"]:.2f}ms\n')
+for cat in data['categories'][:8]:
+    print(f'{cat[\"category\"]:12s} {cat[\"pct\"]:5.1f}%  ({cat[\"total_us\"]/1000:.2f}ms, {cat[\"num_shapes\"]} shapes)')
+    for s in cat['shapes'][:5]:
+        print(f'  {s[\"shape\"]:50s} {s[\"pct_of_total\"]:5.1f}% total, {s[\"count\"]:4d} calls, avg {s[\"avg_us\"]:.1f}us')
+"
+```
+
 ## STEP 1: Operator Fusion Analysis (CRITICAL)
 
 A standalone `analyze_fusion.py` script is provided at `{{OUTPUT_DIR}}/scripts/analyze_fusion.py`.
@@ -12,7 +31,7 @@ Use it to detect fusable operator patterns:
 ```bash
 cp {{OUTPUT_DIR}}/scripts/analyze_fusion.py {{PROFILE_DIR}}/
 cd {{PROFILE_DIR}}
-python analyze_fusion.py
+python3 analyze_fusion.py
 cat fusion_opportunities.json
 ```
 
@@ -31,7 +50,8 @@ cat fusion_opportunities.json
 
 **Create fused kernels BEFORE individual kernels!**
 
-Use ACTUAL shapes from `{{PROFILE_DIR}}/shape_ranges.json` or `{{PROFILE_DIR}}/bottlenecks.json`.
+Use ACTUAL shapes from `{{PROFILE_DIR}}/kernel_shape_analysis.json` (per-shape time breakdown)
+and `{{PROFILE_DIR}}/model_shapes.json`. Focus on the shapes with the highest `pct_of_total`.
 
 ### Example: Fused Residual + RMSNorm
 ```python
@@ -50,7 +70,7 @@ class Model(nn.Module):
         hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
         return self.weight * hidden_states
 
-# ⚠️ Use shapes from shape_ranges.json!
+# Use ACTUAL shapes from kernel_shape_analysis.json
 batch_size = 1
 seq_len = 64       # typical from profiling
 hidden_size = 4096 # from model config
@@ -114,9 +134,9 @@ Create `{{PROBLEMS_DIR}}/optimization_manifest.json`:
 ```
 
 ## Steps
-1. Run fusion analysis
-2. Create fused problem files (HIGH priority)
-3. Create individual problem files (MEDIUM/LOW)
-4. Generate optimization_manifest.json
-5. Update progress.json
-
+1. Review kernel_shape_analysis.json for shape priorities
+2. Run fusion analysis
+3. Create fused problem files (HIGH priority)
+4. Create individual problem files (MEDIUM/LOW)
+5. Generate optimization_manifest.json
+6. Update progress.json

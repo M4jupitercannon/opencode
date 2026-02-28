@@ -3,6 +3,16 @@
 ## Goal
 Start the model using `vllm serve` and verify it works. vLLM handles model download automatically.
 
+## ⚠️ Docker vs venv
+If Phase 0 created a Docker container (`env_type: "docker"` in `env_info.json`), prefix all commands with `docker exec $CONTAINER_NAME bash -c "..."` and use `HIP_VISIBLE_DEVICES=$BEST_GPU` to target the free GPU. Skip `source venv/bin/activate` inside the container (packages are pre-installed).
+
+Before running this phase, set execution mode once:
+```bash
+ENV_TYPE=$(python3 -c "import json; print(json.load(open('{{OUTPUT_DIR}}/env_info.json')).get('env_type','venv'))" 2>/dev/null || echo "venv")
+CONTAINER_NAME=$(python3 -c "import json; print(json.load(open('{{OUTPUT_DIR}}/env_info.json')).get('container','vllm_model_opt'))" 2>/dev/null || echo "vllm_model_opt")
+BEST_GPU=$(python3 -c "import json; print(json.load(open('{{OUTPUT_DIR}}/env_info.json')).get('best_gpu',0))" 2>/dev/null || echo 0)
+```
+
 ## ⚠️ vLLM Mode
 In vLLM mode, there is NO need to:
 - Manually download the model (vLLM auto-downloads from HuggingFace)
@@ -16,7 +26,8 @@ In vLLM mode, there is NO need to:
 
 ### 1. Test vLLM serve
 ```bash
-source {{OUTPUT_DIR}}/venv/bin/activate
+# venv mode only:
+# source {{OUTPUT_DIR}}/venv/bin/activate
 
 # Start vLLM — ALL output to log file, NEVER to stdout
 vllm serve {{HF_MODEL}} \
@@ -32,13 +43,13 @@ for i in $(seq 1 60); do
   curl -s http://localhost:8192/health > /dev/null 2>&1 && break
   sleep 5
 done
-curl -s http://localhost:8192/health > /dev/null 2>&1 && echo "✓ Server ready" || echo "✗ Server failed — check {{OUTPUT_DIR}}/vllm_serve.log"
+curl -s http://localhost:8192/health > /dev/null 2>&1 && echo "Server ready" || echo "FAILED — check {{OUTPUT_DIR}}/vllm_serve.log"
 
 # Quick inference test (only show the result, not vllm internals)
 curl -s http://localhost:8192/v1/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "{{HF_MODEL}}", "prompt": "Hello, I am", "max_tokens": 20}' \
-  | python3 -c "import json,sys; d=json.load(sys.stdin); print('✓ Inference OK' if 'choices' in d else f'✗ Error: {d}')"
+  | python3 -c "import json,sys; d=json.load(sys.stdin); print('Inference OK' if 'choices' in d else f'Error: {d}')"
 
 # Kill the test server
 kill $VLLM_PID 2>/dev/null; wait $VLLM_PID 2>/dev/null
@@ -46,7 +57,8 @@ kill $VLLM_PID 2>/dev/null; wait $VLLM_PID 2>/dev/null
 
 ### 2. Record model config
 ```bash
-source {{OUTPUT_DIR}}/venv/bin/activate
+# venv mode only:
+# source {{OUTPUT_DIR}}/venv/bin/activate
 python3 -c "
 from transformers import AutoConfig
 config = AutoConfig.from_pretrained('{{HF_MODEL}}', trust_remote_code=True)

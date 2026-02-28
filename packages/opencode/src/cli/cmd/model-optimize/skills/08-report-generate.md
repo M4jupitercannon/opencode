@@ -25,6 +25,15 @@ Create a comprehensive optimization report.
 |----------|-------------------|------------|-----------|---------|
 | ...      | ...               | ...        | ...       | ...     |
 
+## Per-Shape Kernel Time Analysis
+Include the top hottest (operator, shape) combinations from `kernel_shape_analysis.json`.
+This data was collected with `--enforce-eager` and `torch_profiler_record_shapes: true` in `--profiler-config`.
+
+| Category | Shape | % of GPU Time | Time (ms) | Count |
+|----------|-------|--------------|-----------|-------|
+| GEMM     | [4,4096]x[4096,24576] | 30.5% | 5023.1 | 9072 |
+| ...      | ...   | ...          | ...       | ...   |
+
 ## Performance Results (ACTUAL MEASURED)
 | Metric | Original | Optimized | Speedup |
 |--------|----------|-----------|---------|
@@ -38,17 +47,21 @@ Outputs generated with fixed random seed for verification.
 |----------|-----------|
 | [text]   | [text]    |
 
-### Image Models:
+### Image Models (if applicable):
+> Include this section only for vision/multimodal models that produce image outputs.
+
 | Original | Optimized |
 |:--------:|:---------:|
 | ![Original](comparison_outputs/original_output.png) | ![Optimized](comparison_outputs/optimized_output.png) |
 
 ## Files Generated
-- model/ - Downloaded model
-- demo/demo.py - Working demo
-- profile/bottlenecks.json - Profiling results
+- profile/bottlenecks.json - Kernel bottleneck ranking
+- profile/kernel_shape_analysis.json - Per-shape kernel time breakdown
+- profile/kernel_shape_analysis.csv - Shape analysis (flat CSV)
 - problems/ - Problem files + optimized kernels
-- optimized/integrate.py - Integration script
+- optimized/vllm_plugin/ - vLLM CustomOp integration plugin
+- report/baseline_serving.json - Baseline benchmark results
+- report/optimized_serving.json - Optimized benchmark results
 - report/optimization_report.md - This report
 
 ## Recommendations
@@ -59,4 +72,3 @@ Outputs generated with fixed random seed for verification.
 1. Gather all results from previous phases
 2. Generate the comprehensive report
 3. Update progress.json: phase="complete", phases_completed.append("report")
-

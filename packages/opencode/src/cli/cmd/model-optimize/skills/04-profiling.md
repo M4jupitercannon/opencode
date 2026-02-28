@@ -1,16 +1,28 @@
 # Phase 4: Performance Profiling {{SKIP_LABEL}}
 
 ## Goal
-Benchmark vLLM serving throughput AND collect GPU kernel trace for bottleneck analysis.
+Benchmark vLLM serving throughput AND collect GPU kernel trace for bottleneck analysis,
+including per-shape kernel time breakdown.
 
 ## ⚠️ CRITICAL: ALL vLLM output MUST go to log files
 **NEVER let vLLM stdout/stderr appear in bash output.** Always use `&> logfile`.
 **For `vllm bench serve`, redirect to file and only extract key metrics.**
 
+## ⚠️ Execution mode (docker vs venv)
+Detect once before running this phase:
+```bash
+ENV_TYPE=$(python3 -c "import json; print(json.load(open('{{OUTPUT_DIR}}/env_info.json')).get('env_type','venv'))" 2>/dev/null || echo "venv")
+CONTAINER_NAME=$(python3 -c "import json; print(json.load(open('{{OUTPUT_DIR}}/env_info.json')).get('container','vllm_model_opt'))" 2>/dev/null || echo "vllm_model_opt")
+BEST_GPU=$(python3 -c "import json; print(json.load(open('{{OUTPUT_DIR}}/env_info.json')).get('best_gpu',0))" 2>/dev/null || echo 0)
+```
+If `ENV_TYPE=docker`, run commands with:
+`docker exec -e HIP_VISIBLE_DEVICES=$BEST_GPU $CONTAINER_NAME bash -lc "<command>"`.
+
 ## Step 1: Baseline Throughput Benchmark
 
 ```bash
-source {{OUTPUT_DIR}}/venv/bin/activate
+# venv mode only:
+# source {{OUTPUT_DIR}}/venv/bin/activate
 
 # Start vLLM — ALL output to log file
 vllm serve {{HF_MODEL}} \
@@ -26,7 +38,7 @@ for i in $(seq 1 60); do
   curl -s http://localhost:8192/health > /dev/null 2>&1 && break
   sleep 5
 done
-curl -s http://localhost:8192/health > /dev/null 2>&1 && echo "✓ Server ready" || { echo "✗ Failed — check vllm_baseline.log"; tail -5 {{OUTPUT_DIR}}/vllm_baseline.log; }
+curl -s http://localhost:8192/health > /dev/null 2>&1 && echo "Server ready" || { echo "FAILED — check vllm_baseline.log"; tail -5 {{OUTPUT_DIR}}/vllm_baseline.log; }
 
 # Run benchmark — output to file, then extract only key metrics
 vllm bench serve \
@@ -53,17 +65,40 @@ for k in ['output_throughput','request_throughput','mean_tpot_ms','mean_ttft_ms'
 
 ## Step 2: Collect Kernel Trace
 
-```bash
-source {{OUTPUT_DIR}}/venv/bin/activate
-mkdir -p {{PROFILE_DIR}}/traces
+⚠️ **CRITICAL**: Two flags are mandatory for kernel shape analysis:
+- `--enforce-eager` — disables CUDA Graphs so GPU kernels retain their `External id` linkage to CPU ops
+- `--profiler-config` with `torch_profiler_record_shapes: true` — records tensor `Input Dims` on every CPU op
 
-# Start vLLM WITH profiler — output to log file
-VLLM_TORCH_PROFILER_DIR={{PROFILE_DIR}}/traces \
+Without both, `analyze_kernel_shapes.py` will produce only `(unattributed)` shapes.
+
+```bash
+# venv mode only:
+# source {{OUTPUT_DIR}}/venv/bin/activate
+mkdir -p {{PROFILE_DIR}}/traces
+TRACE_DIR=$(realpath {{PROFILE_DIR}}/traces)
+
+# Build profiler config JSON (record_shapes is the key flag)
+PROFILER_CFG=$(python3 -c "
+import json; print(json.dumps({
+  'profiler': 'torch',
+  'torch_profiler_dir': '$TRACE_DIR',
+  'torch_profiler_record_shapes': True,
+  'torch_profiler_with_stack': True,
+  'torch_profiler_with_flops': True,
+  'torch_profiler_with_memory': False,
+  'torch_profiler_use_gzip': True,
+}))
+")
+
+# Start vLLM WITH profiler + enforce-eager — output to log file
+VLLM_TORCH_PROFILER_DIR="$TRACE_DIR" \
 vllm serve {{HF_MODEL}} \
   --dtype auto \
   --max-model-len 4096 \
   --port 8193 \
-  --disable-log-requests &> {{OUTPUT_DIR}}/vllm_trace.log &
+  --disable-log-requests \
+  --enforce-eager \
+  --profiler-config "$PROFILER_CFG" &> {{OUTPUT_DIR}}/vllm_trace.log &
 VLLM_PID=$!
 echo "Trace vLLM PID: $VLLM_PID (log: {{OUTPUT_DIR}}/vllm_trace.log)"
 
@@ -72,7 +107,10 @@ for i in $(seq 1 60); do
   curl -s http://localhost:8193/health > /dev/null 2>&1 && break
   sleep 5
 done
-curl -s http://localhost:8193/health > /dev/null 2>&1 && echo "✓ Trace server ready" || { echo "✗ Failed"; tail -5 {{OUTPUT_DIR}}/vllm_trace.log; }
+curl -s http://localhost:8193/health > /dev/null 2>&1 && echo "Trace server ready" || { echo "FAILED"; tail -5 {{OUTPUT_DIR}}/vllm_trace.log; }
+
+# Start profiling via API
+curl -s -X POST http://localhost:8193/start_profile && echo "Profiler started"
 
 # Send requests for trace — output to file
 vllm bench serve \
@@ -84,6 +122,8 @@ vllm bench serve \
   --result-dir {{PROFILE_DIR}} --result-filename trace_benchmark.json \
   --label trace &> {{PROFILE_DIR}}/bench_trace.log
 
+# Stop profiling and flush trace
+curl -s -X POST http://localhost:8193/stop_profile && echo "Profiler stopped"
 sleep 15
 kill $VLLM_PID 2>/dev/null; wait $VLLM_PID 2>/dev/null
 
@@ -143,21 +183,60 @@ for k in kernels[:30]:
         reason = 'Memory op'; optimizable = False
     bottlenecks.append({**k, 'cuda_time_percent': pct, 'optimizable': optimizable, 'reason': reason})
 
-# Print compact summary (not full data)
-print(f'Total GPU time: {total/1000:.2f}ms, Top 10 kernels:')
+print('Total GPU time: %.2fms, Top 10 kernels:' % (total/1000))
 for i, b in enumerate(bottlenecks[:10], 1):
-    print(f\"  {i}. {b['name'][:45]:45s} {b['cuda_time_percent']:5.1f}%\")
+    print('  %d. %-45s %5.1f%%' % (i, b['name'][:45], b['cuda_time_percent']))
 
 with open('bottlenecks.json', 'w') as f:
     json.dump(bottlenecks, f, indent=2)
-print(f'Saved bottlenecks.json ({len(bottlenecks)} kernels)')
+print('Saved bottlenecks.json (%d kernels)' % len(bottlenecks))
 "
 ```
 
-## Step 5: Save model shapes
+## Step 5: Per-Shape Kernel Time Analysis
+
+Analyze time proportion of **each shape** for each operator category.
+This correlates GPU kernel durations with CPU-side operator shapes from the trace.
 
 ```bash
-source {{OUTPUT_DIR}}/venv/bin/activate
+cd {{PROFILE_DIR}}
+cp {{OUTPUT_DIR}}/scripts/analyze_kernel_shapes.py .
+
+TRACE_FILE=$(ls -t traces/*.json traces/*.json.gz 2>/dev/null | head -1)
+echo "Shape analysis on: $TRACE_FILE"
+
+python3 analyze_kernel_shapes.py -i "$TRACE_FILE" -o .
+```
+
+This produces:
+- `kernel_shape_analysis.json` — structured per-category, per-shape breakdown
+- `kernel_shape_analysis.csv` — flat CSV for inspection
+
+Example output:
+```
+  GEMM — 94.1% of total (15488.61ms, 10 shapes, 100% attributed)
+  ──────────────────────────────────────────────────────────────────────────────────────
+    Shape                                               %Total  %InCat  Time(ms)  Count  Avg(us)
+    [4,4096]x[4096,24576]                                30.5%   32.4%  5023.08   9072    553.7
+    [2,4096]x[4096,24576]                                15.4%   16.4%  2533.19   4644    545.5
+    [4,12288]x[12288,4096]                               12.8%   13.6%  2112.64   9072    232.9
+    [4,4096]x[4096,6144]                                  7.0%    7.4%  1144.21   9072    126.1
+    ...
+
+  Attention — 2.4% of total (390.56ms, 4 shapes, 100% attributed)
+  ──────────────────────────────────────────────────────────────────────────────────────
+    Shape                                               %Total  %InCat  Time(ms)  Count  Avg(us)
+    [4,32,128]x[4,8,128]x[4,8,128]x[4,32,128]             1.5%   64.4%   251.52  27216      9.2
+    ...
+```
+
+⚠️ **CRITICAL**: The shapes must be real traced shapes. Use this data in Phase 5 to pick exact dimensions for problem files and prioritize which (operator, shape) combinations to optimize first.
+
+## Step 6: Save model shapes
+
+```bash
+# venv mode only:
+# source {{OUTPUT_DIR}}/venv/bin/activate
 python3 -c "
 import json
 from transformers import AutoConfig

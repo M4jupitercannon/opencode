@@ -3,6 +3,16 @@
 ## Goal
 Write optimized Triton kernels for each problem file and verify speedup.
 
+## ⚠️ Docker vs venv
+If Phase 0 created a Docker container (`env_type: "docker"` in `env_info.json`), prefix all commands with `docker exec $CONTAINER_NAME bash -c "..."` and use `HIP_VISIBLE_DEVICES=$BEST_GPU`.
+
+Detect once before running this phase:
+```bash
+ENV_TYPE=$(python3 -c "import json; print(json.load(open('{{OUTPUT_DIR}}/env_info.json')).get('env_type','venv'))" 2>/dev/null || echo "venv")
+CONTAINER_NAME=$(python3 -c "import json; print(json.load(open('{{OUTPUT_DIR}}/env_info.json')).get('container','vllm_model_opt'))" 2>/dev/null || echo "vllm_model_opt")
+BEST_GPU=$(python3 -c "import json; print(json.load(open('{{OUTPUT_DIR}}/env_info.json')).get('best_gpu',0))" 2>/dev/null || echo 0)
+```
+
 ## ⚠️ NO external `opencode` command needed
 Optimize kernels DIRECTLY in this session using the test scripts provided.
 
@@ -32,7 +42,8 @@ Create `{{PROBLEMS_DIR}}/problem_XXX_opt.py` with:
 
 ### 4. Test accuracy + benchmark
 ```bash
-source {{OUTPUT_DIR}}/venv/bin/activate
+# venv mode only:
+# source {{OUTPUT_DIR}}/venv/bin/activate
 python3 {{OUTPUT_DIR}}/scripts/kernel_test_runner.py \
   --src {{PROBLEMS_DIR}}/problem_XXX.py \
   --target {{PROBLEMS_DIR}}/problem_XXX_opt.py
