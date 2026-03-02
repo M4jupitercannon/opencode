@@ -1,0 +1,260 @@
+[2026-03-02T09:44:03.551Z] ============================================================
+[2026-03-02T09:44:03.551Z] InferenceX Pipeline Started: kimik2.5-int4-mi355x-vllm
+[2026-03-02T09:44:03.551Z] Output Directory: /home/weicai12/opencode/inferencex_kimik2_5-int4-mi355x-vllm
+[2026-03-02T09:44:03.551Z] LLM Model: default
+[2026-03-02T09:44:03.551Z] ============================================================
+[2026-03-02T09:44:11.953Z] 
+$ docker --version
+[2026-03-02T09:44:11.953Z] Docker version 28.3.2, build 578ccf6
+[2026-03-02T09:44:12.747Z] 
+$ ls /dev/kfd /dev/dri 2>/dev/null && echo "AMD GPU detected" || echo "No AMD GPU"
+[2026-03-02T09:44:12.747Z] /dev/kfd
+
+/dev/dri:
+by-path
+card0
+card1
+card10
+card11
+card12
+card13
+card14
+card15
+card16
+card17
+card18
+card19
+card2
+card20
+card21
+card22
+card23
+card24
+card25
+card26
+card27
+card28
+card29
+card3
+card30
+card31
+card32
+card33
+card34
+card35
+card36
+card37
+card38
+card39
+card4
+card40
+card41
+card42
+card43
+card44
+card45
+card46
+card47
+card48
+card49
+card5
+card50
+card51
+card52
+card53
+card54
+card55
+card56
+card57
+card58
+card59
+card6
+card60
+card61
+card62
+card63
+card7
+card8
+card9
+renderD128
+renderD129
+renderD130
+renderD131
+renderD132
+renderD133
+renderD134
+renderD135
+renderD136
+renderD137
+renderD138
+renderD139
+renderD140
+renderD141
+renderD142
+renderD143
+renderD144
+renderD145
+renderD146
+renderD147
+renderD148
+renderD149
+renderD150
+renderD151
+renderD152
+renderD153
+renderD154
+renderD155
+renderD156
+renderD157
+renderD158
+renderD159
+renderD160
+renderD161
+renderD162
+renderD163
+renderD164
+renderD165
+renderD166
+renderD167
+renderD168
+renderD169
+renderD170
+renderD171
+renderD172
+renderD173
+renderD174
+renderD175
+renderD176
+renderD177
+renderD178
+renderD179
+renderD180
+renderD181
+renderD182
+renderD183
+renderD184
+renderD185
+renderD186
+renderD187
+renderD188
+renderD189
+renderD190
+renderD191
+AMD GPU detected
+[2026-03-02T09:44:13.377Z] 
+$ nvidia-smi 2>/dev/null && echo "NVIDIA GPU detected" || echo "No NVIDIA GPU"
+[2026-03-02T09:44:13.377Z] No NVIDIA GPU
+[2026-03-02T09:44:14.283Z] 
+$ python3 --version && python3 -c "import yaml; import json; print('Dependencies OK')"
+[2026-03-02T09:44:14.283Z] Python 3.10.12
+Dependencies OK
+[2026-03-02T09:44:21.377Z] 
+$ ls "/home/weicai12/opencode/inferencex_kimik2_5-int4-mi355x-vllm/repo/.github/configs/amd-master.yaml"
+[2026-03-02T09:44:21.377Z] ls: cannot access '/home/weicai12/opencode/inferencex_kimik2_5-int4-mi355x-vllm/repo/.github/configs/amd-master.yaml': No such file or directory
+[2026-03-02T09:44:23.162Z] 
+$ HF_CACHE="/data/huggingface"
+mkdir -p "$HF_CACHE"
+echo "HF cache directory: $HF_CACHE"
+ls -la "$HF_CACHE" | head -5
+[2026-03-02T09:44:23.162Z] HF cache directory: /data/huggingface
+total 24
+drwxr-xr-x  6 root root 4096 Feb 27 03:55 .
+drwxrwxrwx 12 root root 4096 Mar  1 20:13 ..
+drwxr-xr-x  7 root root 4096 Mar  1 20:10 hub
+drwxr-xr-x  3 root root 4096 Feb 27 01:46 .locks
+[2026-03-02T09:44:23.492Z] 
+$ REPO_DIR="/home/weicai12/opencode/inferencex_kimik2_5-int4-mi355x-vllm/repo"
+if [ -d "$REPO_DIR/.github/configs" ]; then
+    echo "Using existing repo at $REPO_DIR, pulling latest..."
+    cd "$REPO_DIR" && git pull --ff-only || true
+else
+    echo "Cloning InferenceX repo..."
+    git clone "https://github.com/SemiAnalysisAI/InferenceX.git" "$REPO_DIR"
+fi
+[2026-03-02T09:44:23.492Z] Cloning InferenceX repo...
+Cloning into '/home/weicai12/opencode/inferencex_kimik2_5-int4-mi355x-vllm/repo'...
+[2026-03-02T09:44:30.078Z] 
+$ ls -la /home/weicai12/opencode/inferencex_kimik2_5-int4-mi355x-vllm/repo/
+[2026-03-02T09:44:30.078Z] total 120
+drwxrwxr-x 9 weicai12 weicai12  4096 Mar  2 03:44 .
+drwxrwxr-x 7 weicai12 weicai12  4096 Mar  2 03:44 ..
+-rw-rw-r-- 1 weicai12 weicai12 18430 Mar  2 03:44 AGENTS.md
+drwxrwxr-x 4 weicai12 weicai12  4096 Mar  2 03:44 benchmarks
+drwxrwxr-x 3 weicai12 weicai12  4096 Mar  2 03:44 .claude
+drwxrwxr-x 6 weicai12 weicai12  4096 Mar  2 03:44 experimental
+drwxrwxr-x 8 weicai12 weicai12  4096 Mar  2 03:44 .git
+drwxrwxr-x 6 weicai12 weicai12  4096 Mar  2 03:44 .github
+-rw-rw-r-- 1 weicai12 weicai12    30 Mar  2 03:44 .gitignore
+-rw-rw-r-- 1 weicai12 weicai12 11389 Mar  2 03:44 LICENSE
+-rw-rw-r-- 1 weicai12 weicai12   177 Mar  2 03:44 .mcp.json
+-rw-rw-r-- 1 weicai12 weicai12 33932 Mar  2 03:44 perf-changelog.yaml
+-rw-rw-r-- 1 weicai12 weicai12  5405 Mar  2 03:44 README.md
+drwxrwxr-x 2 weicai12 weicai12  4096 Mar  2 03:44 runners
+drwxrwxr-x 5 weicai12 weicai12  4096 Mar  2 03:44 utils
+[2026-03-02T09:44:31.147Z] 
+$ find /home/weicai12/opencode/inferencex_kimik2_5-int4-mi355x-vllm/repo -name "*.yaml" -type f 2>/dev/null | head -20
+[2026-03-02T09:44:31.147Z] /home/weicai12/opencode/inferencex_kimik2_5-int4-mi355x-vllm/repo/perf-changelog.yaml
+/home/weicai12/opencode/inferencex_kimik2_5-int4-mi355x-vllm/repo/benchmarks/multi_node/amd_utils/models.yaml
+/home/weicai12/opencode/inferencex_kimik2_5-int4-mi355x-vllm/repo/utils/evals/gpqa_diamond.yaml
+/home/weicai12/opencode/inferencex_kimik2_5-int4-mi355x-vllm/repo/utils/evals/gsm8k.yaml
+/home/weicai12/opencode/inferencex_kimik2_5-int4-mi355x-vllm/repo/.github/configs/nvidia-master.yaml
+/home/weicai12/opencode/inferencex_kimik2_5-int4-mi355x-vllm/repo/.github/configs/runners.yaml
+/home/weicai12/opencode/inferencex_kimik2_5-int4-mi355x-vllm/repo/.github/configs/amd-master.yaml
+[2026-03-02T09:44:34.517Z] 
+$ ls -la /home/weicai12/opencode/inferencex_kimik2_5-int4-mi355x-vllm/repo/.github/configs/amd-master.yaml
+[2026-03-02T09:44:34.517Z] -rw-rw-r-- 1 weicai12 weicai12 32400 Mar  2 03:44 /home/weicai12/opencode/inferencex_kimik2_5-int4-mi355x-vllm/repo/.github/configs/amd-master.yaml
+[2026-03-02T09:44:35.442Z] 
+$ mkdir -p /home/weicai12/opencode/inferencex_kimik2_5-int4-mi355x-vllm/{results,profiles,report}
+[2026-03-02T09:44:43.129Z] 
+[FILE WRITE] inferencex_kimik2_5-int4-mi355x-vllm/progress.json
+[2026-03-02T09:44:53.845Z] 
+$ cd /home/weicai12/opencode/inferencex_kimik2_5-int4-mi355x-vllm/repo && python3 utils/matrix_logic/generate_sweep_configs.py test-config --config-files ".github/configs/amd-master.yaml" --config-keys "kimik2.5-int4-mi355x-vllm"
+[2026-03-02T09:44:53.845Z] [{"image": "vllm/vllm-openai-rocm:v0.15.1", "model": "moonshotai/Kimi-K2.5", "model-prefix": "kimik2.5", "precision": "int4", "framework": "vllm", "runner": "mi355x", "isl": 1024, "osl": 1024, "tp": 8, "conc": 4, "max-model-len": 2248, "ep": 1, "dp-attn": false, "spec-decoding": "none", "exp-name": "kimik2.5_1k1k", "disagg": false, "run-eval": false}, {"image": "vllm/vllm-openai-rocm:v0.15.1", "model": "moonshotai/Kimi-K2.5", "model-prefix": "kimik2.5", "precision": "int4", "framework": "vllm", "runner": "mi355x", "isl": 1024, "osl": 1024, "tp": 8, "conc": 8, "max-model-len": 2248, "ep": 1, "dp-attn": false, "spec-decoding": "none", "exp-name": "kimik2.5_1k1k", "disagg": false, "run-eval": false}, {"image": "vllm/vllm-openai-rocm:v0.15.1", "model": "moonshotai/Kimi-K2.5", "model-prefix": "kimik2.5", "precision": "int4", "framework": "vllm", "runner": "mi355x", "isl": 1024, "osl": 1024, "tp": 8, "conc": 16, "max-model-len": 2248, "ep": 1, "dp-attn": false, "spec-decoding": "none", "exp-name": "kimik2.5_1k1k", "disagg": false, "run-eval": false}, {"image": "vllm/vllm-openai-rocm:v0.15.1", "model": "moonshotai/Kimi-K2.5", "model-prefix": "kimik2.5", "precision": "int4", "framework": "vllm", "runner": "mi355x", "isl": 1024, "osl": 1024, "tp": 8, "conc": 32, "max-model-len": 2248, "ep": 1, "dp-attn": false, "spec-decoding": "none", "exp-name": "kimik2.5_1k1k", "disagg": false, "run-eval": false}, {"image": "vllm/vllm-openai-rocm:v0.15.1", "model": "moonshotai/Kimi-K2.5", "model-prefix": "kimik2.5", "precision": "int4", "framework": "vllm", "runner": "mi355x", "isl": 1024, "osl": 1024, "tp": 8, "conc": 64, "max-model-len": 2248, "ep": 1, "dp-attn": false, "spec-decoding": "none", "exp-name": "kimik2.5_1k1k", "disagg": false, "run-eval": false}, {"image": "vllm/vllm-openai-rocm:v0.15.1", "model": "moonshotai/Kimi-K2.5", "model-prefix": "kimik2.5", "precision": "int4", "framework": "vllm", "runner": "mi355x", "isl": 1024, "osl": 8192, "tp": 8, "conc": 4, "max-model-len": 94
+... (truncated, 5304 chars total)
+[2026-03-02T09:45:16.879Z] 
+[FILE WRITE] inferencex_kimik2_5-int4-mi355x-vllm/results/sweep_configs.json
+[2026-03-02T09:45:23.627Z] 
+$ cp /home/weicai12/opencode/inferencex_kimik2_5-int4-mi355x-vllm/results/sweep_configs.json /home/weicai12/opencode/inferencex_kimik2_5-int4-mi355x-vllm/results/filtered_configs.json
+[2026-03-02T09:45:29.023Z] 
+[FILE WRITE] inferencex_kimik2_5-int4-mi355x-vllm/progress.json
+[2026-03-02T09:45:40.206Z] 
+$ ls -la /home/weicai12/opencode/inferencex_kimik2_5-int4-mi355x-vllm/repo/benchmarks/single_node/
+[2026-03-02T09:45:40.206Z] total 168
+drwxrwxr-x 2 weicai12 weicai12 4096 Mar  2 03:44 .
+drwxrwxr-x 4 weicai12 weicai12 4096 Mar  2 03:44 ..
+-rw-rw-r-- 1 weicai12 weicai12 1981 Mar  2 03:44 dsr1_fp4_b200.sh
+-rw-rw-r-- 1 weicai12 weicai12 3663 Mar  2 03:44 dsr1_fp4_b200_trt_mtp.sh
+-rw-rw-r-- 1 weicai12 weicai12 3226 Mar  2 03:44 dsr1_fp4_b200_trt.sh
+-rw-rw-r-- 1 weicai12 weicai12 1713 Mar  2 03:44 dsr1_fp4_mi355x_atom_mtp.sh
+-rw-rw-r-- 1 weicai12 weicai12 1688 Mar  2 03:44 dsr1_fp4_mi355x_atom.sh
+-rw-rw-r-- 1 weicai12 weicai12 1635 Mar  2 03:44 dsr1_fp4_mi355x.sh
+-rwxrwxr-x 1 weicai12 weicai12 3061 Mar  2 03:44 dsr1_fp8_b200_mtp.sh
+-rw-rw-r-- 1 weicai12 weicai12 3028 Mar  2 03:44 dsr1_fp8_b200.sh
+-rw-rw-r-- 1 weicai12 weicai12 3954 Mar  2 03:44 dsr1_fp8_b200_trt_mtp.sh
+-rw-rw-r-- 1 weicai12 weicai12 3993 Mar  2 03:44 dsr1_fp8_b200_trt.sh
+-rw-rw-r-- 1 weicai12 weicai12 2095 Mar  2 03:44 dsr1_fp8_h200.sh
+-rw-rw-r-- 1 weicai12 weicai12 2905 Mar  2 03:44 dsr1_fp8_h200_trt_mtp.sh
+-rw-rw-r-- 1 weicai12 weicai12 2443 Mar  2 03:44 dsr1_fp8_h200_trt.sh
+-rw-rw-r-- 1 weicai12 weicai12 2053 Mar  2 03:44 dsr1_fp8_mi300x.sh
+-rw-rw-r-- 1 weicai12 weicai12 1648 Mar  2 03:44 dsr1_fp8_mi325x.sh
+-rw-rw-r-- 1 weicai12 weicai12 1753 Mar  2 03:44 dsr1_fp8_mi355x_atom_mtp.sh
+-rw-rw-r-- 1 weicai12 weicai12 1688 Mar  2 03:44 dsr1_fp8_mi355x_atom.sh
+-rw-rw-r-- 1 weicai12 weicai12 1644 Mar  2 03:44 dsr1_fp8_mi355x.sh
+-rw-rw-r-- 1 weicai12 weicai12 1991 Mar  2 03:44 gptoss_fp4_b200.sh
+-rw-rw-r-- 1 weicai12 weicai12 2940 Mar  2 03:44 gptoss_fp4_b200_trt.sh
+-rw-rw-r-- 1 weicai12 weicai12 1468 Mar  2 03:44 gptoss_fp4_h100.sh
+-rw-rw-r-- 1 weicai12 weicai12 1855 Mar  2 03:44 gptoss_fp4_h200.sh
+-rw-rw-r-- 1 weicai12 weicai12 1906 Mar  2 03:44 gptoss_fp4_h200_trt.sh
+-rw-rw-r-- 1 weicai12 weicai12 2116 Mar  2 03:44 gptoss_fp4_mi300x.sh
+-rw-rw-r-- 1 weicai12 weicai12 2068 Mar  2 03:44 gptoss_fp4_mi325x.sh
+-rw-rw-r-- 1 weicai12 weicai12 1734 Mar  2 03:44 gptoss_fp4_mi355x_atom.sh
+-rw-rw-r-- 1 weicai12 weicai12 2067 Mar  2 03:44 gpt
+... (truncated, 2959 chars total)
+[2026-03-02T09:45:41.179Z] 
+$ ls /home/weicai12/opencode/inferencex_kimik2_5-int4-mi355x-vllm/repo/benchmarks/single_node/ | grep -i kimi
+[2026-03-02T09:45:41.179Z] kimik2.5_fp4_mi355x.sh
+kimik2.5_int4_b200.sh
+kimik2.5_int4_mi355x.sh
+[2026-03-02T09:45:48.489Z] 
+$ docker image ls | grep -E "vllm.*rocm" | head -5
+[2026-03-02T09:45:48.490Z] vllm/vllm-openai-rocm                                         v0.15.1                                                652c93f0fbc1   3 weeks ago     30.4GB

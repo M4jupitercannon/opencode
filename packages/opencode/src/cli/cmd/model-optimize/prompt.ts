@@ -4,13 +4,43 @@
  * Reads pure markdown skill files (.md) and substitutes {{VAR}} placeholders.
  * All skill logic lives in .md files — this file is minimal TS glue.
  */
-import * as fs from "fs"
 import * as path from "path"
 import type { ModelOptConfig } from "./types"
 import { PHASE_ORDER } from "./types"
 
-/** Directory containing the .md skill files */
-const SKILLS_DIR = path.join(import.meta.dir, "skills")
+// @ts-ignore - Bun text import
+import skill00 from "./skills/00-env-setup.md" with { type: "text" }
+// @ts-ignore - Bun text import
+import skill01 from "./skills/01-model-download.md" with { type: "text" }
+// @ts-ignore - Bun text import
+import skill02 from "./skills/02-demo-generate.md" with { type: "text" }
+// @ts-ignore - Bun text import
+import skill03 from "./skills/03-compat-fix.md" with { type: "text" }
+// @ts-ignore - Bun text import
+import skill04 from "./skills/04-profiling.md" with { type: "text" }
+// @ts-ignore - Bun text import
+import skill05 from "./skills/05-problem-generate.md" with { type: "text" }
+// @ts-ignore - Bun text import
+import skill06 from "./skills/06-kernel-optimize.md" with { type: "text" }
+// @ts-ignore - Bun text import
+import skill07 from "./skills/07-integration.md" with { type: "text" }
+// @ts-ignore - Bun text import
+import skill08 from "./skills/08-report-generate.md" with { type: "text" }
+// @ts-ignore - Bun text import
+import skillAgentConfig from "./skills/agent-config.md" with { type: "text" }
+
+const EMBEDDED_SKILLS: Record<string, string> = {
+  "00-env-setup.md": skill00,
+  "01-model-download.md": skill01,
+  "02-demo-generate.md": skill02,
+  "03-compat-fix.md": skill03,
+  "04-profiling.md": skill04,
+  "05-problem-generate.md": skill05,
+  "06-kernel-optimize.md": skill06,
+  "07-integration.md": skill07,
+  "08-report-generate.md": skill08,
+  "agent-config.md": skillAgentConfig,
+}
 
 /** Ordered list of skill files to compose */
 const SKILL_FILES = [
@@ -52,9 +82,11 @@ function substitute(template: string, vars: Record<string, string>): string {
   return template.replace(/\{\{(\w+)\}\}/g, (match, key) => vars[key] ?? match)
 }
 
-/** Read an .md file from the skills directory */
+/** Read an embedded .md skill file */
 function readSkill(filename: string): string {
-  return fs.readFileSync(path.join(SKILLS_DIR, filename), "utf-8")
+  const content = EMBEDDED_SKILLS[filename]
+  if (!content) throw new Error(`Unknown skill file: ${filename}`)
+  return content
 }
 
 /** Read the agent config .md file and substitute variables */

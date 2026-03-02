@@ -1,0 +1,18 @@
+{
+  "phase": "config",
+  "phases_completed": ["env", "config"],
+  "current_step": "configs generated",
+  "details": {
+    "total_configs": 15,
+    "filtered_configs": 15,
+    "model": "moonshotai/Kimi-K2.5",
+    "framework": "vllm",
+    "precision": "int4",
+    "runner": "mi355x",
+    "tp": 8,
+    "concurrency_levels": [4, 8, 16, 32, 64],
+    "sequence_lengths": ["1k1k", "1k8k", "8k1k"],
+    "image": "vllm/vllm-openai-rocm:v0.15.1"
+  },
+  "errors": []
+}

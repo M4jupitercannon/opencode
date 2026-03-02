@@ -29,6 +29,7 @@ import { PrCommand } from "./cli/cmd/pr"
 import { SessionCommand } from "./cli/cmd/session"
 import { KernelOptimizeCommand } from "./cli/cmd/kernel-optimize"
 import { ModelOptimizeCommand } from "./cli/cmd/model-optimize"
+import { InferenceXOptimizeCommand } from "./cli/cmd/inferencex-optimize"
 
 process.on("unhandledRejection", (e) => {
   Log.Default.error("rejection", {
@@ -103,6 +104,7 @@ const cli = yargs(hideBin(process.argv))
   .command(SessionCommand)
   .command(KernelOptimizeCommand)
   .command(ModelOptimizeCommand)
+  .command(InferenceXOptimizeCommand)
   .fail((msg, err) => {
     if (
       msg?.startsWith("Unknown argument") ||
