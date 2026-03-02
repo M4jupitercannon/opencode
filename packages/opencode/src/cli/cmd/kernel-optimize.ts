@@ -697,8 +697,10 @@ Before writing any kernel, run this to get actual GPU architecture:
 python3 -c "import torch; print(f'GPU: {torch.cuda.get_device_name()}'); print(f'Arch: {torch.cuda.get_device_capability()}')"
 \`\`\`
 This tells you:
-- AMD MI300X/MI355X: Use wave size 64, CDNA3 architecture
-- NVIDIA A100/H100: Use warp size 32, different optimal configs
+- AMD MI300X/MI325X (gfx942): wave size 64, CDNA3
+- AMD MI355X (gfx950): wave size 64, CDNA4
+- AMD gfx1200/gfx1201: wave size 32, RDNA4
+- NVIDIA A100/H100: warp size 32
 Adjust your optimization strategy based on actual hardware!
 
 ### STEP 1: Analyze the Problem
@@ -866,7 +868,7 @@ Start by reading the source file.`
 
     // Create agent config
     const agentConfig = `---
-model: amd-anthropic/claude-opus-4-5
+model: ${modelArg || "amd-anthropic/claude-opus-4-5"}
 temperature: 0.3
 steps: 50
 ---
@@ -964,13 +966,14 @@ Based on autotune results and problem analysis:
 `
     fs.writeFileSync(path.join(agentDir, "kernel-dev.md"), agentConfig)
 
-    // Create opencode.jsonc
+    const defaultModel = modelArg || "amd-anthropic/claude-opus-4-5"
+    const providerName = defaultModel.split("/")[0]
     const opencodeConfig = `{
   "$schema": "https://opencode.ai/config.json",
-  "model": "amd-anthropic/claude-opus-4-5",
+  "model": "${defaultModel}",
   "default_agent": "kernel-dev",
   "provider": {
-    "amd-anthropic": {
+    "${providerName}": {
       "options": {
         "timeout": 600000
       }

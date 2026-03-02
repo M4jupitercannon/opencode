@@ -226,7 +226,6 @@ export const ModelOptimizeCommand = cmd({
     const agentDir = path.join(opencodeDir, "agent")
     fs.mkdirSync(agentDir, { recursive: true })
 
-    // Exclude large directories (venv, model, __pycache__) from opencode indexing
     fs.writeFileSync(path.join(outputDir, ".gitignore"), [
       "venv/",
       "model/",
@@ -237,6 +236,8 @@ export const ModelOptimizeCommand = cmd({
       "*.gguf",
       "*.trace.json",
       "*.trace.json.gz",
+      "vllm_plugin/",
+      "*.log",
     ].join("\n") + "\n")
 
     // Create agent config from .md skill file
