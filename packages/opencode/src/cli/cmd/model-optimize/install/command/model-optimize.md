@@ -16,7 +16,7 @@ agent: model-opt
 4. Copy helper scripts from `~/.config/opencode/scripts/` to `<output_dir>/scripts/`
 
 ## ⚠️ CRITICAL RULES
-- **Docker mode** (preferred): If `env_info.json` has `env_type: "docker"`, prefix commands with `docker exec $CONTAINER_NAME bash -c "..."`. Set `HIP_VISIBLE_DEVICES=$BEST_GPU`.
+- **Docker mode** (preferred): If `env_info.json` has `env_type: "docker"`, search available docker images on dockerhub(rocm/vllm-dev:nightly preferred). prefix commands with `docker exec $CONTAINER_NAME bash -c "..."`. Set `HIP_VISIBLE_DEVICES=$BEST_GPU`.
 - **venv mode** (fallback): If `env_type: "venv"`, activate venv: `source <output_dir>/venv/bin/activate`
 - **ALL vLLM commands MUST redirect output to log files** (`&> logfile`) — NEVER dump vLLM logs into bash output
 - **ALL decisions MUST be data-driven** — read shapes from `kernel_shape_analysis.json`, not hardcoded
@@ -391,18 +391,45 @@ for k in ['output_throughput','request_throughput','mean_tpot_ms','mean_ttft_ms'
 
 ## Step 2: Collect Kernel Trace
 
-⚠️ **CRITICAL**: Two flags are mandatory for kernel shape analysis:
-- `--enforce-eager` — disables CUDA Graphs so GPU kernels retain their `External id` linkage to CPU ops
-- `--profiler-config` with `torch_profiler_record_shapes: true` — records tensor `Input Dims` on every CPU op
+### ⛔ HARD REQUIREMENTS — all three are mandatory, do NOT skip any:
 
-Without both, `analyze_kernel_shapes.py` will produce only `(unattributed)` shapes.
+1. **`--enforce-eager`** on the `vllm serve` command line — disables CUDA Graphs so every GPU kernel retains its `External id` linkage back to the CPU op that launched it. Without this, the trace has GPU kernels but no way to correlate them to operator shapes.
+
+2. **`--profiler-config`** with a JSON object containing **`torch_profiler_record_shapes: true`** — tells the PyTorch profiler to record `Input Dims` on every CPU operator event. Without this, the trace has CPU ops but their shapes are empty.
+
+3. **`/start_profile` → send requests → `/stop_profile`** API sequence — vLLM does NOT profile from startup. You must explicitly start and stop profiling via the HTTP API. Without this sequence, no trace file is written at all.
+
+**If any of the three is missing, `analyze_kernel_shapes.py` WILL produce 0% attributed shapes. You MUST re-collect the trace — do NOT proceed with bad data.**
+
+### Docker path note
+When running inside Docker, the profiler writes to the **container-side path**. Use `/workspace/output/profile/traces` (not the host path) inside `--profiler-config`.
+Do NOT set the `VLLM_TORCH_PROFILER_DIR` environment variable — it is deprecated (removed in v0.15+). Use `torch_profiler_dir` inside `--profiler-config` instead.
+
+### ⚠️ Two trace files are written
+vLLM writes **two** separate trace files per profiling session:
+- **`*async_llm*`** — frontend-only trace (CPU activity only, NO GPU kernels, NO shapes). **This file is USELESS for shape analysis.**
+- **`*rank-0*`** — worker trace (CPU + CUDA activities, has `cpu_op` events with `Input Dims`, has `kernel` events with `External id`). **This is the file you need.**
+
+Setting `ignore_frontend: true` in the profiler config suppresses the frontend trace entirely, which also reduces profiling overhead.
+
+**When selecting the trace file in subsequent steps, you MUST pick the `rank-0` worker trace, NOT the `async_llm` trace.**
 
 ```bash
 source <output_dir>/venv/bin/activate
 mkdir -p <output_dir>/profile/traces
-TRACE_DIR=$(realpath <output_dir>/profile/traces)
 
-# Build profiler config JSON (record_shapes is the key flag)
+# Determine the correct trace directory path
+# Docker mode: use container-side path; venv mode: use host path
+ENV_TYPE=$(python3 -c "import json; print(json.load(open('<output_dir>/env_info.json')).get('env_type','venv'))" 2>/dev/null || echo "venv")
+if [ "$ENV_TYPE" = "docker" ]; then
+  TRACE_DIR="/workspace/output/profile/traces"
+else
+  TRACE_DIR=$(realpath <output_dir>/profile/traces)
+fi
+
+# Build profiler config JSON
+# ⚠️ torch_profiler_record_shapes: true is the critical flag for shape analysis
+# ⚠️ ignore_frontend: true suppresses the useless async_llm trace (CPU-only, no GPU data)
 PROFILER_CFG=$(python3 -c "
 import json; print(json.dumps({
   'profiler': 'torch',
@@ -412,11 +439,19 @@ import json; print(json.dumps({
   'torch_profiler_with_flops': True,
   'torch_profiler_with_memory': False,
   'torch_profiler_use_gzip': True,
+  'ignore_frontend': True,
 }))
 ")
+echo "Profiler config: $PROFILER_CFG"
+
+# VLLM_RPC_TIMEOUT: trace flush after /stop_profile can take minutes for large models.
+# vLLM docs recommend 30min for 100 reqs on 70B. Default 10s causes timeouts.
+export VLLM_RPC_TIMEOUT=1800000
 
 # Start vLLM WITH profiler + enforce-eager — output to log file
-VLLM_TORCH_PROFILER_DIR="$TRACE_DIR" \
+# ⚠️ BOTH --enforce-eager AND --profiler-config are MANDATORY
+# ⚠️ Do NOT set VLLM_TORCH_PROFILER_DIR env var — it is deprecated.
+#    torch_profiler_dir in --profiler-config is the correct way.
 vllm serve $1 \
   --dtype auto \
   --max-model-len 4096 \
@@ -427,15 +462,21 @@ vllm serve $1 \
 VLLM_PID=$!
 echo "Trace vLLM PID: $VLLM_PID (log: <output_dir>/vllm_trace.log)"
 
-# Wait silently
+# Wait for server ready
 for i in $(seq 1 60); do
   curl -s http://localhost:8193/health > /dev/null 2>&1 && break
   sleep 5
 done
-curl -s http://localhost:8193/health > /dev/null 2>&1 && echo "✓ Trace server ready" || { echo "✗ Failed"; tail -5 <output_dir>/vllm_trace.log; }
+curl -s http://localhost:8193/health > /dev/null 2>&1 && echo "Trace server ready" || { echo "FAILED"; tail -5 <output_dir>/vllm_trace.log; kill $VLLM_PID 2>/dev/null; exit 1; }
 
-# Start profiling via API
-curl -s -X POST http://localhost:8193/start_profile && echo "Profiler started"
+# Verify --enforce-eager is active (check log for confirmation)
+grep -qi "enforce.eager\|CUDA graphs.*disabled\|eager mode" <output_dir>/vllm_trace.log && echo "enforce-eager: confirmed" || echo "WARNING: enforce-eager not confirmed in log"
+
+# ⚠️ CRITICAL: Start profiling via API — without this, NO trace is written
+PROFILE_RESP=$(curl -s -X POST http://localhost:8193/start_profile)
+echo "start_profile response: $PROFILE_RESP"
+echo "$PROFILE_RESP" | grep -qi "error" && { echo "FAILED to start profiler"; kill $VLLM_PID 2>/dev/null; exit 1; }
+sleep 2
 
 # Send requests for trace — output to file
 vllm bench serve \
@@ -447,13 +488,32 @@ vllm bench serve \
   --result-dir <output_dir>/profile --result-filename trace_benchmark.json \
   --label trace &> <output_dir>/profile/bench_trace.log
 
-# Stop profiling and flush trace
-curl -s -X POST http://localhost:8193/stop_profile && echo "Profiler stopped"
+# ⚠️ CRITICAL: Stop profiling via API — this flushes the trace to disk
+STOP_RESP=$(curl -s -X POST http://localhost:8193/stop_profile)
+echo "stop_profile response: $STOP_RESP"
 sleep 15
 kill $VLLM_PID 2>/dev/null; wait $VLLM_PID 2>/dev/null
 
 echo "Trace files:"
 ls -lh <output_dir>/profile/traces/ 2>/dev/null | head -5
+```
+
+### ⛔ Step 2b: Verify Trace Has Shape Data (MANDATORY before proceeding)
+
+**Do NOT skip this step.** If this verification fails, you MUST go back and re-collect the trace with the correct flags.
+
+All three analysis scripts (`analyze_kernel_shapes.py`, `vllm_trace_extractor.py`) accept a **directory** as `-i` input and will auto-select the worker trace (`*rank-0*`), rejecting `async_llm` frontend traces. They also validate the trace contents and exit non-zero if the trace is unsuitable.
+
+```bash
+cp <output_dir>/scripts/analyze_kernel_shapes.py <output_dir>/profile/
+# Run with --top-n 0 for validation only (no output files needed yet)
+python3 <output_dir>/profile/analyze_kernel_shapes.py -i <output_dir>/profile/traces/ -o <output_dir>/profile --top-n 0 2>&1 | head -20
+
+# If the above exits non-zero, the trace is invalid for shape analysis.
+# Check the output for the specific failure reason and re-collect with:
+#   1. --enforce-eager on vllm serve
+#   2. --profiler-config with torch_profiler_record_shapes: true AND ignore_frontend: true
+#   3. /start_profile API call BEFORE requests, /stop_profile AFTER
 ```
 
 ## Step 3: Extract Kernel Bottlenecks from Trace
@@ -462,10 +522,9 @@ ls -lh <output_dir>/profile/traces/ 2>/dev/null | head -5
 cd <output_dir>/profile
 cp <output_dir>/scripts/vllm_trace_extractor.py .
 
-TRACE_FILE=$(ls -t traces/*.json traces/*.json.gz 2>/dev/null | head -1)
-echo "Analyzing: $TRACE_FILE"
-
-python3 vllm_trace_extractor.py -i "$TRACE_FILE" \
+# The script auto-selects the worker trace (rank-0) from the directory,
+# rejecting async_llm frontend traces that have no GPU kernel data.
+python3 vllm_trace_extractor.py -i traces/ \
   --full-csv kernel_full.csv \
   --unique-csv kernel_unique.csv
 ```
@@ -514,7 +573,7 @@ for i, b in enumerate(bottlenecks[:10], 1):
 
 with open('bottlenecks.json', 'w') as f:
     json.dump(bottlenecks, f, indent=2)
-print(f'Saved bottlenecks.json ({len(bottlenecks)} kernels)')
+print('Saved bottlenecks.json (%d kernels)' % len(bottlenecks))
 "
 ```
 
@@ -527,10 +586,9 @@ This correlates GPU kernel durations with CPU-side operator shapes from the trac
 cd <output_dir>/profile
 cp <output_dir>/scripts/analyze_kernel_shapes.py .
 
-TRACE_FILE=$(ls -t traces/*.json traces/*.json.gz 2>/dev/null | head -1)
-echo "Shape analysis on: $TRACE_FILE"
-
-python3 analyze_kernel_shapes.py -i "$TRACE_FILE" -o .
+# The script auto-selects the worker trace (rank-0) from the directory,
+# validates it has GPU kernels + CPU ops with shapes, and exits non-zero if not.
+python3 analyze_kernel_shapes.py -i traces/ -o .
 ```
 
 This produces:

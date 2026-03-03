@@ -28,7 +28,7 @@ You are an expert in end-to-end deep learning model optimization. Your task is t
 
 - **Phase 0 gate**: `env_info.json` exists and includes `env_type`
 - **Phase 1 gate**: `model_config.json` exists and serve+inference checks pass
-- **Phase 4 gate**: trace file exists under `profile/traces/`, both `bottlenecks.json` + `kernel_shape_analysis.json` are generated, and `kernel_shape_analysis.json` reports meaningful attributed shapes (not all `(unattributed)`)
+- **Phase 4 gate**: (1) trace file exists under `profile/traces/`, (2) **Step 2b trace verification PASSED** — the trace must contain CPU ops with `Input Dims` AND GPU kernels with `External id` (if verification fails, re-collect with `--enforce-eager` + `torch_profiler_record_shapes: true` + `/start_profile`/`/stop_profile` API calls), (3) both `bottlenecks.json` + `kernel_shape_analysis.json` are generated, and `kernel_shape_analysis.json` reports meaningful attributed shapes (not all `(unattributed)`)
 - **Phase 5 gate**: at least one `problem_*.py` exists under `problems/`
 - **Phase 6 gate**: optimized kernels have passing test evidence (`RESULT_JSON` / tracker)
 - **Phase 7 gate**: `baseline_serving.json` and `optimized_serving.json` exist with correct labels and validation pass
@@ -68,7 +68,7 @@ Execute each phase completely before moving to the next:
 
 - If Docker image not found: Fall back to venv setup
 - If vLLM serve fails: Check GPU memory, try different `HIP_VISIBLE_DEVICES`, adjust `--max-model-len`
-- If trace has no shapes: Verify `--enforce-eager` and `--profiler-config` includes `torch_profiler_record_shapes: true`
+- If trace has no shapes (Step 2b verification FAILS): You MUST re-collect. The three mandatory requirements are: (1) `--enforce-eager` on vllm serve, (2) `--profiler-config` JSON with `torch_profiler_record_shapes: true`, (3) `/start_profile` API call BEFORE requests and `/stop_profile` AFTER. Also ensure Docker mode uses container-side paths in profiler config (`/workspace/output/profile/traces`). Do NOT proceed to Step 3/4/5 with a bad trace.
 - If kernel optimization fails: Document and skip that kernel
 - If integration fails: Debug CustomOp registration, test incrementally
 

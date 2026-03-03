@@ -505,13 +505,119 @@ def print_summary(per_category: List[Dict], total_gpu_us: float,
     print(f"\n{'='*90}\n")
 
 
+# ── Trace auto-selection ──────────────────────────────────────────────────
+
+def find_worker_trace(path: str) -> str:
+    """If path is a directory, auto-select the worker trace (rank-0), rejecting async_llm.
+
+    vLLM writes two trace files per profiling session:
+      - *async_llm* — frontend-only (CPU python_function events, NO GPU kernels)
+      - *rank-0*    — worker trace (CPU ops + CUDA kernels with shapes)
+
+    If path is a file, returns it as-is (with a warning if it looks like async_llm).
+    """
+    if os.path.isfile(path):
+        if "async_llm" in os.path.basename(path):
+            print(f"WARNING: Input file appears to be an async_llm frontend trace.")
+            print(f"  Frontend traces contain only Python function calls — no GPU kernels.")
+            print(f"  For shape analysis, use the *rank-0* worker trace instead.")
+        return path
+
+    if not os.path.isdir(path):
+        return path
+
+    traces = sorted(
+        [os.path.join(path, f) for f in os.listdir(path)
+         if f.endswith(".json") or f.endswith(".json.gz")],
+        key=os.path.getmtime, reverse=True,
+    )
+    if not traces:
+        print(f"ERROR: No trace files found in directory: {path}")
+        return ""
+
+    for t in traces:
+        bn = os.path.basename(t)
+        if "rank" in bn and "async_llm" not in bn:
+            print(f"Auto-selected worker trace: {bn}")
+            return t
+
+    for t in traces:
+        if "async_llm" not in os.path.basename(t):
+            print(f"Auto-selected trace (no rank marker): {os.path.basename(t)}")
+            return t
+
+    print(f"WARNING: Only async_llm frontend traces found in {path}")
+    return traces[0]
+
+
+def validate_trace_for_shapes(events: List[Dict[str, Any]]) -> bool:
+    """Upfront validation that the trace has the data needed for shape analysis.
+
+    Checks for:
+      - GPU kernel events (cat=kernel)
+      - CPU op events (cat=cpu_op)
+      - Input Dims on CPU ops (torch_profiler_record_shapes was enabled)
+      - External id on GPU kernels (--enforce-eager was used)
+
+    Returns True if valid, False if shape analysis would be useless.
+    """
+    cpu_ops = [e for e in events if e.get("cat") == "cpu_op"]
+    with_shapes = [e for e in cpu_ops if e.get("args", {}).get("Input Dims")]
+    gpu_kernels = [e for e in events if e.get("cat") == "kernel"]
+    with_ext_id = [e for e in gpu_kernels if e.get("args", {}).get("External id")]
+    frontend = [e for e in events if e.get("cat") == "python_function"]
+
+    print(f"\n  Trace validation:")
+    print(f"    CPU ops (cpu_op):     {len(cpu_ops)}")
+    print(f"    CPU ops with shapes:  {len(with_shapes)}")
+    print(f"    GPU kernels:          {len(gpu_kernels)}")
+    print(f"    GPU kernels w/ ext_id:{len(with_ext_id)}")
+
+    problems = []
+    if len(gpu_kernels) == 0:
+        if len(frontend) > 0:
+            problems.append(
+                f"This is an async_llm frontend trace ({len(frontend)} python_function events, 0 GPU kernels). "
+                f"Use the *rank-0* worker trace instead."
+            )
+        else:
+            problems.append("No GPU kernel events found.")
+    if len(cpu_ops) == 0:
+        problems.append("No cpu_op events — --enforce-eager was likely missing on vllm serve.")
+    if len(cpu_ops) > 0 and len(with_shapes) == 0:
+        problems.append(
+            "CPU ops exist but have no Input Dims — "
+            "torch_profiler_record_shapes was likely not set in --profiler-config."
+        )
+    if len(gpu_kernels) > 0 and len(with_ext_id) == 0:
+        problems.append(
+            "GPU kernels exist but have no External id — "
+            "--enforce-eager was likely missing (CUDA Graphs break correlation)."
+        )
+
+    if problems:
+        print(f"\n  TRACE VALIDATION FAILED:")
+        for p in problems:
+            print(f"    - {p}")
+        print(f"\n  Shape analysis requires ALL of:")
+        print(f"    1. --enforce-eager on the vllm serve command")
+        print(f"    2. --profiler-config JSON with torch_profiler_record_shapes: true, ignore_frontend: true")
+        print(f"    3. /start_profile API before requests, /stop_profile after")
+        print(f"    4. Select the *rank-0* worker trace, not the *async_llm* trace")
+        return False
+
+    pct = len(with_shapes) / len(cpu_ops) * 100 if cpu_ops else 0
+    print(f"    PASSED — {pct:.0f}% of CPU ops have shapes, {len(with_ext_id)} GPU kernels have External id")
+    return True
+
+
 # ── Main ─────────────────────────────────────────────────────────────────
 
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Per-shape GPU time breakdown for each operator category")
     ap.add_argument("-i", "--input", required=True,
-                    help="Torch profiler trace (.json or .json.gz)")
+                    help="Torch profiler trace (.json/.json.gz) or trace directory")
     ap.add_argument("-o", "--output-dir",
                     help="Output directory (default: same as input file)")
     ap.add_argument("--json-out", help="Override JSON output path")
@@ -520,9 +626,17 @@ def main() -> int:
                     help="Keep only top-N hottest shapes in outputs (default: 20)")
     args = ap.parse_args()
 
-    print(f"Loading trace: {args.input}")
-    events = load_trace(args.input)
+    input_path = find_worker_trace(args.input)
+    if not input_path:
+        return 1
+
+    print(f"Loading trace: {input_path}")
+    events = load_trace(input_path)
     print(f"Loaded {len(events)} events")
+
+    if not validate_trace_for_shapes(events):
+        print("\nERROR: Trace is not suitable for shape analysis. Exiting.")
+        return 1
 
     cpu_ops, gpu_kernels, bridge = build_indices(events)
     print(f"CPU ops: {len(cpu_ops)}, GPU kernels: {len(gpu_kernels)}, "
@@ -544,7 +658,7 @@ def main() -> int:
     print(f"Keeping top {args.top_n} hottest shapes in outputs.")
     print_summary(per_category, total_gpu_us, stats)
 
-    out_dir = args.output_dir or os.path.dirname(args.input) or "."
+    out_dir = args.output_dir or os.path.dirname(input_path) or "."
     os.makedirs(out_dir, exist_ok=True)
     json_path = args.json_out or os.path.join(out_dir, "kernel_shape_analysis.json")
     csv_path = args.csv_out or os.path.join(out_dir, "kernel_shape_analysis.csv")

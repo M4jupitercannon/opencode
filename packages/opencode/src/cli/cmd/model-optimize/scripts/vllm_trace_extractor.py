@@ -135,25 +135,77 @@ def default_output_paths(input_path: str) -> Tuple[str, str]:
     return full_csv, uniq_csv
 
 
+def find_worker_trace(path: str) -> str:
+    """If path is a directory, auto-select the worker trace (rank-0), rejecting async_llm.
+
+    vLLM writes two trace files per profiling session:
+      - *async_llm* — frontend-only (CPU python_function events, NO GPU kernels)
+      - *rank-0*    — worker trace (CPU ops + CUDA kernels with shapes)
+
+    If path is a file, returns it as-is (with a warning if it looks like async_llm).
+    """
+    if os.path.isfile(path):
+        if "async_llm" in os.path.basename(path):
+            print(f"WARNING: Input file appears to be an async_llm frontend trace.")
+            print(f"  Frontend traces contain only Python function calls — no GPU kernels.")
+            print(f"  For kernel analysis, use the *rank-0* worker trace instead.")
+        return path
+
+    if not os.path.isdir(path):
+        return path
+
+    traces = sorted(
+        [os.path.join(path, f) for f in os.listdir(path)
+         if f.endswith(".json") or f.endswith(".json.gz")],
+        key=os.path.getmtime, reverse=True,
+    )
+    if not traces:
+        print(f"ERROR: No trace files found in directory: {path}")
+        return ""
+
+    # Prefer rank-0 worker traces
+    for t in traces:
+        bn = os.path.basename(t)
+        if "rank" in bn and "async_llm" not in bn:
+            print(f"Auto-selected worker trace: {bn}")
+            return t
+
+    # Fallback: any non-async_llm trace
+    for t in traces:
+        if "async_llm" not in os.path.basename(t):
+            print(f"Auto-selected trace (no rank marker): {os.path.basename(t)}")
+            return t
+
+    print(f"WARNING: Only async_llm frontend traces found in {path}")
+    return traces[0]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Extract GPU kernel events from a vLLM/torch profiler trace (ALKA-style)")
     parser.add_argument("-i", "--input", required=True,
-                        help="Path to .pt.trace.json or .pt.trace.json.gz")
+                        help="Path to trace file (.json/.json.gz) or trace directory")
     parser.add_argument("--full-csv", help="Output CSV path for full kernel trace")
     parser.add_argument("--unique-csv", help="Output CSV path for unique kernel summary")
     args = parser.parse_args()
 
-    print(f"Loading trace: {args.input}")
-    trace, display_unit = load_trace_events(args.input)
+    input_path = find_worker_trace(args.input)
+    if not input_path:
+        return 1
+
+    print(f"Loading trace: {input_path}")
+    trace, display_unit = load_trace_events(input_path)
     kernels = extract_kernel_events(trace)
     print(f"Found {len(kernels)} kernel events (time unit: {display_unit})")
 
     if not kernels:
-        print("WARNING: No kernel events found in trace!")
+        print("ERROR: No kernel events found in trace!")
+        if any(e.get("cat") == "python_function" for e in trace[:5000]):
+            print("  This appears to be an async_llm frontend trace (python_function events only).")
+            print("  Use the *rank-0* worker trace instead for kernel analysis.")
         return 1
 
-    full_csv, uniq_csv = default_output_paths(args.input)
+    full_csv, uniq_csv = default_output_paths(input_path)
     if args.full_csv:
         full_csv = args.full_csv
     if args.unique_csv:

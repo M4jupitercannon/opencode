@@ -65,7 +65,10 @@ def start_vllm_serve(model: str, port: int, extra_args: list[str] = None,
     env = os.environ.copy()
     if trace_dir:
         os.makedirs(trace_dir, exist_ok=True)
-        env["VLLM_TORCH_PROFILER_DIR"] = trace_dir
+        # VLLM_RPC_TIMEOUT: trace flush after /stop_profile can take minutes for
+        # large models (vLLM docs recommend 30min for 100 reqs on 70B).
+        # Default is only 10s which causes timeouts.
+        env.setdefault("VLLM_RPC_TIMEOUT", "1800000")
 
     print(f"Starting vLLM serve: {' '.join(cmd)}")
     if trace_dir:
@@ -157,44 +160,108 @@ def build_profiler_config_arg(trace_dir: str) -> str:
         "torch_profiler_with_flops": True,
         "torch_profiler_with_memory": False,
         "torch_profiler_use_gzip": True,
+        "ignore_frontend": True,
     }
-    # vLLM CLI expects a JSON string value for --profiler-config, not a file path.
     return json.dumps(config)
 
 
-def verify_shapes_in_trace(trace_path: str):
-    """Quick check that the trace contains 'Input Dims' (shape data)."""
+def find_worker_trace(trace_dir: str) -> str:
+    """Select the worker trace (rank-0) from trace_dir, rejecting async_llm traces.
+
+    vLLM writes two trace files per profiling session:
+      - *async_llm* — frontend-only (CPU python_function events, NO GPU kernels)
+      - *rank-0*    — worker trace (CPU ops + CUDA kernels with shapes)
+
+    Returns the path to the worker trace, or empty string if not found.
+    """
+    if not os.path.isdir(trace_dir):
+        return ""
+
+    all_traces = sorted(
+        [os.path.join(trace_dir, f) for f in os.listdir(trace_dir)
+         if f.endswith(".json") or f.endswith(".json.gz")],
+        key=os.path.getmtime, reverse=True,
+    )
+    if not all_traces:
+        return ""
+
+    # Prefer rank-0 worker traces
+    for t in all_traces:
+        basename = os.path.basename(t)
+        if "rank" in basename and "async_llm" not in basename:
+            return t
+
+    # Fallback: any non-async_llm trace
+    for t in all_traces:
+        if "async_llm" not in os.path.basename(t):
+            return t
+
+    print(f"WARNING: Only async_llm frontend traces found in {trace_dir}")
+    print("  These contain only Python function calls — no GPU kernels or shapes.")
+    return ""
+
+
+def verify_shapes_in_trace(trace_path: str) -> bool:
+    """Validate that a trace file has GPU kernels with External id and CPU ops with Input Dims.
+
+    Returns True if the trace is valid for shape analysis, False otherwise.
+    """
     import gzip
     opener = gzip.open if trace_path.endswith(".gz") else open
     try:
-        has_shapes = False
-        has_kernels = False
-        # Stream through the full file to avoid false negatives on large traces.
         with opener(trace_path, "rt") as f:
-            while True:
-                chunk = f.read(1_000_000)
-                if not chunk:
-                    break
-                if not has_shapes and ("Input Dims" in chunk or "input_dims" in chunk):
-                    has_shapes = True
-                if not has_kernels and ('"cat":"kernel"' in chunk or '"cat": "kernel"' in chunk):
-                    has_kernels = True
-                if has_shapes and has_kernels:
-                    break
+            data = json.load(f)
 
-        if has_shapes and has_kernels:
-            print(f"\n✓ Trace verified: contains kernel events WITH shape data")
-            print(f"  File: {trace_path} ({os.path.getsize(trace_path) / 1_000_000:.1f} MB)")
-        elif has_kernels and not has_shapes:
-            print(f"\n⚠ Trace contains kernel events but NO shape data (Input Dims)")
-            print(f"  The profiler may not have record_shapes enabled.")
-            print(f"  Ensure vLLM version >= 0.8 with --profiler-config support")
-        elif not has_kernels:
-            print(f"\n⚠ Trace may not contain GPU kernel events")
+        events = data if isinstance(data, list) else data.get("traceEvents", [])
+
+        cpu_ops = [e for e in events if e.get("cat") == "cpu_op"]
+        with_shapes = [e for e in cpu_ops if e.get("args", {}).get("Input Dims")]
+        gpu_kernels = [e for e in events if e.get("cat") == "kernel"]
+        with_ext_id = [e for e in gpu_kernels if e.get("args", {}).get("External id")]
+        frontend_only = [e for e in events if e.get("cat") == "python_function"]
+
+        print(f"\n  Trace verification: {trace_path}")
+        print(f"    Size:                 {os.path.getsize(trace_path) / 1_000_000:.1f} MB")
+        print(f"    Total events:         {len(events)}")
+        print(f"    CPU ops (cpu_op):     {len(cpu_ops)}")
+        print(f"    CPU ops with shapes:  {len(with_shapes)}")
+        print(f"    GPU kernels:          {len(gpu_kernels)}")
+        print(f"    GPU kernels w/ ext_id:{len(with_ext_id)}")
+
+        ok = True
+        if len(gpu_kernels) == 0:
+            if len(frontend_only) > 0:
+                print(f"  FAIL: This is an async_llm frontend trace ({len(frontend_only)} python_function events)")
+                print(f"    This trace has NO GPU kernels. Select the *rank-0* worker trace instead.")
+            else:
+                print(f"  FAIL: No GPU kernel events in trace")
+            ok = False
+        if len(cpu_ops) == 0:
+            print(f"  FAIL: No cpu_op events — --enforce-eager was likely missing")
+            ok = False
+        if len(with_shapes) == 0 and len(cpu_ops) > 0:
+            print(f"  FAIL: No Input Dims on cpu_ops — torch_profiler_record_shapes was likely not set")
+            ok = False
+        if len(with_ext_id) == 0 and len(gpu_kernels) > 0:
+            print(f"  FAIL: No External id on GPU kernels — --enforce-eager was likely missing")
+            ok = False
+
+        if ok:
+            pct = len(with_shapes) / len(cpu_ops) * 100 if cpu_ops else 0
+            print(f"  PASSED — {pct:.0f}% of CPU ops have shape data, "
+                  f"{len(with_ext_id)} GPU kernels have External id")
         else:
-            print(f"\n✓ Trace file collected: {trace_path}")
+            print(f"\n  Trace verification FAILED. Shape analysis will not produce useful results.")
+            print(f"  Required profiling setup:")
+            print(f"    1. --enforce-eager on the vllm serve command")
+            print(f"    2. --profiler-config with torch_profiler_record_shapes: true, ignore_frontend: true")
+            print(f"    3. /start_profile API call BEFORE requests, /stop_profile AFTER")
+            print(f"    4. Select the *rank-0* worker trace, not the *async_llm* trace")
+
+        return ok
     except Exception as e:
-        print(f"\n⚠ Could not verify trace: {e}")
+        print(f"\n  Could not verify trace: {e}")
+        return False
 
 
 def benchmark_mode(args) -> dict:
@@ -289,19 +356,26 @@ def trace_mode(args) -> str:
     finally:
         stop_server(proc)
 
-    # Find the generated trace file
-    trace_files = []
-    for f in os.listdir(trace_dir):
-        if f.endswith(".json") or f.endswith(".json.gz"):
-            trace_files.append(os.path.join(trace_dir, f))
+    # Find the worker trace (rank-0), not the async_llm frontend trace
+    print(f"\nLooking for worker trace in: {trace_dir}")
+    all_traces = [os.path.join(trace_dir, f) for f in os.listdir(trace_dir)
+                  if f.endswith(".json") or f.endswith(".json.gz")]
+    if all_traces:
+        print(f"  All trace files: {[os.path.basename(t) for t in all_traces]}")
 
-    if trace_files:
-        trace_files.sort(key=os.path.getmtime, reverse=True)
-        print(f"Trace files collected: {trace_files}")
-        verify_shapes_in_trace(trace_files[0])
-        return trace_files[0]
+    trace_file = find_worker_trace(trace_dir)
+    if trace_file:
+        print(f"  Selected worker trace: {os.path.basename(trace_file)}")
+        valid = verify_shapes_in_trace(trace_file)
+        if not valid:
+            print("\nERROR: Trace verification failed — shape analysis will not work.")
+            print("Re-run with correct flags (see verification output above).")
+        return trace_file
     else:
-        print("WARNING: No trace files found!")
+        print("ERROR: No valid worker trace files found!")
+        if all_traces:
+            print(f"  Found {len(all_traces)} trace files, but all appear to be async_llm frontend traces.")
+            print("  Ensure ignore_frontend: true is set in --profiler-config.")
         return ""
 
 
