@@ -11,6 +11,7 @@ import { Server } from "../../../server/server"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
 import * as fs from "fs"
 import * as path from "path"
+import { execSync } from "child_process"
 import { UI } from "../../ui"
 import { Provider } from "../../../provider/provider"
 import { select } from "@clack/prompts"
@@ -18,6 +19,26 @@ import { select } from "@clack/prompts"
 import type { InferenceXConfig, InferenceXDirs } from "./types"
 import { PHASE_ORDER } from "./types"
 import { buildAgentPrompt, buildAgentConfig } from "./prompt"
+
+const DOCKER_LABEL = "inferencex-pipeline=true"
+
+function cleanupDockerContainers() {
+  try {
+    const ids = execSync(
+      `docker ps -q --filter label=${DOCKER_LABEL}`,
+      { encoding: "utf-8", timeout: 10_000 },
+    ).trim()
+    if (ids) {
+      UI.println("Stopping pipeline Docker containers...")
+      execSync(`docker stop ${ids.split("\n").join(" ")}`, {
+        encoding: "utf-8",
+        timeout: 30_000,
+      })
+    }
+  } catch {
+    // best-effort cleanup
+  }
+}
 
 const DEFAULT_REPO_URL = "https://github.com/SemiAnalysisAI/InferenceX.git"
 
@@ -43,7 +64,7 @@ export const InferenceXOptimizeCommand = cmd({
       })
       .option("repo-dir", {
         type: "string",
-        describe: "path to existing InferenceX repo clone",
+        describe: "path for InferenceX repo (uses existing clone or clones here; default: <output>/repo)",
       })
       .option("repo-url", {
         type: "string",
@@ -200,6 +221,13 @@ export const InferenceXOptimizeCommand = cmd({
       fs.writeFileSync(progressFile, JSON.stringify(progress, null, 2))
     }
 
+    const onExit = () => {
+      cleanupDockerContainers()
+      process.exit(1)
+    }
+    process.on("SIGINT", onExit)
+    process.on("SIGTERM", onExit)
+
     const pipelineConfig: InferenceXConfig = {
       configKey,
       outputDir,
@@ -288,6 +316,7 @@ export const InferenceXOptimizeCommand = cmd({
         UI.println(UI.Style.TEXT_DIM + `Detailed log: ${logFilePath}`)
 
         let currentPhase = ""
+        const shownBashOutput = new Map<string, number>()
         const eventProcessor = (async () => {
           for await (const event of events.stream) {
             if (event.type === "message.part.updated") {
@@ -301,51 +330,89 @@ export const InferenceXOptimizeCommand = cmd({
                 }
               }
 
-              if (part.type === "tool" && part.state.status === "completed") {
+              if (part.type === "tool") {
                 const tool = part.tool
-                const title = part.state.title || ""
-                const input = (part.state.input || {}) as Record<string, any>
+                const state = part.state as any
+                const title = state.title || ""
+                const input = (state.input || {}) as Record<string, any>
+                const partId = (part as any).id || ""
 
-                if (tool === "bash") {
-                  const shellCmd = input.command || title
-                  log(`\n$ ${shellCmd}`)
-                  UI.println(UI.Style.TEXT_INFO_BOLD + "$ " + UI.Style.TEXT_DIM + title)
-                  if (part.state.output?.trim()) {
-                    const output = part.state.output.trim()
-                    if (output.length > 2000) {
-                      log(`${output.slice(0, 2000)}\n... (truncated, ${output.length} chars total)`)
+                if (tool === "bash" && state.status === "running") {
+                  const output = (state.output as string) || ""
+                  const shown = shownBashOutput.get(partId) || 0
+                  if (shown === 0 && title) {
+                    UI.println(UI.Style.TEXT_INFO_BOLD + "$ " + UI.Style.TEXT_DIM + title)
+                    log(`\n$ ${input.command || title}`)
+                  }
+                  if (output.length > shown) {
+                    const newContent = output.slice(shown)
+                    log(newContent)
+                    UI.println(newContent.trimEnd())
+                    shownBashOutput.set(partId, output.length)
+                  }
+                }
+
+                if (state.status === "completed") {
+                  const wasStreamed = partId && shownBashOutput.has(partId)
+
+                  if (tool === "bash") {
+                    if (!wasStreamed) {
+                      const shellCmd = input.command || title
+                      log(`\n$ ${shellCmd}`)
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "$ " + UI.Style.TEXT_DIM + title)
+                      if (state.output?.trim()) {
+                        const output = (state.output as string).trim()
+                        if (output.length > 2000) {
+                          log(`${output.slice(0, 2000)}\n... (truncated, ${output.length} chars total)`)
+                        } else {
+                          log(output)
+                        }
+                        const lines = output.split("\n")
+                        if (lines.length > 10) {
+                          UI.println(lines.slice(0, 8).join("\n"))
+                          UI.println(UI.Style.TEXT_DIM + `... (${lines.length - 8} more lines)`)
+                        } else {
+                          UI.println(output)
+                        }
+                      }
                     } else {
-                      log(output)
+                      const output = (state.output as string) || ""
+                      const shown = shownBashOutput.get(partId) || 0
+                      if (output.length > shown) {
+                        const remaining = output.slice(shown)
+                        log(remaining)
+                        UI.println(remaining.trimEnd())
+                      }
+                      shownBashOutput.delete(partId)
                     }
-                    const lines = output.split("\n")
-                    if (lines.length > 10) {
-                      UI.println(lines.slice(0, 8).join("\n"))
-                      UI.println(UI.Style.TEXT_DIM + `... (${lines.length - 8} more lines)`)
-                    } else {
-                      UI.println(output)
+                    const shellCmd = input.command || title
+                    const combined = shellCmd + "\n" + ((state.output as string) || "")
+                    const scriptMatch = combined.match(/BENCHMARK_SCRIPT=["']?(benchmarks\/[^\s"']+\.sh|[^\s"']+\.sh)/)
+                    if (scriptMatch) {
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "Benchmark script: " + scriptMatch[1])
                     }
-                  }
-                } else if (tool === "write" || tool === "edit") {
-                  const filePath = input.target_file || input.file_path || title
-                  const shortPath = filePath.replace(outputDir + "/", "")
-                  log(`\n[FILE ${tool.toUpperCase()}] ${shortPath}`)
-                  const verb = tool === "write" ? "Creating" : "Editing"
-                  UI.println(UI.Style.TEXT_SUCCESS + `${verb}: ` + UI.Style.TEXT_DIM + shortPath)
-                } else if (tool === "read") {
-                  // skip noisy read logs
-                } else if (tool === "todowrite") {
-                  const todos = input.todos || []
-                  const inProgress = todos.filter((t: any) => t.status === "in_progress")
-                  const completed = todos.filter((t: any) => t.status === "completed")
-                  if (inProgress.length > 0) {
-                    UI.println(UI.Style.TEXT_INFO + "In Progress: " + inProgress.map((t: any) => t.content).join(", "))
-                  }
-                  if (completed.length > 0) {
-                    UI.println(UI.Style.TEXT_SUCCESS + "Completed: " + completed.map((t: any) => t.content).join(", "))
-                  }
-                } else {
-                  if (title) {
-                    UI.println(UI.Style.TEXT_DIM + `[${tool}] ${title}`)
+                  } else if (tool === "write" || tool === "edit") {
+                    const filePath = input.target_file || input.file_path || title
+                    const shortPath = filePath.replace(outputDir + "/", "")
+                    log(`\n[FILE ${tool.toUpperCase()}] ${shortPath}`)
+                    const verb = tool === "write" ? "Creating" : "Editing"
+                    UI.println(UI.Style.TEXT_SUCCESS + `${verb}: ` + UI.Style.TEXT_DIM + shortPath)
+                  } else if (tool === "read") {
+                    // skip noisy read logs
+                  } else if (tool === "todowrite") {
+                    const todos = input.todos || []
+                    const inProgress = todos.filter((t: any) => t.status === "in_progress")
+                    const completed = todos.filter((t: any) => t.status === "completed")
+                    if (completed.length > 0) {
+                      UI.println(UI.Style.TEXT_SUCCESS + "Completed: " + completed.map((t: any) => t.content).join(", "))
+                    }
+                    if (inProgress.length > 0) {
+                      UI.println(UI.Style.TEXT_INFO + "In Progress: " + inProgress.map((t: any) => t.content).join(", "))
+                    }
+                  } else {
+                    if (title) {
+                      UI.println(UI.Style.TEXT_DIM + `[${tool}] ${title}`)
+                    }
                   }
                 }
               }
@@ -457,6 +524,9 @@ export const InferenceXOptimizeCommand = cmd({
         UI.println("Event processor completed")
         UI.println(UI.Style.TEXT_SUCCESS + `Full log saved to: ${logFilePath}`)
       } finally {
+        cleanupDockerContainers()
+        process.removeListener("SIGINT", onExit)
+        process.removeListener("SIGTERM", onExit)
         try {
           fs.rmSync(opencodeDir, { recursive: true })
         } catch {

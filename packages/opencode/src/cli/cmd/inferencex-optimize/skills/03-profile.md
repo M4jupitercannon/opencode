@@ -21,6 +21,7 @@ Add profiling environment variables to the Docker command:
 ```bash
 docker run --rm \
     --entrypoint /bin/bash \
+    --label inferencex-pipeline=true \
     $GPU_FLAGS \
     --shm-size 64g \
     --ipc=host \

@@ -12,13 +12,29 @@ docker --version
 If Docker is not available, report an error and stop.
 
 ### 2. Check GPU Availability
-Detect GPU vendor:
+Detect GPU vendor and architecture:
 ```bash
-# For AMD GPUs
-ls /dev/kfd /dev/dri 2>/dev/null && echo "AMD GPU detected"
+# Try AMD GPU detection via rocminfo
+if command -v rocminfo &>/dev/null; then
+    AMD_ARCH=$(rocminfo 2>/dev/null | grep -oP 'gfx\w+' | head -1 | tr '[:upper:]' '[:lower:]')
+    if [ -n "$AMD_ARCH" ]; then
+        echo "AMD GPU detected: $AMD_ARCH"
+    fi
+fi
 
-# For NVIDIA GPUs
-nvidia-smi 2>/dev/null && echo "NVIDIA GPU detected"
+# Try NVIDIA GPU detection via nvidia-smi
+if command -v nvidia-smi &>/dev/null; then
+    NVIDIA_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.' | sed 's/^/sm_/')
+    if [ -n "$NVIDIA_ARCH" ]; then
+        echo "NVIDIA GPU detected: $NVIDIA_ARCH"
+    fi
+fi
+
+# Fail if no GPU was found
+if [ -z "$AMD_ARCH" ] && [ -z "$NVIDIA_ARCH" ]; then
+    echo "ERROR: No GPU detected" >&2
+    exit 1
+fi
 ```
 
 ### 3. Clone or Update InferenceX Repository
