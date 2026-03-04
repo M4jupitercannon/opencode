@@ -30,8 +30,8 @@ mkdir -p "$OPENCODE_DIR/agent" "$OPENCODE_DIR/command" "$OPENCODE_DIR/scripts"
 BASE_URL="https://raw.githubusercontent.com/vivienfanghuagood/opencode/opt-vllm/packages/opencode/src/cli/cmd/model-optimize/install"
 
 AGENT_FILES="model-opt.md"
-COMMAND_FILES="model-optimize.md kernel-optimize.md"
-SCRIPT_FILES="kernel_test_runner.py kernel_finalize.py shape_capture.py analyze_fusion.py analyze_kernels.py vllm_trace_extractor.py vllm_benchmark.py generate_vllm_plugin.py validate_pipeline.py"
+COMMAND_FILES="model-analyzer.md model-optimize.md kernel-optimize.md"
+SCRIPT_FILES="kernel_test_runner.py kernel_finalize.py shape_capture.py analyze_fusion.py analyze_kernels.py vllm_trace_extractor.py vllm_benchmark.py generate_vllm_plugin.py validate_pipeline.py split_vllm_trace_annotation.py"
 
 if [ -f "$SCRIPT_DIR/agent/model-opt.md" ]; then
     echo "Installing from local files..."

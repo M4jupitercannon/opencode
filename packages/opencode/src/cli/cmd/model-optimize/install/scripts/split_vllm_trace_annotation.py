@@ -140,10 +140,41 @@ import zipfile
 from typing import List, Set, Tuple, Optional
 from dataclasses import dataclass, field
 import csv
-from TraceLens.util import DataLoader
-# Try to use faster JSON parser (orjson is 2-10x faster than json)
-import orjson
-from tqdm import tqdm
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, **_kwargs):
+        return iterable
+
+try:
+    import orjson as _json_fast
+    def _json_loads(data):
+        return _json_fast.loads(data)
+except ImportError:
+    _json_fast = None
+    def _json_loads(data):
+        if isinstance(data, bytes):
+            data = data.decode("utf-8")
+        return json.loads(data)
+
+
+def _load_trace_file(filepath: str) -> dict:
+    """Load trace JSON from .json, .json.gz, or .zip (standalone, no TraceLens)."""
+    if filepath.endswith(".zip"):
+        with zipfile.ZipFile(filepath, "r") as zf:
+            json_files = [f for f in zf.namelist() if f.endswith(".json")]
+            if not json_files:
+                raise ValueError(f"No .json file found in {filepath}")
+            data = zf.read(json_files[0])
+    elif filepath.endswith(".json.gz") or filepath.endswith(".gz"):
+        with gzip.open(filepath, "rb") as f:
+            data = f.read()
+    elif filepath.endswith(".json"):
+        with open(filepath, "rb") as f:
+            data = f.read()
+    else:
+        raise ValueError(f"Unsupported file type: {filepath}")
+    return _json_loads(data)
 GPU_EVENT_CATEGORIES = ["kernel", "gpu_memcpy", "gpu_memset", "gpu_user_annotation"]
 
 def get_filename(filepath: str) -> dict:
@@ -553,7 +584,7 @@ def main():
     ]
 
     # Load trace
-    trace_json = DataLoader.load_data(get_filename(args.trace_path))
+    trace_json = _load_trace_file(get_filename(args.trace_path))
     events = trace_json.get("traceEvents", [])
     print(f"Loaded {len(events)} events")
     
