@@ -73,7 +73,7 @@ for k in ['output_throughput','request_throughput','mean_tpot_ms','mean_ttft_ms'
 
 3. **`/start_profile` → send requests → `/stop_profile`** API sequence — vLLM does NOT profile from startup. You must explicitly start and stop profiling via the HTTP API. Without this sequence, no trace file is written at all.
 
-**If any of the three is missing, `analyze_kernel_shapes.py` WILL produce 0% attributed shapes. You MUST re-collect the trace — do NOT proceed with bad data.**
+**If any of the three is missing, `analyze_kernels.py` WILL produce 0% attributed shapes. You MUST re-collect the trace — do NOT proceed with bad data.**
 
 ### Docker path note
 When running inside Docker, the profiler writes to the **container-side path**. Use `/workspace/output/profile/traces` (not the host path) inside `--profiler-config`.
@@ -178,11 +178,11 @@ ls -lh {{PROFILE_DIR}}/traces/ 2>/dev/null | head -5
 **Do NOT skip this step.** If this verification fails, you MUST go back and re-collect the trace with the correct flags.
 
 ```bash
-# Run the shape analyzer in validation-only mode.
+# Run the analyzer in validation-only mode.
 # It auto-selects the worker trace (rank-0) from the traces/ directory,
 # validates that it has GPU kernels + CPU ops with shapes, and exits non-zero if invalid.
-cp {{OUTPUT_DIR}}/scripts/analyze_kernel_shapes.py {{PROFILE_DIR}}/
-python3 {{PROFILE_DIR}}/analyze_kernel_shapes.py -i {{PROFILE_DIR}}/traces/ -o {{PROFILE_DIR}} --top-n 0 2>&1 | head -20
+cp {{OUTPUT_DIR}}/scripts/analyze_kernels.py {{PROFILE_DIR}}/
+python3 {{PROFILE_DIR}}/analyze_kernels.py -i {{PROFILE_DIR}}/traces/ --validate-only 2>&1 | head -20
 
 # If the above exits non-zero, the trace is invalid for shape analysis.
 # Check the output for the specific failure reason and re-collect with:
@@ -191,104 +191,38 @@ python3 {{PROFILE_DIR}}/analyze_kernel_shapes.py -i {{PROFILE_DIR}}/traces/ -o {
 #   3. /start_profile API call BEFORE requests, /stop_profile AFTER
 ```
 
-## Step 3: Extract Kernel Bottlenecks from Trace
+## Step 3: Split Trace & Run TraceLens Performance Analysis
+
+The `analyze_kernels.py` script handles trace splitting and TraceLens analysis in one command. It:
+1. Splits the trace into prefill-decode and decode-only phases via TraceLens
+2. Runs standalone performance analysis on each phase trace
+3. Produces `analysis_summary.json` and per-phase CSV reports
 
 ```bash
 cd {{PROFILE_DIR}}
-cp {{OUTPUT_DIR}}/scripts/vllm_trace_extractor.py .
+cp {{OUTPUT_DIR}}/scripts/analyze_kernels.py .
 
-# The script auto-selects the worker trace (rank-0) from the directory,
-# rejecting async_llm frontend traces that have no GPU kernel data.
-python3 vllm_trace_extractor.py -i traces/ \
-  --full-csv kernel_full.csv \
-  --unique-csv kernel_unique.csv
-```
-
-## Step 4: Generate bottlenecks.json
-
-```bash
-cd {{PROFILE_DIR}}
-python3 -c "
-import csv, json
-
-kernels = []
-with open('kernel_unique.csv') as f:
-    for row in csv.DictReader(f):
-        kernels.append({
-            'name': row['name'], 'count': int(row['count']),
-            'total_dur_us': float(row['total_dur']),
-            'avg_dur_us': float(row['avg_dur']),
-            'median_dur_us': float(row['median_dur']),
-        })
-
-total = sum(k['total_dur_us'] for k in kernels)
-bottlenecks = []
-for k in kernels[:30]:
-    pct = k['total_dur_us'] / total * 100 if total > 0 else 0
-    name = k['name']
-    optimizable = True
-    reason = ''
-    if 'Cijk_' in name or 'gemm' in name.lower() or 'hipblas' in name.lower():
-        reason = 'GEMM/rocBLAS'; optimizable = False
-    elif 'attn' in name.lower() or 'flash' in name.lower() or 'mha' in name.lower():
-        reason = 'Attention'; optimizable = True
-    elif 'norm' in name.lower() or 'rms' in name.lower():
-        reason = 'Normalization'; optimizable = True
-    elif 'elementwise' in name.lower() or 'vectorized' in name.lower():
-        reason = 'Elementwise'; optimizable = True
-    elif 'silu' in name.lower() or 'gelu' in name.lower():
-        reason = 'Activation'; optimizable = True
-    elif 'copy' in name.lower() or 'Cat' in name:
-        reason = 'Memory op'; optimizable = False
-    bottlenecks.append({**k, 'cuda_time_percent': pct, 'optimizable': optimizable, 'reason': reason})
-
-print('Total GPU time: %.2fms, Top 10 kernels:' % (total/1000))
-for i, b in enumerate(bottlenecks[:10], 1):
-    print('  %d. %-45s %5.1f%%' % (i, b['name'][:45], b['cuda_time_percent']))
-
-with open('bottlenecks.json', 'w') as f:
-    json.dump(bottlenecks, f, indent=2)
-print('Saved bottlenecks.json (%d kernels)' % len(bottlenecks))
-"
-```
-
-## Step 5: Per-Shape Kernel Time Analysis
-
-Analyze time proportion of **each shape** for each operator category.
-This correlates GPU kernel durations with CPU-side operator shapes from the trace.
-
-```bash
-cd {{PROFILE_DIR}}
-cp {{OUTPUT_DIR}}/scripts/analyze_kernel_shapes.py .
-
-# The script auto-selects the worker trace (rank-0) from the directory,
-# validates it has GPU kernels + CPU ops with shapes, and exits non-zero if not.
-python3 analyze_kernel_shapes.py -i traces/ -o .
+# TraceLens is auto-discovered or cloned from GitHub if not found.
+# Use --tracelens-dir to point to a local copy, or set TRACELENS_DIR env var.
+# --skip-validation skips re-loading the full trace (already validated in Step 2b).
+python3 analyze_kernels.py -i traces/ -o . --skip-validation
 ```
 
 This produces:
-- `kernel_shape_analysis.json` — structured per-category, per-shape breakdown
-- `kernel_shape_analysis.csv` — flat CSV for inspection
+- `phase_traces/` — split trace files (prefill-decode, decode-only)
+- `prefilldecode_report/` — TraceLens CSVs (ops_summary.csv, unified_perf_summary.csv, etc.)
+- `decode_report/` — TraceLens CSVs for decode-only phase
+- `analysis_summary.json` — machine-readable summary with roofline data
 
-Example output:
-```
-  GEMM — 94.1% of total (15488.61ms, 10 shapes, 100% attributed)
-  ──────────────────────────────────────────────────────────────────────────────────────
-    Shape                                               %Total  %InCat  Time(ms)  Count  Avg(us)
-    [4,4096]x[4096,24576]                                30.5%   32.4%  5023.08   9072    553.7
-    [2,4096]x[4096,24576]                                15.4%   16.4%  2533.19   4644    545.5
-    [4,12288]x[12288,4096]                               12.8%   13.6%  2112.64   9072    232.9
-    [4,4096]x[4096,6144]                                  7.0%    7.4%  1144.21   9072    126.1
-    ...
+## Step 4: Generate bottlenecks.json from TraceLens Results
 
-  Attention — 2.4% of total (390.56ms, 4 shapes, 100% attributed)
-  ──────────────────────────────────────────────────────────────────────────────────────
-    Shape                                               %Total  %InCat  Time(ms)  Count  Avg(us)
-    [4,32,128]x[4,8,128]x[4,8,128]x[4,32,128]             1.5%   64.4%   251.52  27216      9.2
-    ...
-```
+See `model-optimize.md` Phase 4, Step 4 for the full inline script that:
+- Reads TraceLens `ops_summary.csv` and `unified_perf_summary.csv`
+- Calculates roofline efficiency for GEMM kernels
+- Breaks down Attention (SDPA) sub-kernels
+- Produces `bottlenecks.json` with per-shape roofline data
 
-⚠️ **CRITICAL**: The shapes must be real traced shapes. Use this data in Phase 5 to pick exact dimensions for problem files and prioritize which (operator, shape) combinations to optimize first.
+⚠️ **CRITICAL**: The shapes are real traced shapes from the profiled workload. Use this data in Phase 5 to pick exact dimensions for problem files and prioritize which (operator, shape) combinations to optimize first.
 
 ## Step 6: Save model shapes
 

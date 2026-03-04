@@ -25,8 +25,8 @@ Create a comprehensive optimization report.
 |----------|-------------------|------------|-----------|---------|
 | ...      | ...               | ...        | ...       | ...     |
 
-## Per-Shape Kernel Time Analysis
-Include the top hottest (operator, shape) combinations from `kernel_shape_analysis.json`.
+## TraceLens Roofline Analysis
+Include the top hottest (operator, shape) combinations from `analysis_summary.json` and TraceLens `unified_perf_summary.csv`.
 This data was collected with `--enforce-eager` and `torch_profiler_record_shapes: true` in `--profiler-config`.
 
 | Category | Shape | % of GPU Time | Time (ms) | Count |
@@ -55,9 +55,10 @@ Outputs generated with fixed random seed for verification.
 | ![Original](comparison_outputs/original_output.png) | ![Optimized](comparison_outputs/optimized_output.png) |
 
 ## Files Generated
-- profile/bottlenecks.json - Kernel bottleneck ranking
-- profile/kernel_shape_analysis.json - Per-shape kernel time breakdown
-- profile/kernel_shape_analysis.csv - Shape analysis (flat CSV)
+- profile/bottlenecks.json - Kernel bottleneck ranking with roofline efficiency
+- profile/analysis_summary.json - TraceLens analysis summary with per-phase roofline data
+- profile/prefilldecode_report/ - TraceLens CSVs for prefill-decode phase
+- profile/decode_report/ - TraceLens CSVs for decode-only phase
 - problems/ - Problem files + optimized kernels
 - optimized/vllm_plugin/ - vLLM CustomOp integration plugin
 - report/baseline_serving.json - Baseline benchmark results

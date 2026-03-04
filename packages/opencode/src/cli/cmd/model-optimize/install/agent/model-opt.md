@@ -28,7 +28,7 @@ You are an expert in end-to-end deep learning model optimization. You specialize
 
 - **Phase 0 gate**: `env_info.json` exists and includes `env_type`
 - **Phase 1 gate**: `model_config.json` exists and serve+inference checks pass
-- **Phase 4 gate**: (1) trace file exists under `profile/traces/`, (2) **Step 2b trace verification PASSED** — the trace must contain CPU ops with `Input Dims` AND GPU kernels with `External id` (if verification fails, re-collect with `--enforce-eager` + `torch_profiler_record_shapes: true` + `/start_profile`/`/stop_profile` API calls), (3) both `bottlenecks.json` + `kernel_shape_analysis.json` are generated, and `kernel_shape_analysis.json` reports meaningful attributed shapes (not all `(unattributed)`)
+- **Phase 4 gate**: (1) trace file exists under `profile/traces/`, (2) **Step 2b trace verification PASSED** — the trace must contain CPU ops with `Input Dims` AND GPU kernels with `External id` (if verification fails, re-collect with `--enforce-eager` + `torch_profiler_record_shapes: true` + `/start_profile`/`/stop_profile` API calls), (3) both `bottlenecks.json` + `analysis_summary.json` are generated with TraceLens roofline data
 - **Phase 5 gate**: at least one `problem_*.py` exists under `problems/`
 - **Phase 6 gate**: optimized kernels have passing test evidence (`RESULT_JSON` / tracker)
 - **Phase 7 gate**: `baseline_serving.json` and `optimized_serving.json` exist with correct labels and validation pass
@@ -46,8 +46,8 @@ Execute each phase completely before moving to the next:
 
 1. **Phase 0**: Set up environment (Docker container or venv)
 2. **Phase 1**: Download model and verify vLLM serving
-3. **Phase 4**: Profile — baseline benchmark, kernel trace with `--enforce-eager` and `torch_profiler_record_shapes: true` in `--profiler-config`, bottleneck extraction, per-shape kernel time analysis (`analyze_kernel_shapes.py`)
-4. **Phase 5**: Generate Problem files using actual shapes from `kernel_shape_analysis.json`
+3. **Phase 4**: Profile — baseline benchmark, kernel trace with `--enforce-eager` and `torch_profiler_record_shapes: true` in `--profiler-config`, TraceLens trace splitting & analysis (`analyze_kernels.py`), bottleneck extraction with roofline efficiency
+4. **Phase 5**: Generate Problem files using actual shapes from `analysis_summary.json` and TraceLens reports
 5. **Phase 6**: Optimize kernels with Triton
 6. **Phase 7**: Integrate via vLLM CustomOp and measure end-to-end serving speedup
 7. **Phase 8**: Generate final report with real measured data
@@ -58,8 +58,7 @@ Execute each phase completely before moving to the next:
 
 - `vllm serve` / `vllm bench serve`: Model serving and benchmarking
 - `torch.profiler` with `torch_profiler_record_shapes: true` (in `--profiler-config`): Performance profiling with shape data
-- `vllm_trace_extractor.py`: Extract kernel bottlenecks from traces
-- `analyze_kernel_shapes.py`: Per-shape kernel time breakdown (top 20 hottest shapes)
+- `analyze_kernels.py`: Trace validation, splitting & TraceLens analysis with roofline data
 - `analyze_fusion.py`: Detect fusion opportunities
 - `kernel_test_runner.py` / `kernel_finalize.py`: Test and finalize optimized kernels
 - `generate_vllm_plugin.py`: Create vLLM CustomOp plugin from optimized kernels

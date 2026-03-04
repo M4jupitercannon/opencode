@@ -19,7 +19,7 @@ agent: model-opt
 - **Docker mode** (preferred): If `env_info.json` has `env_type: "docker"`, search available docker images on dockerhub(rocm/vllm-dev:nightly preferred). prefix commands with `docker exec $CONTAINER_NAME bash -c "..."`. Set `HIP_VISIBLE_DEVICES=$BEST_GPU`.
 - **venv mode** (fallback): If `env_type: "venv"`, activate venv: `source <output_dir>/venv/bin/activate`
 - **ALL vLLM commands MUST redirect output to log files** (`&> logfile`) — NEVER dump vLLM logs into bash output
-- **ALL decisions MUST be data-driven** — read shapes from `kernel_shape_analysis.json`, not hardcoded
+- **ALL decisions MUST be data-driven** — read shapes from TraceLens `analysis_summary.json` / `unified_perf_summary.csv`, not hardcoded
 - **Optimized kernels MUST use @triton.jit** — torch rewrites are FORBIDDEN
 - **Integrate via vLLM CustomOp.register_oot()** — NEVER modify installed packages
 - **Serving benchmarks MUST use `vllm bench serve --save-result`**
@@ -399,7 +399,7 @@ for k in ['output_throughput','request_throughput','mean_tpot_ms','mean_ttft_ms'
 
 3. **`/start_profile` → send requests → `/stop_profile`** API sequence — vLLM does NOT profile from startup. You must explicitly start and stop profiling via the HTTP API. Without this sequence, no trace file is written at all.
 
-**If any of the three is missing, `analyze_kernel_shapes.py` WILL produce 0% attributed shapes. You MUST re-collect the trace — do NOT proceed with bad data.**
+**If any of the three is missing, `analyze_kernels.py` WILL produce 0% attributed shapes. You MUST re-collect the trace — do NOT proceed with bad data.**
 
 ### Docker path note
 When running inside Docker, the profiler writes to the **container-side path**. Use `/workspace/output/profile/traces` (not the host path) inside `--profiler-config`.
@@ -502,121 +502,337 @@ ls -lh <output_dir>/profile/traces/ 2>/dev/null | head -5
 
 **Do NOT skip this step.** If this verification fails, you MUST go back and re-collect the trace with the correct flags.
 
-All three analysis scripts (`analyze_kernel_shapes.py`, `vllm_trace_extractor.py`) accept a **directory** as `-i` input and will auto-select the worker trace (`*rank-0*`), rejecting `async_llm` frontend traces. They also validate the trace contents and exit non-zero if the trace is unsuitable.
+The `analyze_kernels.py` script accepts a **directory** as `-i` input and will auto-select the worker trace (`*rank-0*`), rejecting `async_llm` frontend traces. It validates the trace contents and exits non-zero if the trace is unsuitable.
 
 ```bash
-cp <output_dir>/scripts/analyze_kernel_shapes.py <output_dir>/profile/
-# Run with --top-n 0 for validation only (no output files needed yet)
-python3 <output_dir>/profile/analyze_kernel_shapes.py -i <output_dir>/profile/traces/ -o <output_dir>/profile --top-n 0 2>&1 | head -20
+cp <output_dir>/scripts/analyze_kernels.py <output_dir>/profile/
+# Run with --validate-only for validation (no TraceLens required)
+python3 <output_dir>/profile/analyze_kernels.py -i <output_dir>/profile/traces/ --validate-only 2>&1 | head -20
 
-# If the above exits non-zero, the trace is invalid for shape analysis.
+# If the above exits non-zero, the trace is invalid for analysis.
 # Check the output for the specific failure reason and re-collect with:
 #   1. --enforce-eager on vllm serve
 #   2. --profiler-config with torch_profiler_record_shapes: true AND ignore_frontend: true
 #   3. /start_profile API call BEFORE requests, /stop_profile AFTER
 ```
 
-## Step 3: Extract Kernel Bottlenecks from Trace
+## Step 3: Split Trace & Run TraceLens Performance Analysis
+
+This step uses TraceLens to:
+1. **Split** the trace into phase-specific sub-traces (prefill-decode, decode-only) using steady-state detection
+2. **Analyze** each phase trace with TraceLens standalone analysis (roofline model, op breakdown, GPU timeline)
+
+This replaces the old manual kernel extraction and correlation steps. TraceLens provides:
+- Accurate per-op performance models (GFLOPS, data movement, arithmetic intensity)
+- Roofline analysis (memory-bound vs compute-bound classification)
+- GPU timeline breakdown (busy/idle/communication)
+- Per-phase comparison (prefill vs decode have fundamentally different characteristics)
+
+### TraceLens availability
+
+The script auto-discovers TraceLens by searching common paths (`/TraceLens-internal`, `/TraceLens`, `~/TraceLens`, etc.)
+and the `TRACELENS_DIR` environment variable. **If TraceLens is not found, it is automatically cloned from GitHub:**
+
+```
+https://github.com/AMD-AGI/TraceLens.git
+```
+
+You can also provide the path explicitly via `--tracelens-dir`, or pre-install TraceLens:
+```bash
+# Option A: Clone into container (Docker mode)
+docker exec $CONTAINER_NAME git clone --depth 1 https://github.com/AMD-AGI/TraceLens.git /TraceLens
+
+# Option B: Copy a local checkout into container
+docker cp /path/to/TraceLens-internal $CONTAINER_NAME:/TraceLens-internal
+
+# Option C: Set environment variable
+export TRACELENS_DIR=/path/to/TraceLens
+```
+
+### Run the full analysis pipeline
 
 ```bash
 cd <output_dir>/profile
-cp <output_dir>/scripts/vllm_trace_extractor.py .
+cp <output_dir>/scripts/analyze_kernels.py .
 
-# The script auto-selects the worker trace (rank-0) from the directory,
-# rejecting async_llm frontend traces that have no GPU kernel data.
-python3 vllm_trace_extractor.py -i traces/ \
-  --full-csv kernel_full.csv \
-  --unique-csv kernel_unique.csv
+# Full analysis: validate → split trace → run TraceLens on each phase
+# TraceLens is auto-detected or auto-cloned if not found
+python3 analyze_kernels.py \
+  -i traces/ \
+  -o .
 ```
 
-## Step 4: Generate bottlenecks.json
+This produces:
+- `phase_traces/` — split trace files (combined steady-state, prefill-decode, decode-only)
+- `prefilldecode_report/` — TraceLens CSVs for prefill-decode phase
+- `decode_report/` — TraceLens CSVs for decode-only phase
+- `analysis_summary.json` — machine-readable summary of all phases
+
+Key output files per phase:
+- `unified_perf_summary.csv` — per-op roofline analysis (GFLOPS, TB/s, arithmetic intensity)
+- `ops_summary_by_category.csv` — time breakdown by op category (GEMM, Attention, Norm, etc.)
+- `ops_summary.csv` — time breakdown by individual op
+- `gpu_timeline.csv` — GPU utilization (busy/idle/communication split)
+- `kernel_summary.csv` — raw kernel-level statistics
+
+## Step 4: Generate bottlenecks.json from TraceLens Results
+
+Read TraceLens standalone analysis CSVs and generate the bottlenecks manifest for downstream phases.
+Uses `ops_summary.csv` for the op-level time breakdown and enriches each entry with roofline
+metrics from `unified_perf_summary.csv` (GFLOPS, TB/s, arithmetic intensity, bound type).
 
 ```bash
 cd <output_dir>/profile
 python3 -c "
-import csv, json
+import csv, json, os, glob, ast
 
-kernels = []
-with open('kernel_unique.csv') as f:
-    for row in csv.DictReader(f):
-        kernels.append({
-            'name': row['name'], 'count': int(row['count']),
-            'total_dur_us': float(row['total_dur']),
-            'avg_dur_us': float(row['avg_dur']),
-            'median_dur_us': float(row['median_dur']),
-        })
+# ══════════════════════════════════════════════════════════════════════════
+# Platform peak specs — used for roofline efficiency calculation.
+# These are MAX ACHIEVABLE (measured), not theoretical peak.
+# Source: TraceLens platform_specs.py / AMD ROCm benchmarks.
+# ══════════════════════════════════════════════════════════════════════════
+PLATFORM_PEAKS = {
+    'MI300X': {'mem_bw_tbps': 5.3, 'matrix_bf16_tflops': 708, 'matrix_fp16_tflops': 654, 'matrix_fp8_tflops': 1273},
+    'MI325X': {'mem_bw_tbps': 6.0, 'matrix_bf16_tflops': 843, 'matrix_fp16_tflops': 794, 'matrix_fp8_tflops': 1519},
+    'MI355X': {'mem_bw_tbps': 8.0, 'matrix_bf16_tflops': 1686, 'matrix_fp16_tflops': 1686, 'matrix_fp8_tflops': 3567},
+}
 
-total = sum(k['total_dur_us'] for k in kernels)
+# Auto-detect GPU or default to MI300X
+gpu_name = 'MI300X'
+try:
+    import subprocess
+    out = subprocess.check_output(['rocm-smi', '--showproductname'], text=True, timeout=5)
+    for name in PLATFORM_PEAKS:
+        if name in out:
+            gpu_name = name; break
+except Exception:
+    pass
+
+peak = PLATFORM_PEAKS[gpu_name]
+PEAK_MEM_BW_TBPS = peak['mem_bw_tbps']
+PEAK_BF16_TFLOPS = peak['matrix_bf16_tflops']
+RIDGE_POINT = PEAK_BF16_TFLOPS / PEAK_MEM_BW_TBPS  # FLOPS/Byte where memory→compute transition
+print(f'Platform: {gpu_name}  Peak BW: {PEAK_MEM_BW_TBPS} TB/s  Peak BF16: {PEAK_BF16_TFLOPS} TFLOPS  Ridge: {RIDGE_POINT:.1f} FLOPS/Byte')
+
+def roofline_eff(flops_byte, tflops_s, tb_s):
+    if flops_byte < RIDGE_POINT:
+        eff = (tb_s / PEAK_MEM_BW_TBPS) * 100 if PEAK_MEM_BW_TBPS else 0
+        return eff, 'memory'
+    else:
+        eff = (tflops_s / PEAK_BF16_TFLOPS) * 100 if PEAK_BF16_TFLOPS else 0
+        return eff, 'compute'
+
+# ══════════════════════════════════════════════════════════════════════════
+# Locate report directories
+# ══════════════════════════════════════════════════════════════════════════
+report_dirs = {}
+for d in sorted(glob.glob('*_report')):
+    if os.path.isdir(d) and os.path.isfile(os.path.join(d, 'ops_summary.csv')):
+        report_dirs[d.replace('_report', '')] = d
+
+phase_key = next((k for k in ('decode', 'prefilldecode', 'combined', 'full') if k in report_dirs), None)
+if not phase_key:
+    phase_key = list(report_dirs.keys())[0] if report_dirs else None
+if not phase_key:
+    print('ERROR: No TraceLens report directories found.'); exit(1)
+report_dir = report_dirs[phase_key]
+print(f'Using phase: {phase_key}  (report dir: {report_dir})')
+
+# ── 1. Read ops_summary.csv ──
+ops = []
+with open(os.path.join(report_dir, 'ops_summary.csv')) as f:
+    for row in csv.DictReader(f): ops.append(row)
+
+# ── 2. Read unified_perf_summary.csv (GEMM roofline data) ──
+unified = []
+unified_path = os.path.join(report_dir, 'unified_perf_summary.csv')
+if os.path.isfile(unified_path):
+    with open(unified_path) as f:
+        for row in csv.DictReader(f): unified.append(row)
+
+op_roofline = {}
+for row in unified:
+    name = row.get('name', '')
+    op_roofline.setdefault(name, [])
+    entry = {'input_dims': row.get('Input Dims', ''), 'count': int(float(row.get('operation_count', 0) or 0))}
+    for col in ('GFLOPS', 'Data Moved (MB)', 'FLOPS/Byte', 'TB/s_mean', 'TFLOPS/s_mean', 'Percentage (%)'):
+        val = row.get(col, '')
+        if val:
+            try: entry[col] = float(val)
+            except ValueError: pass
+    entry['compute_spec'] = row.get('Compute Spec', '')
+    entry['has_perf_model'] = row.get('has_perf_model', '').lower() == 'true'
+    op_roofline[name].append(entry)
+
+# ── 3. Read ops_unique_args.csv (Attention kernel breakdown) ──
+unique_args = []
+unique_path = os.path.join(report_dir, 'ops_unique_args.csv')
+if os.path.isfile(unique_path):
+    with open(unique_path) as f:
+        for row in csv.DictReader(f): unique_args.append(row)
+
+attn_shapes = [r for r in unique_args if r.get('op category', '') == 'SDPA_fwd']
+
+# ── 4. Build bottlenecks list ──
 bottlenecks = []
-for k in kernels[:30]:
-    pct = k['total_dur_us'] / total * 100 if total > 0 else 0
-    name = k['name']
-    optimizable = True
-    reason = ''
-    if 'Cijk_' in name or 'gemm' in name.lower() or 'hipblas' in name.lower():
-        reason = 'GEMM/rocBLAS'; optimizable = False
-    elif 'attn' in name.lower() or 'flash' in name.lower() or 'mha' in name.lower():
-        reason = 'Attention'; optimizable = True
-    elif 'norm' in name.lower() or 'rms' in name.lower():
-        reason = 'Normalization'; optimizable = True
-    elif 'elementwise' in name.lower() or 'vectorized' in name.lower():
-        reason = 'Elementwise'; optimizable = True
-    elif 'silu' in name.lower() or 'gelu' in name.lower():
-        reason = 'Activation'; optimizable = True
-    elif 'copy' in name.lower() or 'Cat' in name:
-        reason = 'Memory op'; optimizable = False
-    bottlenecks.append({**k, 'cuda_time_percent': pct, 'optimizable': optimizable, 'reason': reason})
+for row in ops:
+    name = row.get('name', '')
+    pct = float(row.get('Percentage (%)', 0))
+    total_ms = float(row.get('total_direct_kernel_time_ms', 0))
+    count = int(float(row.get('Count', 0)))
+    cats = row.get('Categories', '')
 
-print('Total GPU time: %.2fms, Top 10 kernels:' % (total/1000))
-for i, b in enumerate(bottlenecks[:10], 1):
-    print('  %d. %-45s %5.1f%%' % (i, b['name'][:45], b['cuda_time_percent']))
+    optimizable = True; reason = ''
+    if 'GEMM' in cats:       reason = 'GEMM/rocBLAS'; optimizable = False
+    elif 'SDPA' in cats or 'attention' in name.lower(): reason = 'Attention'; optimizable = True
+    elif 'norm' in name.lower() or 'rms' in name.lower(): reason = 'Normalization'; optimizable = True
+    elif 'silu' in name.lower() or 'gelu' in name.lower(): reason = 'Activation'; optimizable = True
+    elif 'copy' in name.lower() or 'memcpy' in name.lower(): reason = 'Memory op'; optimizable = False
+    elif 'elementwise' in cats: reason = 'Elementwise'; optimizable = True
+    else: reason = 'Other'
+
+    entry = {'name': name, 'count': count, 'total_dur_ms': total_ms, 'cuda_time_percent': pct,
+             'optimizable': optimizable, 'reason': reason, 'phase': phase_key, 'categories': cats}
+
+    shapes = op_roofline.get(name, [])
+    if shapes:
+        top_shapes = sorted(shapes, key=lambda s: s.get('Percentage (%)', 0), reverse=True)[:5]
+        entry['top_shapes'] = []
+        for s in top_shapes:
+            se = {'input_dims': s['input_dims'], 'count': s['count']}
+            for k, jk in [('GFLOPS','gflops'),('Data Moved (MB)','data_moved_mb'),('FLOPS/Byte','flops_per_byte'),
+                          ('TFLOPS/s_mean','tflops_per_s'),('TB/s_mean','tb_per_s'),('Percentage (%)','pct_of_total')]:
+                if k in s: se[jk] = s[k]
+            if s.get('compute_spec'): se['compute_spec'] = s['compute_spec']
+            if 'FLOPS/Byte' in s and 'TFLOPS/s_mean' in s and 'TB/s_mean' in s:
+                eff, bound = roofline_eff(s['FLOPS/Byte'], s['TFLOPS/s_mean'], s['TB/s_mean'])
+                se['roofline_efficiency_pct'] = round(eff, 2)
+                se['bound'] = bound
+            entry['top_shapes'].append(se)
+    bottlenecks.append(entry)
+
+# ══════════════════════════════════════════════════════════════════════════
+# 5. Print summary
+# ══════════════════════════════════════════════════════════════════════════
+total_ms = sum(b['total_dur_ms'] for b in bottlenecks)
+print(f'\nTotal GPU time ({phase_key}): {total_ms:.2f} ms')
+print(f'Top bottlenecks:')
+print(f'  {\"#\":>3s}  {\"Op\":45s} {\"Time%\":>6s} {\"Time(ms)\":>9s} {\"Count\":>6s}  Category')
+print(f'  {\"─\"*85}')
+for i, b in enumerate(bottlenecks[:15], 1):
+    flag = '🔒' if not b['optimizable'] else '  '
+    print(f'  {i:3d}. {flag}{b[\"name\"][:43]:<43s} {b[\"cuda_time_percent\"]:5.1f}% {b[\"total_dur_ms\"]:9.2f} {b[\"count\"]:6d}  {b[\"reason\"]}')
+    for s in b.get('top_shapes', [])[:2]:
+        tflops = f'{s[\"tflops_per_s\"]:.1f} TFLOPS/s' if 'tflops_per_s' in s else ''
+        tbps = f'{s[\"tb_per_s\"]:.2f} TB/s' if 'tb_per_s' in s else ''
+        print(f'       └─ {s[\"input_dims\"][:60]:60s} {s.get(\"pct_of_total\",0):5.1f}%  {tflops}  {tbps}')
+
+# ══════════════════════════════════════════════════════════════════════════
+# 6. GEMM Roofline Efficiency (per-shape)
+# ══════════════════════════════════════════════════════════════════════════
+gemm_shapes = []
+for row in unified:
+    if row.get('op category', '') != 'GEMM': continue
+    fb = row.get('FLOPS/Byte', ''); ts = row.get('TFLOPS/s_mean', ''); bs = row.get('TB/s_mean', '')
+    if not (fb and ts and bs): continue
+    fb, ts, bs = float(fb), float(ts), float(bs)
+    eff, bound = roofline_eff(fb, ts, bs)
+    gemm_shapes.append({
+        'dims': row.get('Input Dims',''), 'count': int(float(row.get('operation_count',0) or 0)),
+        'pct': float(row.get('Percentage (%)',0)), 'gflops': float(row.get('GFLOPS',0)),
+        'data_mb': float(row.get('Data Moved (MB)',0)), 'flops_byte': fb,
+        'tflops_s': ts, 'tb_s': bs, 'eff': eff, 'bound': bound,
+    })
+
+if gemm_shapes:
+    print(f'\n{\"═\"*110}')
+    print(f'  GEMM ROOFLINE EFFICIENCY ({phase_key} phase, {gpu_name})')
+    print(f'  Peak: {PEAK_BF16_TFLOPS} TFLOPS BF16 | {PEAK_MEM_BW_TBPS} TB/s | Ridge: {RIDGE_POINT:.1f} FLOPS/Byte')
+    print(f'{\"═\"*110}')
+    print(f'  {\"Input Dims\":45s} {\"Time%\":>6s} {\"GFLOPS\":>8s} {\"Data(MB)\":>9s} {\"FL/B\":>7s} {\"TFLOPS/s\":>9s} {\"TB/s\":>7s} {\"Bound\":>8s} {\"Eff%\":>6s}')
+    print(f'  {\"─\"*106}')
+    for s in sorted(gemm_shapes, key=lambda x: x['pct'], reverse=True):
+        dims_short = s['dims'].replace('((','(').replace('))',')')[:45]
+        bound_tag = 'MEM' if s['bound'] == 'memory' else 'COMP'
+        print(f'  {dims_short:45s} {s[\"pct\"]:5.1f}% {s[\"gflops\"]:8.1f} {s[\"data_mb\"]:9.1f} {s[\"flops_byte\"]:7.1f} {s[\"tflops_s\"]:9.2f} {s[\"tb_s\"]:7.3f} {bound_tag:>8s} {s[\"eff\"]:5.1f}%')
+
+# ══════════════════════════════════════════════════════════════════════════
+# 7. Attention Kernel Breakdown (per-shape from ops_unique_args.csv)
+# ══════════════════════════════════════════════════════════════════════════
+if attn_shapes:
+    print(f'\n{\"═\"*110}')
+    print(f'  ATTENTION (SDPA) KERNEL BREAKDOWN ({phase_key} phase)')
+    print(f'  Note: TraceLens does not compute GFLOPS/TB/s for SDPA — showing kernel time breakdown')
+    print(f'{\"═\"*110}')
+    print(f'  {\"Input Dims\":50s} {\"Time%\":>6s} {\"Count\":>6s} {\"Avg(us)\":>9s} {\"Sub-kernels\":40s}')
+    print(f'  {\"─\"*115}')
+    for row in attn_shapes:
+        dims = row.get('Input Dims','')[:50]
+        pct = float(row.get('Percentage (%)',0))
+        cnt = int(float(row.get('operation_count',0)))
+        avg = float(row.get('total_direct_kernel_time_mean',0))
+        # Parse kernel breakdown from trunc_kernel_details
+        kdetails = row.get('trunc_kernel_details', '')
+        sub_kernels = []
+        if kdetails:
+            try:
+                parts = ast.literal_eval(kdetails.replace('np.float64(','').replace(')',''))
+                for p in parts:
+                    kname = p.get('name','')[:30]
+                    kdur = p.get('mean_duration_us', 0)
+                    sub_kernels.append(f'{kname}={kdur:.1f}us')
+            except Exception:
+                sub_kernels = ['(parse error)']
+        sk_str = ', '.join(sub_kernels)[:40] if sub_kernels else ''
+        print(f'  {dims:50s} {pct:5.1f}% {cnt:6d} {avg:9.1f} {sk_str:40s}')
+    # Estimate attention mem BW utilization from raw kernel time + data size heuristic
+    for row in attn_shapes:
+        dims_str = row.get('Input Dims','')
+        try:
+            parsed = ast.literal_eval(dims_str)
+            if len(parsed) >= 4:
+                q_shape = parsed[0]; k_shape = parsed[1]; v_shape = parsed[2]
+                batch = q_shape[0]; heads = q_shape[1]; head_dim = q_shape[2]
+                kv_heads = k_shape[1]; seq_est = 1
+                data_bytes = 2 * (batch * heads * head_dim + 2 * batch * kv_heads * head_dim + batch * heads * head_dim)
+                data_mb = data_bytes / 1e6
+                avg_us = float(row.get('total_direct_kernel_time_mean',0))
+                if avg_us > 0:
+                    est_tb_s = (data_mb / 1e6) / (avg_us / 1e6)
+                    est_bw_eff = (est_tb_s / PEAK_MEM_BW_TBPS) * 100
+                    print(f'  Attention est. data/call: {data_mb:.3f} MB, est. BW: {est_tb_s:.3f} TB/s, est. BW eff: {est_bw_eff:.1f}% (Q/K/V only, excl. KV cache)')
+        except Exception:
+            pass
+
+print(f'\n{\"═\"*110}')
 
 with open('bottlenecks.json', 'w') as f:
     json.dump(bottlenecks, f, indent=2)
-print('Saved bottlenecks.json (%d kernels)' % len(bottlenecks))
+print(f'Saved bottlenecks.json ({len(bottlenecks)} entries from {phase_key} phase)')
+
+# Also save per-phase category summary for quick reference
+phase_summary = {}
+for label, rdir in report_dirs.items():
+    cat_path = os.path.join(rdir, 'ops_summary_by_category.csv')
+    if os.path.isfile(cat_path):
+        with open(cat_path) as f:
+            phase_summary[label] = list(csv.DictReader(f))
+with open('phase_category_summary.json', 'w') as f:
+    json.dump(phase_summary, f, indent=2)
+print(f'Saved phase_category_summary.json ({len(phase_summary)} phases)')
 "
 ```
 
-## Step 5: Per-Shape Kernel Time Analysis
+## ⚠️ CRITICAL: Use roofline data for optimization decisions
+The `unified_perf_summary.csv` in each phase report contains per-op roofline analysis with GFLOPS,
+TB/s, arithmetic intensity, and compute spec. Use this to determine whether each operator is
+**memory-bound** or **compute-bound**, and to prioritize optimization targets accordingly.
+- **Memory-bound ops** (low arithmetic intensity): optimize memory access patterns, fusion
+- **Compute-bound ops** (high arithmetic intensity): optimize compute throughput, tiling
+- **Prefill phase**: larger batch dimensions, more compute-bound
+- **Decode phase**: tiny batch dimensions (batch=1 per token), heavily memory-bound
 
-Analyze time proportion of **each shape** for each operator category.
-This correlates GPU kernel durations with CPU-side operator shapes from the trace.
-
-```bash
-cd <output_dir>/profile
-cp <output_dir>/scripts/analyze_kernel_shapes.py .
-
-# The script auto-selects the worker trace (rank-0) from the directory,
-# validates it has GPU kernels + CPU ops with shapes, and exits non-zero if not.
-python3 analyze_kernel_shapes.py -i traces/ -o .
-```
-
-This produces:
-- `kernel_shape_analysis.json` — structured per-category, per-shape breakdown
-- `kernel_shape_analysis.csv` — flat CSV for inspection
-
-Example output:
-```
-  GEMM — 94.1% of total (15488.61ms, 10 shapes, 100% attributed)
-  ──────────────────────────────────────────────────────────────────────────────────────
-    Shape                                               %Total  %InCat  Time(ms)  Count  Avg(us)
-    [4,4096]x[4096,24576]                                30.5%   32.4%  5023.08   9072    553.7
-    [2,4096]x[4096,24576]                                15.4%   16.4%  2533.19   4644    545.5
-    [4,12288]x[12288,4096]                               12.8%   13.6%  2112.64   9072    232.9
-    [4,4096]x[4096,6144]                                  7.0%    7.4%  1144.21   9072    126.1
-    ...
-
-  Attention — 2.4% of total (390.56ms, 4 shapes, 100% attributed)
-  ──────────────────────────────────────────────────────────────────────────────────────
-    Shape                                               %Total  %InCat  Time(ms)  Count  Avg(us)
-    [4,32,128]x[4,8,128]x[4,8,128]x[4,32,128]             1.5%   64.4%   251.52  27216      9.2
-    ...
-```
-## ⚠️ CRITICAL: The shape must be real, do not mind the dimension
-Use this data in Phase 5 to pick the right shapes for problem files and prioritize
-which (operator, shape) combinations to optimize first.
-
-## Step 6: Save model shapes
+## Step 5: Save model shapes
 
 ```bash
 source <output_dir>/venv/bin/activate
@@ -650,23 +866,31 @@ Update progress.json: phases_completed.append("profile")
 Convert bottleneck operators into Problem files for kernel-optimize.
 **IMPORTANT**: Analyze operators for fusion opportunities BEFORE creating individual problem files.
 
-## STEP 0: Review Per-Shape Kernel Analysis (from Phase 4)
+## STEP 0: Review TraceLens Analysis (from Phase 4)
 
-Before creating problem files, review `<output_dir>/profile/kernel_shape_analysis.json` to understand:
+Before creating problem files, review the TraceLens analysis results to understand:
 - Which **operator categories** dominate GPU time (GEMM, Attention, Norm, Activation, ...)
-- For each category, which **specific shapes** are the hottest
-- Use the top (category, shape) pairs to set **priorities** and pick **exact dimensions** for problem files
+- For each category, which **specific shapes** are the hottest (from `unified_perf_summary.csv`)
+- Whether each op is **memory-bound** or **compute-bound** (from roofline analysis)
+- The difference between **prefill** and **decode** phase characteristics
 
 ```bash
-cat <output_dir>/profile/kernel_shape_analysis.json | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-print(f'Total GPU time: {data[\"total_gpu_time_ms\"]:.2f}ms\n')
-for cat in data['categories'][:8]:
-    print(f'{cat[\"category\"]:12s} {cat[\"pct\"]:5.1f}%  ({cat[\"total_us\"]/1000:.2f}ms, {cat[\"num_shapes\"]} shapes)')
-    for s in cat['shapes'][:5]:
-        print(f'  {s[\"shape\"]:50s} {s[\"pct_of_total\"]:5.1f}% total, {s[\"count\"]:4d} calls, avg {s[\"avg_us\"]:.1f}us')
+# Review decode phase (dominant in serving workloads)
+python3 -c "
+import json
+with open('<output_dir>/profile/analysis_summary.json') as f:
+    summary = json.load(f)
+for phase_name, phase in summary['phases'].items():
+    print(f'\n=== {phase_name} ===')
+    for cat in phase.get('categories', []):
+        print(f'  {cat[\"category\"]:20s} {cat[\"percentage\"]:5.1f}%  ({cat[\"total_kernel_time_ms\"]:.2f}ms)')
+    print(f'  Top ops:')
+    for op in phase.get('top_ops', [])[:8]:
+        print(f'    {op[\"name\"]:45s} {op[\"percentage\"]:5.1f}%')
 "
+
+# Review roofline data for decode phase (shapes + memory/compute bound)
+head -20 <output_dir>/profile/decode_report/unified_perf_summary.csv
 ```
 
 ## STEP 1: Operator Fusion Analysis (CRITICAL)
@@ -696,8 +920,9 @@ cat fusion_opportunities.json
 
 **Create fused kernels BEFORE individual kernels!**
 
-Use ACTUAL shapes from `<output_dir>/profile/kernel_shape_analysis.json` (per-shape time breakdown)
-and `<output_dir>/profile/model_shapes.json`. Focus on the shapes with the highest `pct_of_total`.
+Use ACTUAL shapes from TraceLens `unified_perf_summary.csv` in each phase report directory
+(e.g. `<output_dir>/profile/decode_report/unified_perf_summary.csv`) and `<output_dir>/profile/model_shapes.json`.
+Focus on the ops with the highest `Percentage (%)` and use roofline data to decide optimization strategy.
 
 ### Example: Fused Residual + RMSNorm
 ```python
@@ -1176,14 +1401,20 @@ Create a comprehensive optimization report.
 |----------|-------------------|------------|-----------|---------|
 | ...      | ...               | ...        | ...       | ...     |
 
-## Per-Shape Kernel Time Analysis
-Include the top hottest (operator, shape) combinations from `kernel_shape_analysis.json`.
-This data was collected with `--enforce-eager` and `torch_profiler_record_shapes: true` in `--profiler-config`.
+## TraceLens Roofline Analysis (Decode Phase)
+Include the top ops from `decode_report/unified_perf_summary.csv` with roofline metrics.
+This data was collected with `--enforce-eager` and `torch_profiler_record_shapes: true`.
 
-| Category | Shape | % of GPU Time | Time (ms) | Count |
-|----------|-------|--------------|-----------|-------|
-| GEMM     | [4,4096]x[4096,24576] | 30.5% | 5023.1 | 9072 |
-| ...      | ...   | ...          | ...       | ...   |
+| Op | Input Dims | % GPU Time | TFLOPS/s | TB/s | FLOPS/Byte | Bound |
+|----|-----------|-----------|---------|------|-----------|-------|
+| aten::mm | (16,4096)x(4096,24576) | 48.2% | 5.5 | 0.34 | 15.9 | Memory |
+| ...      | ...   | ...       | ...     | ...  | ...       | ...   |
+
+## TraceLens Roofline Analysis (Prefill-Decode Phase)
+| Op | Input Dims | % GPU Time | TFLOPS/s | TB/s | FLOPS/Byte | Bound |
+|----|-----------|-----------|---------|------|-----------|-------|
+| aten::mm | (2048,4096)x(4096,24576) | 38.2% | 120.9 | 0.09 | 1293.5 | Compute |
+| ...      | ...   | ...       | ...     | ...  | ...       | ...   |
 
 ## Performance Results (ACTUAL MEASURED)
 | Metric | Original | Optimized | Speedup |
@@ -1207,8 +1438,10 @@ Outputs generated with fixed random seed for verification.
 
 ## Files Generated
 - profile/bottlenecks.json - Kernel bottleneck ranking
-- profile/kernel_shape_analysis.json - Per-shape kernel time breakdown
-- profile/kernel_shape_analysis.csv - Shape analysis (flat CSV)
+- profile/analysis_summary.json - TraceLens analysis summary (all phases)
+- profile/phase_traces/ - Split trace files (steady-state, prefill-decode, decode-only)
+- profile/prefilldecode_report/ - TraceLens CSVs for prefill-decode phase
+- profile/decode_report/ - TraceLens CSVs for decode-only phase
 - problems/ - Problem files + optimized kernels
 - optimized/vllm_plugin/ - vLLM CustomOp integration plugin
 - report/baseline_serving.json - Baseline benchmark results
