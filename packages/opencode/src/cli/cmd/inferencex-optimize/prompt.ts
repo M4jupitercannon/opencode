@@ -4,7 +4,7 @@
  * Reads pure markdown skill files (.md) and substitutes {{VAR}} placeholders.
  * All skill logic lives in .md files -- this file is minimal TS glue.
  */
-import type { InferenceXConfig } from "./types"
+import type { InferenceXConfig, PipelineMode } from "./types"
 import { PHASE_ORDER } from "./types"
 
 // @ts-ignore - Bun text import
@@ -41,11 +41,19 @@ const SKILL_FILES = [
   "05-report.md",
 ]
 
-function computeSkipLabels(startPhase: string): Record<string, string> {
+const MODE_PHASES: Record<PipelineMode, readonly string[]> = {
+  full: ["env", "config", "benchmark", "analyze", "report"],
+  benchmark: ["env", "config", "benchmark"],
+  profile: ["env", "config", "profile"],
+  "benchmark+profile": ["env", "config", "benchmark", "profile"],
+}
+
+function computeSkipLabels(startPhase: string, mode: PipelineMode): Record<string, string> {
   const phaseIndex: Record<string, number> = {}
   PHASE_ORDER.forEach((p, i) => (phaseIndex[p] = i))
 
   const startIdx = phaseIndex[startPhase] ?? 0
+  const activePhases = MODE_PHASES[mode]
   const filePhaseMap: Record<string, string> = {
     "00": "env",
     "01": "config",
@@ -58,7 +66,13 @@ function computeSkipLabels(startPhase: string): Record<string, string> {
   const labels: Record<string, string> = {}
   for (const [idx, phase] of Object.entries(filePhaseMap)) {
     const pIdx = phaseIndex[phase] ?? 0
-    labels[idx] = pIdx < startIdx ? "[SKIP - ALREADY DONE]" : ""
+    if (!activePhases.includes(phase)) {
+      labels[idx] = "[SKIP - NOT IN SELECTED MODE]"
+    } else if (pIdx < startIdx) {
+      labels[idx] = "[SKIP - ALREADY DONE]"
+    } else {
+      labels[idx] = ""
+    }
   }
   return labels
 }
@@ -86,15 +100,18 @@ export function buildAgentPrompt(config: InferenceXConfig): string {
     repoUrl,
     repoDir,
     hfCache,
+    filterTp,
     filterConc,
     filterSeq,
     dryRun,
     profile,
+    mode,
     startPhase,
     existingProgress,
   } = config
 
-  const skipLabels = computeSkipLabels(startPhase)
+  const skipLabels = computeSkipLabels(startPhase, mode)
+  const activePhases = MODE_PHASES[mode]
 
   const vars: Record<string, string> = {
     CONFIG_KEY: configKey,
@@ -105,6 +122,7 @@ export function buildAgentPrompt(config: InferenceXConfig): string {
     RESULTS_DIR: dirs.results,
     PROFILE_DIR: dirs.profiles,
     REPORT_DIR: dirs.report,
+    FILTER_TP: filterTp,
     FILTER_CONC: filterConc,
     FILTER_SEQ: filterSeq,
     DRY_RUN: String(dryRun),
@@ -112,7 +130,7 @@ export function buildAgentPrompt(config: InferenceXConfig): string {
     DRY_RUN_NOTE: dryRun
       ? "**DRY RUN MODE**: Only print Docker commands, do not execute them."
       : "",
-    PROFILE_SKIP_NOTE: profile
+    PROFILE_SKIP_NOTE: activePhases.includes("profile")
       ? ""
       : "**NOTE**: Profiling was not requested. Skip this phase entirely.",
     PROGRESS_FILE: outputDir + "/progress.json",
@@ -123,15 +141,30 @@ export function buildAgentPrompt(config: InferenceXConfig): string {
     vars["SKIP_LABEL_" + idx] = label
   }
 
-  const phasePrompts = SKILL_FILES.map((file) => {
+  const filePhaseMap: Record<string, string> = {
+    "00": "env",
+    "01": "config",
+    "02": "benchmark",
+    "03": "profile",
+    "04": "analyze",
+    "05": "report",
+  }
+
+  const filteredSkillFiles = SKILL_FILES.filter((file) => {
+    const idx = file.slice(0, 2)
+    const phase = filePhaseMap[idx]
+    return phase ? activePhases.includes(phase) : true
+  })
+
+  const phasePrompts = filteredSkillFiles.map((file) => {
     const template = readSkill(file)
     const idx = file.slice(0, 2)
     const phaseVars = { ...vars, SKIP_LABEL: skipLabels[idx] || "" }
     return substitute(template, phaseVars)
   })
 
-  const header = buildHeader(vars, startPhase, existingProgress)
-  const footer = buildExecutionInstructions(vars, startPhase)
+  const header = buildHeader(vars, startPhase, existingProgress, mode)
+  const footer = buildExecutionInstructions(vars, startPhase, mode)
 
   return [header, ...phasePrompts, footer].join("\n\n---\n\n")
 }
@@ -140,6 +173,7 @@ function buildHeader(
   vars: Record<string, string>,
   startPhase: string,
   existingProgress: any,
+  mode: PipelineMode,
 ): string {
   let resumeContext = ""
   if (startPhase !== "env") {
@@ -155,10 +189,17 @@ function buildHeader(
       "Review existing files before proceeding to understand current state.\n\n---\n"
   }
 
+  const activePhases = MODE_PHASES[mode]
+  const modeLabel = mode === "full" ? "Full Pipeline" :
+    mode === "benchmark" ? "Benchmark Only" :
+    mode === "profile" ? "Profile Only" :
+    "Benchmark + Profile"
+
   return "# InferenceX Benchmark & Profiling Pipeline\n\n" +
     "## Target Configuration\n" +
     "- **Config Key**: " + vars.CONFIG_KEY + "\n" +
     "- **InferenceX Repo**: " + vars.REPO_DIR + "\n" +
+    "- **Mode**: " + modeLabel + " (" + activePhases.join(" → ") + ")\n" +
     resumeContext +
     "\n## Output Directory Structure\n" +
     "```\n" +
@@ -171,33 +212,43 @@ function buildHeader(
     "  progress.json   # Progress tracking\n" +
     "```\n\n" +
     "## Key Parameters\n" +
+    "- **Mode**: " + modeLabel + "\n" +
+    "- **Filter TP**: " + (vars.FILTER_TP || "all") + "\n" +
     "- **Filter Concurrency**: " + (vars.FILTER_CONC || "all") + "\n" +
     "- **Filter Sequence Length**: " + (vars.FILTER_SEQ || "all") + "\n" +
-    "- **Dry Run**: " + vars.DRY_RUN + "\n" +
-    "- **Profiling**: " + vars.PROFILE + "\n\n" +
+    "- **Dry Run**: " + vars.DRY_RUN + "\n\n" +
     "## IMPORTANT FILES\n" +
     "- **Config**: " + vars.OUTPUT_DIR + "/config.json\n" +
     "- **Progress**: " + vars.PROGRESS_FILE + "\n\n" +
     "Update progress.json after completing each phase!\n\n" +
-    '## YOUR TASK: Complete phases starting from "' + startPhase + '"'
+    "## YOUR TASK: Run " + modeLabel + " — phases: " + activePhases.join(", ")
 }
 
 function buildExecutionInstructions(
   vars: Record<string, string>,
   startPhase: string,
+  mode: PipelineMode,
 ): string {
+  const activePhases = MODE_PHASES[mode]
+  const modeLabel = mode === "full" ? "Full Pipeline" :
+    mode === "benchmark" ? "Benchmark Only" :
+    mode === "profile" ? "Profile Only" :
+    "Benchmark + Profile"
+
   let modeInstructions: string
   if (startPhase === "env") {
     modeInstructions =
-      "\n## Fresh Start Mode\n" +
-      "1. **Execute phases in order**: 0, 1, 2, 3, 4, 5\n" +
-      "2. Begin with Phase 0: Environment Setup\n"
+      "\n## " + modeLabel + " Mode\n" +
+      "1. **Execute these phases in order**: " + activePhases.join(" → ") + "\n" +
+      "2. **ONLY run the phases listed above** — skip all other phases\n" +
+      "3. Begin with Phase 0: Environment Setup\n"
   } else {
     modeInstructions =
-      '\n## Resume Mode Active - Starting from "' + startPhase + '"\n' +
+      '\n## ' + modeLabel + ' Mode — Starting from "' + startPhase + '"\n' +
       '1. **Skip phases before "' + startPhase + '"** - their artifacts already exist\n' +
-      "2. **Review existing files first** to understand current state\n" +
-      "3. **Continue from Phase: " + startPhase + "**\n\n" +
+      "2. **ONLY run these phases**: " + activePhases.join(" → ") + "\n" +
+      "3. **Review existing files first** to understand current state\n" +
+      "4. **Continue from Phase: " + startPhase + "**\n\n" +
       "### Quick Start Checklist\n" +
       "- [ ] Read existing progress.json\n" +
       "- [ ] Verify artifacts from previous phases exist\n" +

@@ -10,6 +10,9 @@ export interface InferenceXDirs {
   report: string
 }
 
+/** Pipeline execution mode */
+export type PipelineMode = "full" | "benchmark" | "profile" | "benchmark+profile"
+
 /** Full configuration for the InferenceX optimization pipeline */
 export interface InferenceXConfig {
   /** Config key from the master YAML (e.g., "kimik2.5-int4-mi355x-vllm") */
@@ -24,6 +27,8 @@ export interface InferenceXConfig {
   repoDir: string
   /** HuggingFace cache directory */
   hfCache: string
+  /** Filter to a specific tensor parallelism level from config search-space */
+  filterTp: string
   /** Filter to a specific concurrency level */
   filterConc: string
   /** Filter to a specific sequence length (e.g., "1k1k", "1k8k", "8k1k") */
@@ -32,6 +37,8 @@ export interface InferenceXConfig {
   dryRun: boolean
   /** Whether to run profiling */
   profile: boolean
+  /** Pipeline execution mode: which phases to run */
+  mode: PipelineMode
   /** Which phase to start from */
   startPhase: string
   /** Existing progress data when resuming */

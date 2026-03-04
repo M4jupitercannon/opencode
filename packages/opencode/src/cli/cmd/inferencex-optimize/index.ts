@@ -16,7 +16,7 @@ import { UI } from "../../ui"
 import { Provider } from "../../../provider/provider"
 import { select } from "@clack/prompts"
 
-import type { InferenceXConfig, InferenceXDirs } from "./types"
+import type { InferenceXConfig, InferenceXDirs, PipelineMode } from "./types"
 import { PHASE_ORDER } from "./types"
 import { buildAgentPrompt, buildAgentConfig } from "./prompt"
 
@@ -75,6 +75,10 @@ export const InferenceXOptimizeCommand = cmd({
         type: "string",
         describe: "HuggingFace cache directory (default: $HF_HUB_CACHE or ~/.cache/huggingface)",
       })
+      .option("tp", {
+        type: "number",
+        describe: "filter to specific tensor parallelism level from config search-space (e.g., 1, 4, 8)",
+      })
       .option("conc", {
         type: "string",
         describe: "filter to specific concurrency level",
@@ -88,9 +92,14 @@ export const InferenceXOptimizeCommand = cmd({
         describe: "preview Docker commands without running them",
         default: false,
       })
+      .option("benchmark", {
+        type: "boolean",
+        describe: "run only benchmark (env + config + benchmark)",
+        default: false,
+      })
       .option("profile", {
         type: "boolean",
-        describe: "enable profiling (trace saved to profiles/)",
+        describe: "run only profiling (env + config + profile)",
         default: false,
       })
       .option("resume", {
@@ -120,8 +129,19 @@ export const InferenceXOptimizeCommand = cmd({
     const configKey = args["config-key"] as string
     const configKeySafe = configKey.replace(/[^a-zA-Z0-9_-]/g, "_")
 
+    const now = new Date()
+    const timestamp = [
+      now.getFullYear(),
+      String(now.getMonth() + 1).padStart(2, "0"),
+      String(now.getDate()).padStart(2, "0"),
+      "_",
+      String(now.getHours()).padStart(2, "0"),
+      String(now.getMinutes()).padStart(2, "0"),
+      String(now.getSeconds()).padStart(2, "0"),
+    ].join("")
+
     const outputDir =
-      (args.output as string) || path.resolve(`./inferencex_${configKeySafe}`)
+      (args.output as string) || path.resolve(`./inferencex_${configKeySafe}_${timestamp}`)
 
     const hfCache =
       (args["hf-cache"] as string) ||
@@ -137,8 +157,16 @@ export const InferenceXOptimizeCommand = cmd({
     UI.println(`Output Directory:  ${outputDir}`)
     UI.println(`Repo Directory:    ${repoDir}`)
     UI.println(`HF Cache:          ${hfCache}`)
+    const benchmarkOnly = args.benchmark as boolean
+    const profileOnly = args.profile as boolean
+    let mode: PipelineMode = "full"
+    if (benchmarkOnly && profileOnly) mode = "benchmark+profile"
+    else if (benchmarkOnly) mode = "benchmark"
+    else if (profileOnly) mode = "profile"
+
     UI.println(`Dry Run:           ${args["dry-run"]}`)
-    UI.println(`Profiling:         ${args.profile}`)
+    UI.println(`Mode:              ${mode}`)
+    if (args.tp != null) UI.println(`Filter TP:         ${args.tp}`)
     if (args.conc) UI.println(`Filter Conc:       ${args.conc}`)
     if (args["seq-len"]) UI.println(`Filter Seq Len:    ${args["seq-len"]}`)
     if (llmArg) UI.println(`LLM Model:         ${llmArg}`)
@@ -203,7 +231,8 @@ export const InferenceXOptimizeCommand = cmd({
       start_phase: startPhase,
       resume_mode: resumeMode || !!fromPhase,
       dry_run: args["dry-run"],
-      profile: args.profile,
+      mode,
+      filter_tp: args.tp != null ? String(args.tp) : "",
       filter_conc: args.conc || "",
       filter_seq: args["seq-len"] || "",
       repo_url: args["repo-url"],
@@ -235,10 +264,12 @@ export const InferenceXOptimizeCommand = cmd({
       repoUrl: args["repo-url"] as string,
       repoDir,
       hfCache,
+      filterTp: args.tp != null ? String(args.tp) : "",
       filterConc: (args.conc as string) || "",
       filterSeq: (args["seq-len"] as string) || "",
       dryRun: args["dry-run"] as boolean,
-      profile: args.profile as boolean,
+      profile: mode === "profile" || mode === "benchmark+profile",
+      mode,
       startPhase,
       existingProgress,
     }

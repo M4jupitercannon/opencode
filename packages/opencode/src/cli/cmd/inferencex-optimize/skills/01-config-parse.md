@@ -17,25 +17,28 @@ echo "Config file: $CONFIG_FILE"
 ```
 
 ### 2. Generate Sweep Configs
-Use the InferenceX matrix generation script to produce the full benchmark matrix:
+Use the InferenceX matrix generation script to produce the full benchmark matrix.
+**Do NOT print the raw sweep output** — it is very large and noisy. Capture it silently:
 ```bash
 cd "{{REPO_DIR}}"
 python3 utils/matrix_logic/generate_sweep_configs.py \
-    test-config --config-files "$CONFIG_FILE" --config-keys "{{CONFIG_KEY}}"
+    test-config --config-files "$CONFIG_FILE" --config-keys "{{CONFIG_KEY}}" > /tmp/sweep_raw.json 2>&1
 ```
 
 ### 3. Apply Filters and Save
-Apply filters to the generated configs **before** saving. Only save configs that pass all active filters.
+Apply filters to the generated configs **before** saving. Only save and print configs that pass all active filters.
 
 Sequence length mapping (for `{{FILTER_SEQ}}`):
 - `1k1k` → ISL=1024, OSL=1024
 - `1k8k` → ISL=1024, OSL=8192
 - `8k1k` → ISL=8192, OSL=1024
 
+If `{{FILTER_TP}}` is set, keep only configs whose TP (tensor parallelism) matches.
 If `{{FILTER_SEQ}}` is set, keep only configs whose ISL and OSL match the specified sequence length.
 If `{{FILTER_CONC}}` is set, keep only configs whose concurrency matches.
 
 Save the **filtered** result (or full result if no filters are active) to `{{OUTPUT_DIR}}/results/sweep_configs.json`.
+Only print the filtered configs — never print the full unfiltered sweep output.
 
 ### 4. Resolve Benchmark Script
 For each filtered config, determine which benchmark script will be used. Substitute the actual values of EXP_NAME, PRECISION, RUNNER, and FRAMEWORK from the config into the path pattern:

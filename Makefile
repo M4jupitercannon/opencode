@@ -2,13 +2,21 @@
 
 # One-line install after cloning: make install
 install: build
-	@echo "Installing opencode to /usr/local/bin..."
-	@sudo cp packages/opencode/dist/opencode-linux-x64/bin/opencode /usr/local/bin/ 2>/dev/null || \
-		cp packages/opencode/dist/opencode-linux-x64/bin/opencode /usr/local/bin/
+	@mkdir -p $(HOME)/bin
+	@echo "Installing opencode to $(HOME)/bin..."
+	@cp packages/opencode/dist/opencode-linux-x64/bin/opencode $(HOME)/bin/
 	@echo ""
-	@echo "✓ OpenCode installed successfully!"
+	@echo "✓ OpenCode installed successfully to $(HOME)/bin/opencode!"
 	@echo ""
-	@echo "Usage:"
+	@if echo "$$PATH" | grep -q "$(HOME)/bin"; then \
+		echo "Usage:"; \
+	else \
+		echo "Add $(HOME)/bin to your PATH:"; \
+		echo "  export PATH=\"\$$HOME/bin:\$$PATH\""; \
+		echo "  # (add the above to ~/.bashrc to make it permanent)"; \
+		echo ""; \
+		echo "Usage:"; \
+	fi
 	@echo "  # With free model (no API key needed)"
 	@echo "  opencode kernel-optimize --src source.py -m opencode/glm-4.7-free"
 	@echo ""

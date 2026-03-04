@@ -29,7 +29,17 @@ Create `{{REPORT_DIR}}/benchmark_report.md` with:
 ## Benchmark Results
 
 ### Throughput Summary
-| Concurrency | ISL×OSL | Throughput (tok/s) | TTFT (ms) | ITL (ms) |
+| Metric | Value |
+|--------|-------|
+| Request Throughput | <req/s> |
+| Input Token Throughput | <tok/s> |
+| Output Token Throughput | <tok/s> |
+| Total Token Throughput | <tok/s> |
+
+Note: If the raw benchmark data does not include `input_throughput`, compute it as `total_token_throughput - output_token_throughput`.
+
+### Latency Summary
+| Concurrency | ISL×OSL | TTFT Mean (ms) | ITL Mean (ms) | E2EL Mean (ms) |
 |---|---|---|---|---|
 | ... | ... | ... | ... | ... |
 

@@ -11,7 +11,10 @@ Look for JSON result files matching the experiment naming pattern.
 
 ### 2. Parse Benchmark Metrics
 For each result file, extract key metrics:
-- **Throughput** (tokens/second)
+- **Request Throughput** (requests/second)
+- **Input Token Throughput** (tokens/second) — if not in raw data, compute as `total_token_throughput - output_token_throughput` or `total_input_tokens / duration_s`
+- **Output Token Throughput** (tokens/second)
+- **Total Token Throughput** (tokens/second)
 - **Time to First Token (TTFT)**
 - **Inter-Token Latency (ITL)**
 - **Total latency**

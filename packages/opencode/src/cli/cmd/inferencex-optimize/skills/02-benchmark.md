@@ -1,14 +1,15 @@
 # Phase 2: Benchmark Execution {{SKIP_LABEL}}
 
 ## Objective
-Run benchmarks for each config point using Docker containers.
+Run benchmarks for each config point using a **single persistent Docker container**.
+All benchmark configs are executed inside one container via `docker exec`, avoiding repeated container startup/teardown and reducing overhead.
 
 ## Steps
 
 ### 1. Load Configs
 Read configs from `{{OUTPUT_DIR}}/results/sweep_configs.json` (filters were already applied during Phase 1).
 
-### 2. For Each Config Point, Run Docker Benchmark
+### 2. Extract Config Fields
 For each config entry, extract these fields:
 - `image`: Docker image to use
 - `model`: HuggingFace model name
@@ -34,7 +35,11 @@ fi
 ```
 IMPORTANT: When printing the script path, always print the fully expanded path with actual values (e.g. `benchmarks/single_node/kimik2.5_int4_mi355x.sh`), NOT the shell variable template.
 
-### 4. Build Docker Command
+### 4. Group Configs by Docker Image
+Group all configs by their `image` field. Configs sharing the same Docker image will run in the same container.
+Typically all configs for a given config-key use the same image, so there will be a single group.
+
+### 5. Start One Persistent Container Per Image Group
 Detect GPU vendor and set appropriate flags:
 ```bash
 # For AMD GPUs (runner starts with "mi")
@@ -44,15 +49,14 @@ GPU_FLAGS="--device=/dev/kfd --device=/dev/dri --group-add video --security-opt 
 GPU_FLAGS="--gpus all"
 ```
 
-Start the Docker container in **detached mode** (`-d`) so the command returns immediately:
+Start **one** container per image group in detached mode with `sleep infinity` to keep it alive:
 ```bash
-RESULT_FILENAME="${EXP_NAME}_${PRECISION}_${FRAMEWORK}_tp${TP}-ep${EP}_conc${CONC}"
-CONTAINER_NAME="inferencex-${RESULT_FILENAME}"
+CONTAINER_NAME="inferencex-benchmark-{{CONFIG_KEY}}"
 
 docker run -d \
     --name "$CONTAINER_NAME" \
-    --entrypoint /bin/bash \
     --label inferencex-pipeline=true \
+    --entrypoint /bin/bash \
     $GPU_FLAGS \
     --shm-size 64g \
     --ipc=host \
@@ -60,6 +64,21 @@ docker run -d \
     -v {{REPO_DIR}}:/workspace \
     -v {{HF_CACHE}}:/root/.cache/huggingface \
     -w /workspace \
+    -e HF_HOME=/root/.cache/huggingface \
+    -e HF_HUB_CACHE=/root/.cache/huggingface/hub \
+    $IMAGE \
+    -c "sleep infinity"
+```
+
+{{DRY_RUN_NOTE}}
+
+### 6. Run Each Benchmark via `docker exec`
+For each config in the group, run the benchmark script inside the already-running container using `docker exec`.
+Pass per-benchmark environment variables via `-e` flags:
+```bash
+RESULT_FILENAME="${EXP_NAME}_${PRECISION}_${FRAMEWORK}_tp${TP}-ep${EP}_conc${CONC}"
+
+docker exec \
     -e MODEL=$MODEL \
     -e TP=$TP \
     -e EP_SIZE=$EP \
@@ -72,32 +91,28 @@ docker run -d \
     -e PRECISION=$PRECISION \
     -e FRAMEWORK=$FRAMEWORK \
     -e EXP_NAME=$EXP_NAME \
-    -e HF_HOME=/root/.cache/huggingface \
-    -e HF_HUB_CACHE=/root/.cache/huggingface/hub \
-    $IMAGE \
-    $BENCHMARK_SCRIPT
+    "$CONTAINER_NAME" \
+    /bin/bash /workspace/$BENCHMARK_SCRIPT \
+    > "{{OUTPUT_DIR}}/results/${RESULT_FILENAME}_docker.log" 2>&1
 ```
 
-{{DRY_RUN_NOTE}}
-
-### 5. Stream Container Logs
-Follow container output in real time so the user can see progress, and save to a log file:
+Check the exit code of `docker exec` (it returns the exit code of the executed command):
 ```bash
-docker logs -f "$CONTAINER_NAME" 2>&1 | tee "{{OUTPUT_DIR}}/results/${RESULT_FILENAME}_docker.log"
+EXEC_EXIT_CODE=$?
+echo "Benchmark exit code: $EXEC_EXIT_CODE"
 ```
 
-### 6. Check Exit Code and Clean Up
-After the container exits, check the exit code and remove the container:
+Do NOT print or display the contents of the docker log file. The log is saved for debugging purposes only.
+
+After each benchmark run, copy result files from the repo directory to `{{OUTPUT_DIR}}/results/`.
+Log the result filename and status, then proceed to the next config.
+
+### 7. Clean Up Container
+After **all** benchmarks in the group are complete, stop and remove the container:
 ```bash
-EXIT_CODE=$(docker inspect --format='{{`{{.State.ExitCode}}`}}' "$CONTAINER_NAME")
-echo "Container exit code: $EXIT_CODE"
+docker stop "$CONTAINER_NAME"
 docker rm "$CONTAINER_NAME"
 ```
-Print the log file path so the user knows where to find the full output.
-
-### 7. Collect Results
-After each run, copy result files from the repo directory to `{{OUTPUT_DIR}}/results/`.
-Log the result filename and status.
 
 ## Completion
 Update progress.json:
