@@ -9,7 +9,7 @@ Re-run selected benchmarks with profiling enabled to capture detailed performanc
 
 ### 1. Select Profiling Configs
 Choose a representative subset of configs to profile (typically one concurrency level, one sequence length).
-If `{{FILTER_TP}}`, `{{FILTER_CONC}}`, and `{{FILTER_SEQ}}` are set, use those. Otherwise, pick a low-concurrency config (e.g., conc=4) with the default sequence length.
+If `{{FILTER_TP}}`, `{{FILTER_CONC_START}}`/`{{FILTER_CONC_END}}`, and `{{FILTER_SEQ}}` are set, use those to narrow configs. Otherwise, pick a low-concurrency config (e.g., conc=4) with the default sequence length.
 
 ### 2. Create Profiles Directory
 ```bash

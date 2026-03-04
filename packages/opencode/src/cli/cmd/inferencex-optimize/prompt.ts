@@ -101,7 +101,8 @@ export function buildAgentPrompt(config: InferenceXConfig): string {
     repoDir,
     hfCache,
     filterTp,
-    filterConc,
+    filterConcStart,
+    filterConcEnd,
     filterSeq,
     dryRun,
     profile,
@@ -123,7 +124,8 @@ export function buildAgentPrompt(config: InferenceXConfig): string {
     PROFILE_DIR: dirs.profiles,
     REPORT_DIR: dirs.report,
     FILTER_TP: filterTp,
-    FILTER_CONC: filterConc,
+    FILTER_CONC_START: filterConcStart,
+    FILTER_CONC_END: filterConcEnd,
     FILTER_SEQ: filterSeq,
     DRY_RUN: String(dryRun),
     PROFILE: String(profile),
@@ -214,7 +216,7 @@ function buildHeader(
     "## Key Parameters\n" +
     "- **Mode**: " + modeLabel + "\n" +
     "- **Filter TP**: " + (vars.FILTER_TP || "all") + "\n" +
-    "- **Filter Concurrency**: " + (vars.FILTER_CONC || "all") + "\n" +
+    "- **Filter Concurrency**: " + (vars.FILTER_CONC_START || vars.FILTER_CONC_END ? (vars.FILTER_CONC_START || "1") + " – " + (vars.FILTER_CONC_END || "∞") : "all") + "\n" +
     "- **Filter Sequence Length**: " + (vars.FILTER_SEQ || "all") + "\n" +
     "- **Dry Run**: " + vars.DRY_RUN + "\n\n" +
     "## IMPORTANT FILES\n" +

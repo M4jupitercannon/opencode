@@ -79,9 +79,13 @@ export const InferenceXOptimizeCommand = cmd({
         type: "number",
         describe: "filter to specific tensor parallelism level from config search-space (e.g., 1, 4, 8)",
       })
-      .option("conc", {
-        type: "string",
-        describe: "filter to specific concurrency level",
+      .option("conc-start", {
+        type: "number",
+        describe: "filter to concurrency levels >= this value",
+      })
+      .option("conc-end", {
+        type: "number",
+        describe: "filter to concurrency levels <= this value",
       })
       .option("seq-len", {
         type: "string",
@@ -167,7 +171,11 @@ export const InferenceXOptimizeCommand = cmd({
     UI.println(`Dry Run:           ${args["dry-run"]}`)
     UI.println(`Mode:              ${mode}`)
     if (args.tp != null) UI.println(`Filter TP:         ${args.tp}`)
-    if (args.conc) UI.println(`Filter Conc:       ${args.conc}`)
+    if (args["conc-start"] != null || args["conc-end"] != null) {
+      const start = args["conc-start"] != null ? String(args["conc-start"]) : "1"
+      const end = args["conc-end"] != null ? String(args["conc-end"]) : "∞"
+      UI.println(`Filter Conc:       ${start} – ${end}`)
+    }
     if (args["seq-len"]) UI.println(`Filter Seq Len:    ${args["seq-len"]}`)
     if (llmArg) UI.println(`LLM Model:         ${llmArg}`)
     UI.println("============================================")
@@ -233,7 +241,8 @@ export const InferenceXOptimizeCommand = cmd({
       dry_run: args["dry-run"],
       mode,
       filter_tp: args.tp != null ? String(args.tp) : "",
-      filter_conc: args.conc || "",
+      filter_conc_start: args["conc-start"] != null ? String(args["conc-start"]) : "",
+      filter_conc_end: args["conc-end"] != null ? String(args["conc-end"]) : "",
       filter_seq: args["seq-len"] || "",
       repo_url: args["repo-url"],
       hf_cache: hfCache,
@@ -265,7 +274,8 @@ export const InferenceXOptimizeCommand = cmd({
       repoDir,
       hfCache,
       filterTp: args.tp != null ? String(args.tp) : "",
-      filterConc: (args.conc as string) || "",
+      filterConcStart: args["conc-start"] != null ? String(args["conc-start"]) : "",
+      filterConcEnd: args["conc-end"] != null ? String(args["conc-end"]) : "",
       filterSeq: (args["seq-len"] as string) || "",
       dryRun: args["dry-run"] as boolean,
       profile: mode === "profile" || mode === "benchmark+profile",

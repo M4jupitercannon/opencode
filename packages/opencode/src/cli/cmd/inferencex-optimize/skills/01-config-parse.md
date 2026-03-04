@@ -35,7 +35,9 @@ Sequence length mapping (for `{{FILTER_SEQ}}`):
 
 If `{{FILTER_TP}}` is set, keep only configs whose TP (tensor parallelism) matches.
 If `{{FILTER_SEQ}}` is set, keep only configs whose ISL and OSL match the specified sequence length.
-If `{{FILTER_CONC}}` is set, keep only configs whose concurrency matches.
+If `{{FILTER_CONC_START}}` is set, keep only configs whose concurrency is **>=** this value.
+If `{{FILTER_CONC_END}}` is set, keep only configs whose concurrency is **<=** this value.
+(When both are set, keep configs in the range `FILTER_CONC_START..FILTER_CONC_END` inclusive.)
 
 Save the **filtered** result (or full result if no filters are active) to `{{OUTPUT_DIR}}/results/sweep_configs.json`.
 Only print the filtered configs — never print the full unfiltered sweep output.

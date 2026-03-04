@@ -29,8 +29,10 @@ export interface InferenceXConfig {
   hfCache: string
   /** Filter to a specific tensor parallelism level from config search-space */
   filterTp: string
-  /** Filter to a specific concurrency level */
-  filterConc: string
+  /** Filter to concurrency levels >= this value */
+  filterConcStart: string
+  /** Filter to concurrency levels <= this value */
+  filterConcEnd: string
   /** Filter to a specific sequence length (e.g., "1k1k", "1k8k", "8k1k") */
   filterSeq: string
   /** Whether this is a dry run (preview commands only) */
