@@ -40,6 +40,8 @@ def load_trace_events(path: str) -> Tuple[List[Dict[str, Any]], str]:
     if isinstance(data, dict):
         display_unit = data.get("displayTimeUnit", "us")
         trace = data.get("traceEvents") or data.get("events")
+    elif isinstance(data, list):
+        trace = data
     else:
         trace = None
 

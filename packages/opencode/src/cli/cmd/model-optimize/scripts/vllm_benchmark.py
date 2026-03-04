@@ -214,42 +214,54 @@ def verify_shapes_in_trace(trace_path: str) -> bool:
 
         events = data if isinstance(data, list) else data.get("traceEvents", [])
 
-        cpu_ops = [e for e in events if e.get("cat") == "cpu_op"]
-        with_shapes = [e for e in cpu_ops if e.get("args", {}).get("Input Dims")]
-        gpu_kernels = [e for e in events if e.get("cat") == "kernel"]
-        with_ext_id = [e for e in gpu_kernels if e.get("args", {}).get("External id")]
-        frontend_only = [e for e in events if e.get("cat") == "python_function"]
+        n_cpu_ops = 0
+        n_with_shapes = 0
+        n_gpu_kernels = 0
+        n_with_ext_id = 0
+        n_frontend = 0
+        for e in events:
+            cat = e.get("cat")
+            if cat == "cpu_op":
+                n_cpu_ops += 1
+                if e.get("args", {}).get("Input Dims"):
+                    n_with_shapes += 1
+            elif cat == "kernel":
+                n_gpu_kernels += 1
+                if e.get("args", {}).get("External id"):
+                    n_with_ext_id += 1
+            elif cat == "python_function":
+                n_frontend += 1
 
         print(f"\n  Trace verification: {trace_path}")
         print(f"    Size:                 {os.path.getsize(trace_path) / 1_000_000:.1f} MB")
         print(f"    Total events:         {len(events)}")
-        print(f"    CPU ops (cpu_op):     {len(cpu_ops)}")
-        print(f"    CPU ops with shapes:  {len(with_shapes)}")
-        print(f"    GPU kernels:          {len(gpu_kernels)}")
-        print(f"    GPU kernels w/ ext_id:{len(with_ext_id)}")
+        print(f"    CPU ops (cpu_op):     {n_cpu_ops}")
+        print(f"    CPU ops with shapes:  {n_with_shapes}")
+        print(f"    GPU kernels:          {n_gpu_kernels}")
+        print(f"    GPU kernels w/ ext_id:{n_with_ext_id}")
 
         ok = True
-        if len(gpu_kernels) == 0:
-            if len(frontend_only) > 0:
-                print(f"  FAIL: This is an async_llm frontend trace ({len(frontend_only)} python_function events)")
+        if n_gpu_kernels == 0:
+            if n_frontend > 0:
+                print(f"  FAIL: This is an async_llm frontend trace ({n_frontend} python_function events)")
                 print(f"    This trace has NO GPU kernels. Select the *rank-0* worker trace instead.")
             else:
                 print(f"  FAIL: No GPU kernel events in trace")
             ok = False
-        if len(cpu_ops) == 0:
+        if n_cpu_ops == 0:
             print(f"  FAIL: No cpu_op events — --enforce-eager was likely missing")
             ok = False
-        if len(with_shapes) == 0 and len(cpu_ops) > 0:
+        if n_with_shapes == 0 and n_cpu_ops > 0:
             print(f"  FAIL: No Input Dims on cpu_ops — torch_profiler_record_shapes was likely not set")
             ok = False
-        if len(with_ext_id) == 0 and len(gpu_kernels) > 0:
+        if n_with_ext_id == 0 and n_gpu_kernels > 0:
             print(f"  FAIL: No External id on GPU kernels — --enforce-eager was likely missing")
             ok = False
 
         if ok:
-            pct = len(with_shapes) / len(cpu_ops) * 100 if cpu_ops else 0
+            pct = n_with_shapes / n_cpu_ops * 100 if n_cpu_ops else 0
             print(f"  PASSED — {pct:.0f}% of CPU ops have shape data, "
-                  f"{len(with_ext_id)} GPU kernels have External id")
+                  f"{n_with_ext_id} GPU kernels have External id")
         else:
             print(f"\n  Trace verification FAILED. Shape analysis will not produce useful results.")
             print(f"  Required profiling setup:")
@@ -370,6 +382,7 @@ def trace_mode(args) -> str:
         if not valid:
             print("\nERROR: Trace verification failed — shape analysis will not work.")
             print("Re-run with correct flags (see verification output above).")
+            return ""
         return trace_file
     else:
         print("ERROR: No valid worker trace files found!")

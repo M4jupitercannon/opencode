@@ -190,6 +190,10 @@ def validate_trace_for_shapes(events: List[Dict[str, Any]]) -> bool:
     return True
 
 
+# ── Bundled split script (shipped alongside this file) ───────────────────
+
+_BUNDLED_SPLIT_SCRIPT = os.path.join(os.path.dirname(__file__), "split_vllm_trace_annotation.py")
+
 # ── TraceLens Discovery ──────────────────────────────────────────────────
 
 _TRACELENS_GIT_URL = "https://github.com/AMD-AGI/TraceLens.git"
@@ -205,14 +209,15 @@ _TRACELENS_SEARCH_PATHS = [
 
 
 def _is_valid_tracelens(d: str) -> bool:
-    """Check if a directory contains the required TraceLens scripts."""
-    split_script = os.path.join(
-        d, "examples", "custom_workflows", "split_vllm_trace_annotation.py"
-    )
+    """Check if a directory contains the required TraceLens report script.
+
+    The split script is bundled with this package and no longer needs to
+    live inside the TraceLens tree.
+    """
     report_script = os.path.join(
         d, "TraceLens", "Reporting", "generate_perf_report_pytorch_vllm.py"
     )
-    return os.path.isfile(split_script) and os.path.isfile(report_script)
+    return os.path.isfile(report_script)
 
 
 def _clone_tracelens(target_dir: str) -> Optional[str]:
@@ -287,16 +292,18 @@ def split_trace(
     output_dir: str,
     tracelens_dir: str,
     find_steady_state: bool = True,
-    num_steps: int = 256,
-) -> Dict[str, Any]:
-    """Split the trace into phase-specific traces using TraceLens.
+) -> List[Dict[str, Any]]:
+    """Split the trace into phase-specific traces using the bundled splitter.
 
-    Returns execution_details dict with paths to the generated files.
+    Uses ``--store-single-iteration`` so every iteration is saved as its own
+    file.  When *find_steady_state* is True (default) the splitter also
+    identifies the steady-state region and produces combined + phase-specific
+    (prefill-decode / decode-only) traces.
+
+    Returns a list of execution_details entries with paths to the generated
+    files, or an empty list on failure.
     """
-    split_script = os.path.join(
-        tracelens_dir, "examples", "custom_workflows",
-        "split_vllm_trace_annotation.py",
-    )
+    split_script = _BUNDLED_SPLIT_SCRIPT
     phase_dir = os.path.join(output_dir, "phase_traces")
     os.makedirs(phase_dir, exist_ok=True)
 
@@ -304,7 +311,7 @@ def split_trace(
         sys.executable, split_script,
         trace_path,
         "-o", phase_dir,
-        "--num-steps", str(num_steps),
+        "--store-single-iteration",
     ]
     if find_steady_state:
         cmd.append("--find-steady-state")
@@ -573,10 +580,6 @@ def main() -> int:
         help="Path to TraceLens installation (auto-detected if not set)",
     )
     ap.add_argument(
-        "--num-steps", type=int, default=256,
-        help="Number of steady-state iterations for trace splitting (default: 256)",
-    )
-    ap.add_argument(
         "--skip-split", action="store_true",
         help="Skip trace splitting; run analysis directly on the full trace",
     )
@@ -641,7 +644,6 @@ def main() -> int:
         execution_details = split_trace(
             input_path, out_dir, tracelens_dir,
             find_steady_state=True,
-            num_steps=args.num_steps,
         )
 
         if not execution_details:
