@@ -43,9 +43,9 @@ const SKILL_FILES = [
 
 const MODE_PHASES: Record<PipelineMode, readonly string[]> = {
   full: ["env", "config", "benchmark", "analyze", "report"],
-  benchmark: ["env", "config", "benchmark"],
+  benchmark: ["env", "config", "benchmark", "analyze", "report"],
   profile: ["env", "config", "profile"],
-  "benchmark+profile": ["env", "config", "benchmark", "profile"],
+  "benchmark+profile": ["env", "config", "benchmark", "profile", "analyze", "report"],
 }
 
 function computeSkipLabels(startPhase: string, mode: PipelineMode): Record<string, string> {

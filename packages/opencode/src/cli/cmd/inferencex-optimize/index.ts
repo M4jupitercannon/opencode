@@ -98,7 +98,7 @@ export const InferenceXOptimizeCommand = cmd({
       })
       .option("benchmark", {
         type: "boolean",
-        describe: "run only benchmark (env + config + benchmark)",
+        describe: "run benchmark without profiling (env + config + benchmark + analyze + report)",
         default: false,
       })
       .option("profile", {
@@ -409,9 +409,9 @@ export const InferenceXOptimizeCommand = cmd({
                           log(output)
                         }
                         const lines = output.split("\n")
-                        if (lines.length > 10) {
-                          UI.println(lines.slice(0, 8).join("\n"))
-                          UI.println(UI.Style.TEXT_DIM + `... (${lines.length - 8} more lines)`)
+                        if (lines.length > 50) {
+                          UI.println(lines.slice(0, 40).join("\n"))
+                          UI.println(UI.Style.TEXT_DIM + `... (${lines.length - 40} more lines)`)
                         } else {
                           UI.println(output)
                         }
@@ -428,9 +428,11 @@ export const InferenceXOptimizeCommand = cmd({
                     }
                     const shellCmd = input.command || title
                     const combined = shellCmd + "\n" + ((state.output as string) || "")
-                    const scriptMatch = combined.match(/BENCHMARK_SCRIPT=["']?(benchmarks\/[^\s"']+\.sh|[^\s"']+\.sh)/)
-                    if (scriptMatch) {
-                      UI.println(UI.Style.TEXT_INFO_BOLD + "Benchmark script: " + scriptMatch[1])
+                    const resolvedMatch = combined.match(/(?:Trying|Found):\s*(\/[^\s]+\.sh)/)
+                    const fallbackMatch = combined.match(/BENCHMARK_SCRIPT=["']?([^$\s"']+\.sh)/)
+                    const scriptPath = resolvedMatch?.[1] || fallbackMatch?.[1]
+                    if (scriptPath) {
+                      UI.println(UI.Style.TEXT_INFO_BOLD + "Benchmark script: " + scriptPath)
                     }
                   } else if (tool === "write" || tool === "edit") {
                     const filePath = input.target_file || input.file_path || title
@@ -582,7 +584,15 @@ export const InferenceXOptimizeCommand = cmd({
     UI.println("InferenceX Pipeline Complete")
     UI.println("============================================")
     UI.println(`Output directory: ${outputDir}`)
-    UI.println(`Report: ${path.join(dirs.report, "benchmark_report.md")}`)
+
+    const reportPath = path.join(dirs.report, "benchmark_report.md")
+    UI.println(`Report: ${reportPath}`)
+    if (fs.existsSync(reportPath)) {
+      UI.println("============================================")
+      UI.println("")
+      const reportContent = fs.readFileSync(reportPath, "utf-8")
+      UI.println(reportContent)
+    }
     UI.println("============================================")
   },
 })

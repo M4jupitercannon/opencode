@@ -53,10 +53,22 @@ docker run -d \
 {{DRY_RUN_NOTE}}
 
 ### 4. Run Each Profile via `docker exec`
-For each selected config, run the benchmark script with profiling env vars inside the persistent container:
+For each selected config, run the benchmark script with profiling env vars inside the persistent container.
+
+CRITICAL: You MUST use **two separate bash tool calls** for each profiling run — one to print the info, and a second to execute `docker exec`. Do NOT combine them into a single bash call.
+
+**Bash call 1 — Print DOCKER_LOG and RUN_CMD (separate bash call):**
 ```bash
 PROFILE_RESULT="${EXP_NAME}_${PRECISION}_${FRAMEWORK}_tp${TP}-ep${EP}_conc${CONC}_profile"
+DOCKER_LOG="{{PROFILE_DIR}}/${PROFILE_RESULT}_docker.log"
+echo "DOCKER_LOG: $DOCKER_LOG"
+RUN_CMD="docker exec -e MODEL=$MODEL -e TP=$TP -e EP_SIZE=$EP -e CONC=$CONC -e ISL=$ISL -e OSL=$OSL -e MAX_MODEL_LEN=$MAX_MODEL_LEN -e RANDOM_RANGE_RATIO=0.5 -e RESULT_FILENAME=$PROFILE_RESULT -e PRECISION=$PRECISION -e FRAMEWORK=$FRAMEWORK -e EXP_NAME=$EXP_NAME $CONTAINER_NAME /bin/bash /workspace/$BENCHMARK_SCRIPT"
+echo "RUN_CMD: $RUN_CMD"
+```
+All variables must be fully expanded to actual values (not shell variables).
 
+**Bash call 2 — Execute docker exec (separate bash call):**
+```bash
 docker exec \
     -e MODEL=$MODEL \
     -e TP=$TP \
@@ -72,13 +84,8 @@ docker exec \
     -e EXP_NAME=$EXP_NAME \
     "$CONTAINER_NAME" \
     /bin/bash /workspace/$BENCHMARK_SCRIPT \
-    > "{{PROFILE_DIR}}/${PROFILE_RESULT}_docker.log" 2>&1
-```
-
-Check the exit code:
-```bash
-EXEC_EXIT_CODE=$?
-echo "Profile exit code: $EXEC_EXIT_CODE"
+    > "$DOCKER_LOG" 2>&1
+echo "Profile exit code: $?"
 ```
 
 Do NOT print or display the contents of the docker log file. The log is saved for debugging purposes only.

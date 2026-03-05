@@ -20,7 +20,26 @@ For each result file, extract key metrics:
 - **Total latency**
 - **Request success rate**
 
-### 3. Build Comparison Table
+### 3. Compute Derived Metrics
+For each benchmark result, compute the following derived values and present them in **exactly ONE table** (do **NOT** split into two separate tables):
+- `Token Thpt/GPU = total_token_throughput / tp` (total throughput per GPU)
+- `In Thpt/GPU = input_token_throughput / tp`
+- `Out Thpt/GPU = output_token_throughput / tp`
+- `Interactivity (tok/s/user) = 1 / TPOT` where `TPOT = mean_itl_ms / 1000` (Time Per Output Token in seconds)
+- `End-to-end Latency (s) = mean_e2el_ms / 1000`
+
+**IMPORTANT**: Print ALL derived metrics in a single table with this exact format. Do NOT create separate "Throughput vs Interactivity" and "Throughput vs Latency" tables.
+
+```
+Throughput per GPU, Interactivity & Latency:
+--------------------------------------------------------------------------------
+Conc   ISLxOSL      TP   Token Thpt/GPU   In Thpt/GPU   Out Thpt/GPU   Interactivity(tok/s/user)   End-to-end Latency (s)
+...
+```
+
+Include `tok_per_s_per_gpu`, `in_tok_per_s_per_gpu`, `out_tok_per_s_per_gpu`, `interactivity_tok_per_s`, and `e2el_s` as derived fields in the benchmark summary JSON alongside the raw metrics.
+
+### 4. Build Comparison Table
 Create a table comparing performance across:
 - Different concurrency levels
 - Different sequence lengths (ISL×OSL)
@@ -28,7 +47,7 @@ Create a table comparing performance across:
 
 Save as `{{OUTPUT_DIR}}/results/benchmark_summary.json`.
 
-### 4. Analyze Profiling Data (if available)
+### 5. Analyze Profiling Data (if available)
 If profile traces exist in `{{PROFILE_DIR}}/`:
 - Identify top time-consuming operations
 - Look for GPU utilization patterns
@@ -37,7 +56,7 @@ If profile traces exist in `{{PROFILE_DIR}}/`:
 
 Save analysis to `{{OUTPUT_DIR}}/results/profile_analysis.json`.
 
-### 5. Identify Bottlenecks
+### 6. Identify Bottlenecks
 Based on benchmark and profiling data:
 - Rank operations by time consumption
 - Identify scaling bottlenecks (how throughput changes with concurrency)
