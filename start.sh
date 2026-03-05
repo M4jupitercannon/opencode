@@ -20,7 +20,7 @@ TUNNEL_PID_FILE="$LOG_DIR/cloudflared.pid"
 PORT=3001
 
 export PATH="$HOME/.bun/bin:$PATH"
-export LLM_GATEWAY_KEY="${LLM_GATEWAY_KEY:-e5830d4d8c6948d0bb4829a353bd6c82}"
+export LLM_GATEWAY_KEY="${LLM_GATEWAY_KEY:-1e67b130679141d99d38c6c3b5ddf550}"
 export OPENCODE_PERMISSION='{"external_directory":"allow","bash":"allow","edit":"allow","read":"allow","write":"allow","question":"allow","doom_loop":"allow"}'
 
 mkdir -p "$LOG_DIR"
