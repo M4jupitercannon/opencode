@@ -6,16 +6,19 @@ agent: model-opt
 # Model Analysis Pipeline (Phases 0–4)
 
 ## Target
+
 - **HuggingFace Model**: $1
 - **Output Directory**: $2 (if not specified, use `/tmp/model_opt_<model_short_name>`)
 
 ## First Steps
+
 1. Parse model name from `$1`
 2. Determine output directory: `$2` if provided, else `/tmp/model_opt_<short_name>` (**MUST be outside the working directory**)
-3. Create directory structure + `.gitignore` (exclude venv/, model/, *.safetensors, etc.)
+3. Create directory structure + `.gitignore` (exclude venv/, model/, \*.safetensors, etc.)
 4. Copy helper scripts from `~/.config/opencode/scripts/` to `<output_dir>/scripts/`
 
 ## ⚠️ CRITICAL RULES
+
 - **Docker mode** (preferred): If `env_info.json` has `env_type: "docker"`, search available docker images on dockerhub(rocm/vllm-dev:nightly preferred). prefix commands with `docker exec $CONTAINER_NAME bash -c "..."`. Set `HIP_VISIBLE_DEVICES=$BEST_GPU`.
 - **venv mode** (fallback): If `env_type: "venv"`, activate venv: `source <output_dir>/venv/bin/activate`
 - **ALL vLLM commands MUST redirect output to log files** (`&> logfile`) — NEVER dump vLLM logs into bash output
@@ -24,9 +27,10 @@ agent: model-opt
 
 ---
 
-# Phase 0: Environment Setup 
+# Phase 0: Environment Setup
 
 ## Goal
+
 Search for latest docker images such as rocm/vllm-dev in dockerhub is compatible to vllm and platform, and create a container as isolated environment and install all required dependencies.
 
 If there is no docker images available, then Create an isolated Python virtual environment with vLLM-rocm and all required dependencies.
@@ -226,29 +230,35 @@ ls <output_dir>/scripts/
 ```
 
 ### 6. Update progress.json
+
 Update progress.json: phase="env", phases_completed.append("env")
 
 ⚠️ **CRITICAL for all subsequent phases**: If `env_type` is `docker` in `env_info.json`, prefix all commands with `docker exec $CONTAINER_NAME bash -c "..."` and use `/workspace/output` as the output directory inside the container. Set `HIP_VISIBLE_DEVICES=$BEST_GPU` to target the GPU with the most free memory.
 
 ---
 
-# Phase 1: Model Serving with vLLM 
+# Phase 1: Model Serving with vLLM
 
 ## Goal
+
 Start the model using `vllm serve` and verify it works. vLLM handles model download automatically.
 
 ## ⚠️ vLLM Mode
+
 In vLLM mode, there is NO need to:
+
 - Manually download the model (vLLM auto-downloads from HuggingFace)
 - Write a demo inference script
 - Fix compatibility issues manually
 
 ## ⚠️ CRITICAL: Never dump vLLM logs into bash output
+
 **ALL vLLM commands MUST redirect output to log files.** vLLM logs are thousands of lines and will break the session context.
 
 ## Steps
 
 ### 1. Test vLLM serve
+
 ```bash
 source <output_dir>/venv/bin/activate
 
@@ -257,7 +267,7 @@ vllm serve $1 \
   --dtype auto \
   --max-model-len 2048 \
   --port 8192 \
-  --disable-log-requests &> <output_dir>/vllm_serve.log &
+  --no-enable-log-requests &> <output_dir>/vllm_serve.log &
 VLLM_PID=$!
 echo "vLLM PID: $VLLM_PID"
 
@@ -279,6 +289,7 @@ kill $VLLM_PID 2>/dev/null; wait $VLLM_PID 2>/dev/null
 ```
 
 ### 2. Record model config
+
 ```bash
 source <output_dir>/venv/bin/activate
 python3 -c "
@@ -301,23 +312,22 @@ with open('<output_dir>/model_config.json', 'w') as f:
 ```
 
 ### 3. Update progress.json
+
 Update progress.json: phases_completed.append("download"), phases_completed.append("demo"), phases_completed.append("compatibility")
 
 > **Note**: In vLLM mode, Phase 1 covers download + demo + compatibility in one step.
 
-
 ---
 
-# Phase 2: (Covered by Phase 1 in vLLM mode) 
+# Phase 2: (Covered by Phase 1 in vLLM mode)
 
 > In vLLM mode, demo generation is handled by Phase 1 (`vllm serve`). Skip this phase.
 
 Update progress.json if not already done.
 
-
 ---
 
-# Phase 3: (Covered by Phase 1 in vLLM mode) 
+# Phase 3: (Covered by Phase 1 in vLLM mode)
 
 > In vLLM mode, compatibility fixes are handled by vLLM itself. Skip this phase.
 
@@ -325,15 +335,16 @@ If vLLM serve failed in Phase 1, debug using vLLM logs (check `--dtype`, `--tens
 
 Update progress.json if not already done.
 
-
 ---
 
-# Phase 4: Performance Profiling 
+# Phase 4: Performance Profiling
 
 ## Goal
+
 Benchmark vLLM serving throughput AND collect GPU kernel trace for bottleneck analysis.
 
 ## ⚠️ CRITICAL: ALL vLLM output MUST go to log files
+
 **NEVER let vLLM stdout/stderr appear in bash output.** Always use `&> logfile`.
 **For `vllm bench serve`, redirect to file and only extract key metrics.**
 
@@ -347,7 +358,7 @@ vllm serve $1 \
   --dtype auto \
   --max-model-len 4096 \
   --port 8192 \
-  --disable-log-requests &> <output_dir>/vllm_baseline.log &
+  --no-enable-log-requests &> <output_dir>/vllm_baseline.log &
 VLLM_PID=$!
 echo "Baseline vLLM PID: $VLLM_PID (log: <output_dir>/vllm_baseline.log)"
 
@@ -394,11 +405,14 @@ for k in ['output_throughput','request_throughput','mean_tpot_ms','mean_ttft_ms'
 **If any of the three is missing, `analyze_kernels.py` WILL produce 0% attributed shapes. You MUST re-collect the trace — do NOT proceed with bad data.**
 
 ### Docker path note
+
 When running inside Docker, the profiler writes to the **container-side path**. Use `/workspace/output/profile/traces` (not the host path) inside `--profiler-config`.
 Do NOT set the `VLLM_TORCH_PROFILER_DIR` environment variable — it is deprecated (removed in v0.15+). Use `torch_profiler_dir` inside `--profiler-config` instead.
 
 ### ⚠️ Two trace files are written
+
 vLLM writes **two** separate trace files per profiling session:
+
 - **`*async_llm*`** — frontend-only trace (CPU activity only, NO GPU kernels, NO shapes). **This file is USELESS for shape analysis.**
 - **`*rank-0*`** — worker trace (CPU + CUDA activities, has `cpu_op` events with `Input Dims`, has `kernel` events with `External id`). **This is the file you need.**
 
@@ -448,7 +462,7 @@ vllm serve $1 \
   --dtype auto \
   --max-model-len 4096 \
   --port 8193 \
-  --disable-log-requests \
+  --no-enable-log-requests \
   --enforce-eager \
   --profiler-config "$PROFILER_CFG" &> <output_dir>/vllm_trace.log &
 VLLM_PID=$!
@@ -483,7 +497,24 @@ vllm bench serve \
 # ⚠️ CRITICAL: Stop profiling via API — this flushes the trace to disk
 STOP_RESP=$(curl -s -X POST http://localhost:8193/stop_profile)
 echo "stop_profile response: $STOP_RESP"
-sleep 15
+
+# Wait for trace file to be fully written (poll until size stabilizes)
+echo "Waiting for trace flush (may take several minutes for large models)..."
+PREV_SIZE=0; STABLE=0
+for i in $(seq 1 120); do
+  TRACE_FILE=$(ls -S <output_dir>/profile/traces/rank*.gz 2>/dev/null | head -1)
+  if [ -n "$TRACE_FILE" ]; then
+    CUR_SIZE=$(stat -c%s "$TRACE_FILE" 2>/dev/null || echo 0)
+    if [ "$CUR_SIZE" -eq "$PREV_SIZE" ] && [ "$CUR_SIZE" -gt 0 ]; then
+      STABLE=$((STABLE + 1))
+      [ $STABLE -ge 3 ] && echo "Trace stabilized at $(du -h "$TRACE_FILE" | cut -f1)" && break
+    else
+      STABLE=0
+    fi
+    PREV_SIZE=$CUR_SIZE
+  fi
+  sleep 5
+done
 kill $VLLM_PID 2>/dev/null; wait $VLLM_PID 2>/dev/null
 
 echo "Trace files:"
@@ -511,10 +542,12 @@ python3 <output_dir>/profile/analyze_kernels.py -i <output_dir>/profile/traces/ 
 ## Step 3: Split Trace & Run TraceLens Performance Analysis
 
 This step uses TraceLens to:
+
 1. **Split** the trace into phase-specific sub-traces (prefill-decode, decode-only) using steady-state detection
 2. **Analyze** each phase trace with TraceLens standalone analysis (roofline model, op breakdown, GPU timeline)
 
 This replaces the old manual kernel extraction and correlation steps. TraceLens provides:
+
 - Accurate per-op performance models (GFLOPS, data movement, arithmetic intensity)
 - Roofline analysis (memory-bound vs compute-bound classification)
 - GPU timeline breakdown (busy/idle/communication)
@@ -530,6 +563,7 @@ https://github.com/AMD-AGI/TraceLens.git
 ```
 
 You can also provide the path explicitly via `--tracelens-dir`, or pre-install TraceLens:
+
 ```bash
 # Option A: Clone into container (Docker mode)
 docker exec $CONTAINER_NAME git clone --depth 1 https://github.com/AMD-AGI/TraceLens.git /TraceLens
@@ -555,12 +589,14 @@ python3 analyze_kernels.py \
 ```
 
 This produces:
+
 - `phase_traces/` — split trace files (combined steady-state, prefill-decode, decode-only)
 - `prefilldecode_report/` — TraceLens CSVs for prefill-decode phase
 - `decode_report/` — TraceLens CSVs for decode-only phase
 - `analysis_summary.json` — machine-readable summary of all phases
 
 Key output files per phase:
+
 - `unified_perf_summary.csv` — per-op roofline analysis (GFLOPS, TB/s, arithmetic intensity)
 - `ops_summary_by_category.csv` — time breakdown by op category (GEMM, Attention, Norm, etc.)
 - `ops_summary.csv` — time breakdown by individual op
@@ -816,9 +852,11 @@ print(f'Saved phase_category_summary.json ({len(phase_summary)} phases)')
 ```
 
 ## ⚠️ CRITICAL: Use roofline data for optimization decisions
+
 The `unified_perf_summary.csv` in each phase report contains per-op roofline analysis with GFLOPS,
 TB/s, arithmetic intensity, and compute spec. Use this to determine whether each operator is
 **memory-bound** or **compute-bound**, and to prioritize optimization targets accordingly.
+
 - **Memory-bound ops** (low arithmetic intensity): optimize memory access patterns, fusion
 - **Compute-bound ops** (high arithmetic intensity): optimize compute throughput, tiling
 - **Prefill phase**: larger batch dimensions, more compute-bound
@@ -848,6 +886,7 @@ print(json.dumps(shapes, indent=2))
 ```
 
 VALIDATE
+
 ```
 
 **If validation fails, fix the issue and re-run from the failing step.**
@@ -881,3 +920,4 @@ This data was collected with `--enforce-eager` and `torch_profiler_record_shapes
 # EXECUTION INSTRUCTIONS
 Execute phases: 0 → 1 → 4 (Phases 2-3 handled by vLLM).
 Begin with Phase 0.
+```

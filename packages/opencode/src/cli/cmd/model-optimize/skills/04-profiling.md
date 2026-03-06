@@ -1,20 +1,25 @@
 # Phase 4: Performance Profiling {{SKIP_LABEL}}
 
 ## Goal
+
 Benchmark vLLM serving throughput AND collect GPU kernel trace for bottleneck analysis,
 including per-shape kernel time breakdown.
 
 ## ⚠️ CRITICAL: ALL vLLM output MUST go to log files
+
 **NEVER let vLLM stdout/stderr appear in bash output.** Always use `&> logfile`.
 **For `vllm bench serve`, redirect to file and only extract key metrics.**
 
 ## ⚠️ Execution mode (docker vs venv)
+
 Detect once before running this phase:
+
 ```bash
 ENV_TYPE=$(python3 -c "import json; print(json.load(open('{{OUTPUT_DIR}}/env_info.json')).get('env_type','venv'))" 2>/dev/null || echo "venv")
 CONTAINER_NAME=$(python3 -c "import json; print(json.load(open('{{OUTPUT_DIR}}/env_info.json')).get('container','vllm_model_opt'))" 2>/dev/null || echo "vllm_model_opt")
 BEST_GPU=$(python3 -c "import json; print(json.load(open('{{OUTPUT_DIR}}/env_info.json')).get('best_gpu',0))" 2>/dev/null || echo 0)
 ```
+
 If `ENV_TYPE=docker`, run commands with:
 `docker exec -e HIP_VISIBLE_DEVICES=$BEST_GPU $CONTAINER_NAME bash -lc "<command>"`.
 
@@ -29,7 +34,7 @@ vllm serve {{HF_MODEL}} \
   --dtype auto \
   --max-model-len 4096 \
   --port 8192 \
-  --disable-log-requests &> {{OUTPUT_DIR}}/vllm_baseline.log &
+  --no-enable-log-requests &> {{OUTPUT_DIR}}/vllm_baseline.log &
 VLLM_PID=$!
 echo "Baseline vLLM PID: $VLLM_PID (log: {{OUTPUT_DIR}}/vllm_baseline.log)"
 
@@ -76,11 +81,14 @@ for k in ['output_throughput','request_throughput','mean_tpot_ms','mean_ttft_ms'
 **If any of the three is missing, `analyze_kernels.py` WILL produce 0% attributed shapes. You MUST re-collect the trace — do NOT proceed with bad data.**
 
 ### Docker path note
+
 When running inside Docker, the profiler writes to the **container-side path**. Use `/workspace/output/profile/traces` (not the host path) inside `--profiler-config`.
 Do NOT set the `VLLM_TORCH_PROFILER_DIR` environment variable — it is deprecated (removed in v0.15+). Use `torch_profiler_dir` inside `--profiler-config` instead.
 
 ### ⚠️ Two trace files are written
+
 vLLM writes **two** separate trace files per profiling session:
+
 - **`*async_llm*`** — frontend-only trace (CPU activity only, NO GPU kernels, NO shapes). **This file is USELESS for shape analysis.**
 - **`*rank-0*`** — worker trace (CPU + CUDA activities, has `cpu_op` events with `Input Dims`, has `kernel` events with `External id`). **This is the file you need.**
 
@@ -130,7 +138,7 @@ vllm serve {{HF_MODEL}} \
   --dtype auto \
   --max-model-len 4096 \
   --port 8193 \
-  --disable-log-requests \
+  --no-enable-log-requests \
   --enforce-eager \
   --profiler-config "$PROFILER_CFG" &> {{OUTPUT_DIR}}/vllm_trace.log &
 VLLM_PID=$!
@@ -166,7 +174,24 @@ vllm bench serve \
 # ⚠️ CRITICAL: Stop profiling via API — this flushes the trace to disk
 STOP_RESP=$(curl -s -X POST http://localhost:8193/stop_profile)
 echo "stop_profile response: $STOP_RESP"
-sleep 15
+
+# Wait for trace file to be fully written (poll until size stabilizes)
+echo "Waiting for trace flush (may take several minutes for large models)..."
+PREV_SIZE=0; STABLE=0
+for i in $(seq 1 120); do
+  TRACE_FILE=$(ls -S {{PROFILE_DIR}}/traces/rank*.gz 2>/dev/null | head -1)
+  if [ -n "$TRACE_FILE" ]; then
+    CUR_SIZE=$(stat -c%s "$TRACE_FILE" 2>/dev/null || echo 0)
+    if [ "$CUR_SIZE" -eq "$PREV_SIZE" ] && [ "$CUR_SIZE" -gt 0 ]; then
+      STABLE=$((STABLE + 1))
+      [ $STABLE -ge 3 ] && echo "Trace stabilized at $(du -h "$TRACE_FILE" | cut -f1)" && break
+    else
+      STABLE=0
+    fi
+    PREV_SIZE=$CUR_SIZE
+  fi
+  sleep 5
+done
 kill $VLLM_PID 2>/dev/null; wait $VLLM_PID 2>/dev/null
 
 echo "Trace files:"
@@ -194,6 +219,7 @@ python3 {{PROFILE_DIR}}/analyze_kernels.py -i {{PROFILE_DIR}}/traces/ --validate
 ## Step 3: Split Trace & Run TraceLens Performance Analysis
 
 The `analyze_kernels.py` script handles trace splitting and TraceLens analysis in one command. It:
+
 1. Splits the trace into prefill-decode and decode-only phases via TraceLens
 2. Runs standalone performance analysis on each phase trace
 3. Produces `analysis_summary.json` and per-phase CSV reports
@@ -209,6 +235,7 @@ python3 analyze_kernels.py -i traces/ -o . --skip-validation
 ```
 
 This produces:
+
 - `phase_traces/` — split trace files (prefill-decode, decode-only)
 - `prefilldecode_report/` — TraceLens CSVs (ops_summary.csv, unified_perf_summary.csv, etc.)
 - `decode_report/` — TraceLens CSVs for decode-only phase
@@ -217,6 +244,7 @@ This produces:
 ## Step 4: Generate bottlenecks.json from TraceLens Results
 
 See `model-optimize.md` Phase 4, Step 4 for the full inline script that:
+
 - Reads TraceLens `ops_summary.csv` and `unified_perf_summary.csv`
 - Calculates roofline efficiency for GEMM kernels
 - Breaks down Attention (SDPA) sub-kernels

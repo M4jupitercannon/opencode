@@ -295,10 +295,10 @@ def split_trace(
 ) -> List[Dict[str, Any]]:
     """Split the trace into phase-specific traces using the bundled splitter.
 
-    Uses ``--store-single-iteration`` so every iteration is saved as its own
-    file.  When *find_steady_state* is True (default) the splitter also
-    identifies the steady-state region and produces combined + phase-specific
-    (prefill-decode / decode-only) traces.
+    When *find_steady_state* is True (default) the splitter identifies the
+    steady-state region and produces phase-specific (prefill-decode /
+    decode-only) traces.  We use ``--num-steps 5`` to keep the extraction
+    fast — only a few representative iterations are needed for profiling.
 
     Returns a list of execution_details entries with paths to the generated
     files, or an empty list on failure.
@@ -311,10 +311,9 @@ def split_trace(
         sys.executable, split_script,
         trace_path,
         "-o", phase_dir,
-        "--store-single-iteration",
     ]
     if find_steady_state:
-        cmd.append("--find-steady-state")
+        cmd.extend(["--find-steady-state", "--num-steps", "5"])
 
     print(f"\n  Splitting trace into phases...")
     print(f"    Command: {' '.join(cmd)}")
@@ -665,14 +664,17 @@ def main() -> int:
                     continue
 
                 basename = os.path.basename(trace_file)
-                if "prefilldecode" in basename.lower() and "decode_" not in basename.lower().split("prefilldecode")[0]:
+                lower = basename.lower()
+                # Phase-specific traces from extract_phases_and_save
+                # start with "prefilldecode_" or "decode_"
+                if lower.startswith("prefilldecode_"):
                     label = "prefilldecode"
-                elif basename.lower().startswith("decode_"):
+                elif lower.startswith("decode_"):
                     label = "decode"
-                elif "annotation_iteration" in basename.lower():
-                    label = "combined"
                 else:
-                    label = os.path.splitext(basename)[0][:40]
+                    # Combined steady-state or individual iteration —
+                    # skip, only phase-specific traces are needed
+                    continue
 
                 # Skip if we already have this phase
                 if label in phase_reports:

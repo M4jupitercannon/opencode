@@ -1,17 +1,20 @@
 # Phase 7: Integration & End-to-End Testing {{SKIP_LABEL}}
 
 ## Goal
+
 Apply optimized kernels to vLLM via CustomOp and measure ACTUAL serving throughput.
 
 ## ⛔ MANDATORY: This phase REQUIRES real measured data
 
 **This phase is NOT complete until:**
+
 1. A patched vLLM server has ACTUALLY been started and served requests
 2. `vllm bench serve` has been run against the patched server
 3. `optimized_serving.json` has `"label": "optimized"` (NOT "baseline")
 4. The validation script passes
 
 **FORBIDDEN:**
+
 - Estimating speedup with Amdahl's law
 - Copying baseline numbers and modifying them
 - Reporting "estimated" or "conservative" speedup
@@ -20,9 +23,11 @@ Apply optimized kernels to vLLM via CustomOp and measure ACTUAL serving throughp
 ---
 
 ## ⚠️ Docker vs venv
+
 If Phase 0 created a Docker container (`env_type: "docker"` in `env_info.json`), prefix all commands with `docker exec $CONTAINER_NAME bash -c "..."` and use `HIP_VISIBLE_DEVICES=$BEST_GPU`.
 
 Detect once before running this phase:
+
 ```bash
 ENV_TYPE=$(python3 -c "import json; print(json.load(open('{{OUTPUT_DIR}}/env_info.json')).get('env_type','venv'))" 2>/dev/null || echo "venv")
 CONTAINER_NAME=$(python3 -c "import json; print(json.load(open('{{OUTPUT_DIR}}/env_info.json')).get('container','vllm_model_opt'))" 2>/dev/null || echo "vllm_model_opt")
@@ -34,6 +39,7 @@ BEST_GPU=$(python3 -c "import json; print(json.load(open('{{OUTPUT_DIR}}/env_inf
 ## Integration Mechanism: vLLM CustomOp.register_oot()
 
 We use vLLM's OFFICIAL extension mechanism (not monkey-patching):
+
 - Docs: https://docs.vllm.ai/en/latest/design/custom_op/
 - Each optimized kernel is wrapped as a vLLM CustomOp subclass
 - `CustomOp.register_oot()` replaces the default op at instantiation time
@@ -63,6 +69,7 @@ cat vllm_plugin/manifest.json
 ```
 
 This generates:
+
 - `{{OPTIMIZED_DIR}}/vllm_plugin/__init__.py` — registers CustomOps
 - `{{OPTIMIZED_DIR}}/run_patched_vllm.py` — launcher script
 - `{{OPTIMIZED_DIR}}/vllm_plugin/manifest.json` — registration summary
@@ -90,7 +97,7 @@ Phase 4 produced `baseline_benchmark.json` in `profile/` (different workload). R
 # source {{OUTPUT_DIR}}/venv/bin/activate
 
 # ALL vLLM output to log files — NEVER to stdout
-vllm serve {{HF_MODEL}} --dtype auto --max-model-len 4096 --port 8192 --disable-log-requests &> {{OUTPUT_DIR}}/vllm_baseline_e2e.log &
+vllm serve {{HF_MODEL}} --dtype auto --max-model-len 4096 --port 8192 --no-enable-log-requests &> {{OUTPUT_DIR}}/vllm_baseline_e2e.log &
 VLLM_PID=$!
 echo "Baseline PID: $VLLM_PID"
 for i in $(seq 1 60); do curl -s http://localhost:8192/health > /dev/null 2>&1 && break; sleep 5; done
@@ -126,7 +133,7 @@ for k in ['output_throughput','mean_tpot_ms','mean_ttft_ms','completed']:
 # Start patched vLLM — ALL output to log file
 python3 {{OPTIMIZED_DIR}}/run_patched_vllm.py serve \
   --model {{HF_MODEL}} --dtype auto --max-model-len 4096 \
-  --port 8193 --disable-log-requests &> {{OUTPUT_DIR}}/vllm_patched.log &
+  --port 8193 --no-enable-log-requests &> {{OUTPUT_DIR}}/vllm_patched.log &
 PATCHED_PID=$!
 echo "Patched PID: $PATCHED_PID (log: {{OUTPUT_DIR}}/vllm_patched.log)"
 
@@ -171,6 +178,7 @@ for k in ['output_throughput','mean_tpot_ms','mean_ttft_ms','completed']:
 ```
 
 **If the patched server fails to start or crashes:**
+
 1. Check `run_patched_vllm.py` output for registration errors
 2. Try removing problematic kernels from `vllm_plugin/` and regenerate
 3. If ALL patches fail, run benchmark anyway (it measures "no-change" as the honest result)

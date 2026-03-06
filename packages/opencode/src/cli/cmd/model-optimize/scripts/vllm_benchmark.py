@@ -54,7 +54,7 @@ def start_vllm_serve(model: str, port: int, extra_args: list[str] = None,
         "--model", model,
         "--port", str(port),
         "--dtype", "auto",
-        "--disable-log-requests",
+        "--no-enable-log-requests",
     ]
     if extra_args:
         cmd.extend(extra_args)
@@ -363,8 +363,24 @@ def trace_mode(args) -> str:
         print("\nStopping profiler via /stop_profile ...")
         profiler_api_call(port, "stop_profile")
 
-        # Wait for profiler to flush
-        time.sleep(10)
+        # Wait for trace file to be fully written (poll until size stabilizes)
+        print("Waiting for trace flush (may take several minutes)...")
+        prev = 0
+        stable = 0
+        for _ in range(120):  # max 10 min
+            traces = [os.path.join(trace_dir, f) for f in os.listdir(trace_dir)
+                      if "rank" in f and f.endswith(".gz")]
+            if traces:
+                cur = os.path.getsize(traces[0])
+                if cur == prev and cur > 0:
+                    stable += 1
+                    if stable >= 3:
+                        print(f"  Trace stabilized: {cur / 1e6:.1f} MB")
+                        break
+                else:
+                    stable = 0
+                prev = cur
+            time.sleep(5)
     finally:
         stop_server(proc)
 

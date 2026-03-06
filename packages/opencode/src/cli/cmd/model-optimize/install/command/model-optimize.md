@@ -6,12 +6,15 @@ agent: model-opt
 # vLLM Kernel Optimization & Integration Pipeline (Phases 5–8)
 
 ## Target
+
 - **HuggingFace Model**: $1
 - **Output Directory**: $2 (if not specified, use `/tmp/model_opt_<model_short_name>`)
 
 ## Prerequisites
+
 Phases 0–4 (environment setup, model serving, profiling, bottleneck analysis) must be completed first.
 See `model-analyzer.md` for those phases. The following artifacts from Phase 4 are required:
+
 - `<output_dir>/profile/bottlenecks.json`
 - `<output_dir>/profile/analysis_summary.json`
 - `<output_dir>/profile/model_shapes.json`
@@ -19,6 +22,7 @@ See `model-analyzer.md` for those phases. The following artifacts from Phase 4 a
 - `<output_dir>/profile/prefilldecode_report/unified_perf_summary.csv`
 
 ## ⚠️ CRITICAL RULES
+
 - **Docker mode** (preferred): If `env_info.json` has `env_type: "docker"`, prefix commands with `docker exec $CONTAINER_NAME bash -c "..."`. Set `HIP_VISIBLE_DEVICES=$BEST_GPU`.
 - **venv mode** (fallback): If `env_type: "venv"`, activate venv: `source <output_dir>/venv/bin/activate`
 - **ALL vLLM commands MUST redirect output to log files** (`&> logfile`) — NEVER dump vLLM logs into bash output
@@ -28,22 +32,26 @@ See `model-analyzer.md` for those phases. The following artifacts from Phase 4 a
 - **Serving benchmarks MUST use `vllm bench serve --save-result`**
 
 ## ⛔ MANDATORY VALIDATION
+
 After Phase 6 and Phase 7, run:
+
 ```bash
 python <output_dir>/scripts/validate_pipeline.py --project-dir <output_dir> --phase all
 ```
 
 ---
 
-# Phase 5: Generate Problem Files for Kernel Optimization 
+# Phase 5: Generate Problem Files for Kernel Optimization
 
 ## Goal
+
 Convert bottleneck operators into Problem files for kernel-optimize.
 **IMPORTANT**: Analyze operators for fusion opportunities BEFORE creating individual problem files.
 
 ## STEP 0: Review TraceLens Analysis (from Phase 4)
 
 Before creating problem files, review the TraceLens analysis results to understand:
+
 - Which **operator categories** dominate GPU time (GEMM, Attention, Norm, Activation, ...)
 - For each category, which **specific shapes** are the hottest (from `unified_perf_summary.csv`)
 - Whether each op is **memory-bound** or **compute-bound** (from roofline analysis)
@@ -82,14 +90,14 @@ cat fusion_opportunities.json
 
 ### Common Fusion Opportunities in LLMs
 
-| Pattern | Operators to Fuse | Fused Name | Expected Speedup |
-|---------|-------------------|------------|------------------|
-| **ResidualNorm** | add + rmsnorm/layernorm | fused_residual_norm | 1.2-1.5x |
-| **SwiGLU/GeGLU** | silu/gelu + mul | fused_swiglu | 1.3-1.8x |
-| **BiasAdd** | matmul + add (bias) | fused_linear_bias | 1.1-1.3x |
-| **RotaryEmbed** | rope_cos + rope_sin + cat | fused_rope | 1.2-1.5x |
-| **QKV Projection** | 3x linear (q,k,v) | fused_qkv_proj | 1.2-1.4x |
-| **MLP Block** | linear + activation + linear | fused_mlp | 1.3-2.0x |
+| Pattern            | Operators to Fuse            | Fused Name          | Expected Speedup |
+| ------------------ | ---------------------------- | ------------------- | ---------------- |
+| **ResidualNorm**   | add + rmsnorm/layernorm      | fused_residual_norm | 1.2-1.5x         |
+| **SwiGLU/GeGLU**   | silu/gelu + mul              | fused_swiglu        | 1.3-1.8x         |
+| **BiasAdd**        | matmul + add (bias)          | fused_linear_bias   | 1.1-1.3x         |
+| **RotaryEmbed**    | rope_cos + rope_sin + cat    | fused_rope          | 1.2-1.5x         |
+| **QKV Projection** | 3x linear (q,k,v)            | fused_qkv_proj      | 1.2-1.4x         |
+| **MLP Block**      | linear + activation + linear | fused_mlp           | 1.3-2.0x         |
 
 ## STEP 2: Create FUSED Problem Files (Priority)
 
@@ -100,6 +108,7 @@ Use ACTUAL shapes from TraceLens `unified_perf_summary.csv` in each phase report
 Focus on the ops with the highest `Percentage (%)` and use roofline data to decide optimization strategy.
 
 ### Example: Fused Residual + RMSNorm
+
 ```python
 # problem_fused_residual_rmsnorm.py
 import torch
@@ -131,6 +140,7 @@ def get_init_inputs():
 ```
 
 ### Example: Fused SwiGLU
+
 ```python
 # problem_fused_swiglu.py
 import torch
@@ -170,35 +180,47 @@ Create `<output_dir>/problems/optimization_manifest.json`:
   "model": "$1",
   "description": "Edit 'enabled' to control which optimizations to apply",
   "optimizations": [
-    {"name": "fused_residual_rmsnorm", "file": "problem_fused_residual_rmsnorm.py",
-     "type": "fused", "priority": "HIGH", "enabled": true},
-    {"name": "linear_gemm", "file": "problem_linear.py",
-     "type": "individual", "priority": "LOW", "enabled": false,
-     "notes": "rocBLAS usually optimal"}
+    {
+      "name": "fused_residual_rmsnorm",
+      "file": "problem_fused_residual_rmsnorm.py",
+      "type": "fused",
+      "priority": "HIGH",
+      "enabled": true
+    },
+    {
+      "name": "linear_gemm",
+      "file": "problem_linear.py",
+      "type": "individual",
+      "priority": "LOW",
+      "enabled": false,
+      "notes": "rocBLAS usually optimal"
+    }
   ]
 }
 ```
 
 ## Steps
+
 1. Run fusion analysis
 2. Create fused problem files (HIGH priority)
 3. Create individual problem files (MEDIUM/LOW)
 4. Generate optimization_manifest.json
 5. Update progress.json
 
-
-
 ---
 
-# Phase 6: Kernel Optimization 
+# Phase 6: Kernel Optimization
 
 ## Goal
+
 Write optimized Triton kernels for each problem file and verify speedup.
 
 ## ⚠️ NO external `opencode` command needed
+
 Optimize kernels DIRECTLY in this session using the test scripts provided.
 
 ## Scripts Available
+
 - `<output_dir>/scripts/kernel_test_runner.py` — test accuracy + benchmark
 - `<output_dir>/scripts/kernel_finalize.py` — save best result to target file
 
@@ -207,22 +229,27 @@ Optimize kernels DIRECTLY in this session using the test scripts provided.
 For each `problem_*.py` file in `<output_dir>/problems/`:
 
 ### 1. Read the source file to understand the PyTorch operator
+
 ```bash
 cat <output_dir>/problems/problem_XXX.py
 ```
 
 ### 2. Check GPU architecture
+
 ```bash
 python3 -c "import torch; print(f'GPU: {torch.cuda.get_device_name()}, Arch: {torch.cuda.get_device_capability()}')"
 ```
 
 ### 3. Write the optimized Triton kernel
+
 Create `<output_dir>/problems/problem_XXX_opt.py` with:
+
 - `class ModelNew(nn.Module)` using `@triton.jit` Triton kernels
 - Same `__init__` signature as `Model`
 - Use `@triton.autotune` with 10-20 diverse configs
 
 ### 4. Test accuracy + benchmark
+
 ```bash
 source <output_dir>/venv/bin/activate
 python3 <output_dir>/scripts/kernel_test_runner.py \
@@ -233,10 +260,12 @@ python3 <output_dir>/scripts/kernel_test_runner.py \
 The script prints: `RESULT_JSON: {"speedup": 1.5, "accuracy": "PASSED", ...}`
 
 ### 5. Iterate if needed
+
 - Accuracy FAILED → fix kernel, re-run step 4
 - Speedup too low → adjust block sizes, fusion strategy, re-run step 4
 
 ### 6. Finalize when satisfied
+
 ```bash
 python3 <output_dir>/scripts/kernel_finalize.py \
   --target <output_dir>/problems/problem_XXX_opt.py
@@ -244,16 +273,17 @@ python3 <output_dir>/scripts/kernel_finalize.py \
 
 ## Priority Order
 
-| Priority | Kernel Type | Goal | Reason |
-|----------|-------------|------|--------|
-| **HIGH** | Fused Residual+RMSNorm | 1.5x | Memory traffic reduction |
-| **HIGH** | Fused SwiGLU | 1.5x | Activation fusion |
-| **HIGH** | Fused RoPE | 1.5x | Custom optimization |
-| MEDIUM | Individual norms | 1.3x | If not covered by fused version |
-| LOW | Linear/GEMM | 1.1x | rocBLAS usually optimal |
-| **SKIP** | Simple add/copy | — | Overhead > benefit |
+| Priority | Kernel Type            | Goal | Reason                          |
+| -------- | ---------------------- | ---- | ------------------------------- |
+| **HIGH** | Fused Residual+RMSNorm | 1.5x | Memory traffic reduction        |
+| **HIGH** | Fused SwiGLU           | 1.5x | Activation fusion               |
+| **HIGH** | Fused RoPE             | 1.5x | Custom optimization             |
+| MEDIUM   | Individual norms       | 1.3x | If not covered by fused version |
+| LOW      | Linear/GEMM            | 1.1x | rocBLAS usually optimal         |
+| **SKIP** | Simple add/copy        | —    | Overhead > benefit              |
 
 ## When to SKIP a kernel
+
 - If it's part of a fused kernel you already optimized
 - If rocBLAS/vendor lib is already near-optimal
 - If after 3 attempts speedup is < 1.0x at actual shapes
@@ -261,6 +291,7 @@ python3 <output_dir>/scripts/kernel_finalize.py \
 ## Triton Optimization Guide
 
 ### Autotune Strategy
+
 ```python
 @triton.autotune(
     configs=[
@@ -274,6 +305,7 @@ python3 <output_dir>/scripts/kernel_finalize.py \
 ```
 
 ### Common Patterns
+
 - **Memory-bound**: Optimize access patterns, vectorization
 - **Compute-bound**: Larger tiles, more arithmetic per memory access
 - **Fused kernels**: Combine multiple ops to reduce memory traffic
@@ -296,6 +328,7 @@ done
 ```
 
 Copy successful optimizations to `<output_dir>/optimized/`:
+
 ```bash
 cd <output_dir>/problems
 for f in *_opt.py; do
@@ -312,23 +345,25 @@ done
 
 Update progress.json: phases_completed.append("optimize")
 
-
 ---
 
-# Phase 7: Integration & End-to-End Testing 
+# Phase 7: Integration & End-to-End Testing
 
 ## Goal
+
 Apply optimized kernels to vLLM via CustomOp and measure ACTUAL serving throughput.
 
 ## ⛔ MANDATORY: This phase REQUIRES real measured data
 
 **This phase is NOT complete until:**
+
 1. A patched vLLM server has ACTUALLY been started and served requests
 2. `vllm bench serve` has been run against the patched server
 3. `optimized_serving.json` has `"label": "optimized"` (NOT "baseline")
 4. The validation script passes
 
 **FORBIDDEN:**
+
 - Estimating speedup with Amdahl's law
 - Copying baseline numbers and modifying them
 - Reporting "estimated" or "conservative" speedup
@@ -339,6 +374,7 @@ Apply optimized kernels to vLLM via CustomOp and measure ACTUAL serving throughp
 ## Integration Mechanism: vLLM CustomOp.register_oot()
 
 We use vLLM's OFFICIAL extension mechanism (not monkey-patching):
+
 - Docs: https://docs.vllm.ai/en/latest/design/custom_op/
 - Each optimized kernel is wrapped as a vLLM CustomOp subclass
 - `CustomOp.register_oot()` replaces the default op at instantiation time
@@ -367,6 +403,7 @@ cat vllm_plugin/manifest.json
 ```
 
 This generates:
+
 - `<output_dir>/optimized/vllm_plugin/__init__.py` — registers CustomOps
 - `<output_dir>/optimized/run_patched_vllm.py` — launcher script
 - `<output_dir>/optimized/vllm_plugin/manifest.json` — registration summary
@@ -392,7 +429,7 @@ Phase 4 produced `baseline_benchmark.json` in `profile/` (different workload par
 source <output_dir>/venv/bin/activate
 
 # ALL vLLM output to log files — NEVER to stdout
-vllm serve $1 --dtype auto --max-model-len 4096 --port 8192 --disable-log-requests &> <output_dir>/vllm_baseline_e2e.log &
+vllm serve $1 --dtype auto --max-model-len 4096 --port 8192 --no-enable-log-requests &> <output_dir>/vllm_baseline_e2e.log &
 VLLM_PID=$!
 echo "Baseline PID: $VLLM_PID"
 for i in $(seq 1 60); do curl -s http://localhost:8192/health > /dev/null 2>&1 && break; sleep 5; done
@@ -427,7 +464,7 @@ source <output_dir>/venv/bin/activate
 # Start patched vLLM — ALL output to log file
 python3 <output_dir>/optimized/run_patched_vllm.py serve \
   --model $1 --dtype auto --max-model-len 4096 \
-  --port 8193 --disable-log-requests &> <output_dir>/vllm_patched.log &
+  --port 8193 --no-enable-log-requests &> <output_dir>/vllm_patched.log &
 PATCHED_PID=$!
 echo "Patched PID: $PATCHED_PID (log: <output_dir>/vllm_patched.log)"
 
@@ -472,6 +509,7 @@ for k in ['output_throughput','mean_tpot_ms','mean_ttft_ms','completed']:
 ```
 
 **If the patched server fails to start or crashes:**
+
 1. Check `run_patched_vllm.py` output for registration errors
 2. Try removing problematic kernels from `vllm_plugin/` and regenerate
 3. If ALL patches fail, run benchmark anyway (it measures "no-change" as the honest result)
@@ -546,12 +584,12 @@ VALIDATE
 
 Update progress.json: phases_completed.append("integrate")
 
-
 ---
 
-# Phase 8: Generate Final Report 
+# Phase 8: Generate Final Report
 
 ## Goal
+
 Create a comprehensive optimization report.
 
 ## Create Report: `<output_dir>/report/optimization_report.md`
@@ -562,41 +600,49 @@ Create a comprehensive optimization report.
 # Model Optimization Report
 
 ## Model Information
+
 - **Model**: $1
 - **Optimization Date**: [DATE]
 
 ## Summary
+
 - **ACTUAL End-to-End Speedup**: X.Xx (measured, NOT estimated)
 - **Kernels Optimized**: N
 - **Baseline Inference Time**: X.Xs
 - **Optimized Inference Time**: X.Xs
 
 ## Bottleneck Analysis
+
 | Operator | Original Time (ms) | % of Total | Optimized | Speedup |
-|----------|-------------------|------------|-----------|---------|
-| ...      | ...               | ...        | ...       | ...     |
+| -------- | ------------------ | ---------- | --------- | ------- |
+| ...      | ...                | ...        | ...       | ...     |
 
 ## Performance Results (ACTUAL MEASURED)
-| Metric | Original | Optimized | Speedup |
-|--------|----------|-----------|---------|
-| End-to-End Inference Time | X.Xs | X.Xs | **X.Xx** |
+
+| Metric                    | Original | Optimized | Speedup  |
+| ------------------------- | -------- | --------- | -------- |
+| End-to-End Inference Time | X.Xs     | X.Xs      | **X.Xx** |
 
 ## Comparison Outputs (Seed=42)
+
 Outputs generated with fixed random seed for verification.
 
 ### Text Models:
+
 | Original | Optimized |
-|----------|-----------|
+| -------- | --------- |
 | [text]   | [text]    |
 
 ### Image Models (if applicable):
+
 > Include this section only for vision/multimodal models that produce image outputs.
 
-| Original | Optimized |
-|:--------:|:---------:|
+|                      Original                       |                       Optimized                       |
+| :-------------------------------------------------: | :---------------------------------------------------: |
 | ![Original](comparison_outputs/original_output.png) | ![Optimized](comparison_outputs/optimized_output.png) |
 
 ## Files Generated
+
 - problems/ - Problem files + optimized kernels
 - optimized/vllm_plugin/ - vLLM CustomOp integration plugin
 - report/baseline_serving.json - Baseline benchmark results
@@ -604,19 +650,20 @@ Outputs generated with fixed random seed for verification.
 - report/optimization_report.md - This report
 
 ## Recommendations
+
 1. ...
 ```
 
 ## Steps
+
 1. Gather all results from previous phases
 2. Generate the comprehensive report
 3. Update progress.json: phase="complete", phases_completed.append("report")
 
-
-
 ---
 
 # EXECUTION INSTRUCTIONS
+
 Execute phases: 5 → 6 → 7 → 8.
 **ALL vLLM output to log files. Run validate_pipeline.py after Phase 6 and 7.**
 Begin with Phase 5.
