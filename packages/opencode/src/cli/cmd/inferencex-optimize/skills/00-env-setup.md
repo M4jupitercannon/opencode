@@ -37,22 +37,26 @@ if [ -z "$AMD_ARCH" ] && [ -z "$NVIDIA_ARCH" ]; then
 fi
 ```
 
-### 3. Clone or Update InferenceX Repository
+### 3. Clone or Update InferenceX Repository (CRITICAL — do NOT skip)
+You MUST run this step. The repo directory may exist but be empty.
 ```bash
 REPO_DIR="{{REPO_DIR}}"
 REPO_URL="{{REPO_URL}}"
 
-if [ -d "$REPO_DIR/.github/configs" ]; then
+if [ -d "$REPO_DIR/.git" ]; then
     echo "Using existing repo at $REPO_DIR, pulling latest..."
     cd "$REPO_DIR" && git pull --ff-only || true
 else
-    echo "Cloning InferenceX repo..."
+    echo "InferenceX repo not found at $REPO_DIR, cloning..."
+    rm -rf "$REPO_DIR"
     git clone "$REPO_URL" "$REPO_DIR"
 fi
 ```
+If `git clone` fails, report the error and stop.
 
 ### 4. Verify Config File Exists
 ```bash
+REPO_DIR="{{REPO_DIR}}"
 CONFIG_KEY="{{CONFIG_KEY}}"
 if [[ "$CONFIG_KEY" == *mi3* ]]; then
     CONFIG_FILE=".github/configs/amd-master.yaml"
@@ -60,7 +64,12 @@ else
     CONFIG_FILE=".github/configs/nvidia-master.yaml"
 fi
 
-ls "{{REPO_DIR}}/$CONFIG_FILE"
+if [ ! -f "$REPO_DIR/$CONFIG_FILE" ]; then
+    echo "ERROR: Config file not found: $REPO_DIR/$CONFIG_FILE" >&2
+    echo "This likely means the repo was not cloned. Go back to step 3." >&2
+    exit 1
+fi
+echo "Config file found: $REPO_DIR/$CONFIG_FILE"
 ```
 
 ### 5. Check Python3 and Dependencies

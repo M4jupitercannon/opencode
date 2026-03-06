@@ -44,7 +44,7 @@ const SKILL_FILES = [
 const MODE_PHASES: Record<PipelineMode, readonly string[]> = {
   full: ["env", "config", "benchmark", "analyze", "report"],
   benchmark: ["env", "config", "benchmark", "analyze", "report"],
-  profile: ["env", "config", "profile"],
+  profile: ["env", "config", "profile", "analyze", "report"],
   "benchmark+profile": ["env", "config", "benchmark", "profile", "analyze", "report"],
 }
 
@@ -206,7 +206,7 @@ function buildHeader(
     "\n## Output Directory Structure\n" +
     "```\n" +
     vars.OUTPUT_DIR + "/\n" +
-    "  repo/           # InferenceX repository clone\n" +
+    "  InferenceX/     # InferenceX repository clone\n" +
     "  results/        # Benchmark results and analysis\n" +
     "  profiles/       # Profiling trace files\n" +
     "  report/         # Final benchmark report\n" +

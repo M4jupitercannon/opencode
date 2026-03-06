@@ -46,11 +46,28 @@ docker run -d \
     -e PROFILE=1 \
     -e SGLANG_TORCH_PROFILER_DIR=/workspace/profiles \
     -e VLLM_TORCH_PROFILER_DIR=/workspace/profiles \
+    -e VLLM_RPC_TIMEOUT=1800000 \
     $IMAGE \
     -c "sleep infinity"
 ```
 
 {{DRY_RUN_NOTE}}
+
+### 3a. Inject vLLM Profiler Config
+vLLM v0.16+ requires `--profiler-config` on the `vllm serve` command to register the `/start_profile` and `/stop_profile` API endpoints. The `VLLM_TORCH_PROFILER_DIR` env var alone is not enough; without `--profiler-config`, the profiling routes are never attached and calls to `/start_profile` silently fail, producing no torch traces.
+
+After starting the container, patch the resolved benchmark script **inside the container** so that any `vllm serve` invocation includes the profiler config:
+```bash
+docker exec "$CONTAINER_NAME" bash -c '
+    PROF_DIR="${VLLM_TORCH_PROFILER_DIR:-/workspace/profiles}"
+    PROFILER_CFG="--profiler-config {\"profiler\": \"torch\", \"torch_profiler_dir\": \"${PROF_DIR}\", \"torch_profiler_use_gzip\": true}"
+    find /workspace/benchmarks -name "*.sh" -exec \
+        sed -i "s|vllm serve |vllm serve ${PROFILER_CFG} |" {} \;
+    echo "Patched benchmark scripts with --profiler-config"
+'
+```
+
+This only modifies the copy inside the container, not the host repo.
 
 ### 4. Run Each Profile via `docker exec`
 For each selected config, run the benchmark script with profiling env vars inside the persistent container.
@@ -98,9 +115,44 @@ docker rm "$CONTAINER_NAME"
 ```
 
 ### 6. Collect Profile Traces
+Copy the **actual torch profiler traces** (produced by vLLM to `VLLM_TORCH_PROFILER_DIR`) and any relay traces:
 ```bash
-cp {{REPO_DIR}}/profiles/*.trace.json* "{{PROFILE_DIR}}/" 2>/dev/null || echo "No trace files found"
+# Torch profiler traces written by vLLM to the profiles subdirectory
+cp {{REPO_DIR}}/profiles/*.json* "{{PROFILE_DIR}}/" 2>/dev/null || true
+# Relay traces from benchmark_lib (in repo root)
+cp {{REPO_DIR}}/profile_*.trace.json* "{{PROFILE_DIR}}/" 2>/dev/null || true
+echo "Collected trace files:"
 ls -lh "{{PROFILE_DIR}}/"
+```
+
+### 6a. Validate Trace Files
+Verify that at least one collected trace file is a genuine torch profiler trace (contains `traceEvents` key), not just a benchmark result JSON:
+```bash
+python3 -c "
+import json, gzip, glob, sys
+trace_dir = '{{PROFILE_DIR}}'
+valid = []
+for f in sorted(glob.glob(trace_dir + '/*.json*')):
+    if '_docker.log' in f:
+        continue
+    try:
+        opener = gzip.open if f.endswith('.gz') else open
+        with opener(f, 'rt') as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and 'traceEvents' in data:
+            valid.append(f)
+            print(f'VALID torch trace: {f}')
+        else:
+            keys = list(data.keys())[:5] if isinstance(data, dict) else type(data).__name__
+            print(f'NOT a torch trace (keys: {keys}): {f}')
+    except Exception as e:
+        print(f'ERROR reading {f}: {e}')
+if not valid:
+    print('WARNING: No valid torch profiler traces found. TraceLens analysis will be skipped.')
+    print('This usually means vLLM profiling endpoints were not activated.')
+else:
+    print(f'Found {len(valid)} valid torch trace(s)')
+"
 ```
 
 ### 7. Profile Summary

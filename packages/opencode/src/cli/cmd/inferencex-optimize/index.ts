@@ -103,7 +103,7 @@ export const InferenceXOptimizeCommand = cmd({
       })
       .option("profile", {
         type: "boolean",
-        describe: "run only profiling (env + config + profile)",
+        describe: "run profiling with analysis (env + config + profile + analyze + report)",
         default: false,
       })
       .option("resume", {
@@ -152,7 +152,7 @@ export const InferenceXOptimizeCommand = cmd({
       process.env.HF_HUB_CACHE ||
       path.join(process.env.HOME || "~", ".cache/huggingface")
 
-    const repoDir = (args["repo-dir"] as string) || path.join(outputDir, "repo")
+    const repoDir = (args["repo-dir"] as string) || path.join(outputDir, "InferenceX")
 
     UI.println("============================================")
     UI.println("InferenceX Benchmark Pipeline")
@@ -295,7 +295,7 @@ export const InferenceXOptimizeCommand = cmd({
 
     const opencodeConfigObj = {
       "$schema": "https://opencode.ai/config.json",
-      model: "amd-anthropic/claude-opus-4-5",
+      model: `amd-anthropic/${process.env.ANTHROPIC_DEFAULT_OPUS_MODEL || "claude-opus-4-6"}`,
       default_agent: "inferencex-opt",
       provider: {
         "amd-anthropic": { options: { timeout: 1200000 } },
@@ -550,8 +550,9 @@ export const InferenceXOptimizeCommand = cmd({
         if (llmArg) {
           modelParam = Provider.parseModel(llmArg)
         } else if (gatewayKey) {
-          modelParam = Provider.parseModel("amd-anthropic/claude-opus-4-5")
-          UI.println("Using default AMD gateway model: amd-anthropic/claude-opus-4-5")
+          const opusModel = process.env.ANTHROPIC_DEFAULT_OPUS_MODEL || "claude-opus-4-6"
+          modelParam = Provider.parseModel(`amd-anthropic/${opusModel}`)
+          UI.println(`Using default AMD gateway model: amd-anthropic/${opusModel}`)
         }
         UI.println("Sending prompt to LLM...")
         await sdk.session.prompt({
