@@ -151,6 +151,29 @@ print(best)
 ")
   echo "Best GPU: cuda:$BEST_GPU"
 
+  # Patch vLLM BlockSize for hybrid architectures (mamba/linear_attention)
+  # that require non-standard block sizes (e.g. block_size=528).
+  # Safe: the computed block size is always a multiple of 16 (kernel alignment).
+  docker exec "$CONTAINER_NAME" bash -c "
+    python3 -c \"
+from typing import get_args
+from vllm.config.cache import BlockSize
+sizes = get_args(BlockSize)
+if max(sizes) < 512:
+    cache_file = '/usr/local/lib/python3.12/dist-packages/vllm/config/cache.py'
+    with open(cache_file) as f: src = f.read()
+    old = f'BlockSize = Literal[{\\\", \\\".join(str(s) for s in sizes)}]'
+    new = old.rstrip(']') + ', 528]'
+    if old in src:
+        with open(cache_file, 'w') as f: f.write(src.replace(old, new))
+        print('Patched BlockSize to include 528 (hybrid arch support)')
+    else:
+        print('BlockSize definition not found — patch skipped')
+else:
+    print(f'BlockSize already includes large values: {sizes}')
+\"
+  "
+
   # Save environment info
   docker exec "$CONTAINER_NAME" bash -c "
     mkdir -p /workspace/output
@@ -293,17 +316,28 @@ kill $VLLM_PID 2>/dev/null; wait $VLLM_PID 2>/dev/null
 ```bash
 source <output_dir>/venv/bin/activate
 python3 -c "
-from transformers import AutoConfig
-config = AutoConfig.from_pretrained('$1', trust_remote_code=True)
 import json
+try:
+    from transformers import AutoConfig
+    config = AutoConfig.from_pretrained('$1', trust_remote_code=True)
+    d = config.to_dict()
+except Exception:
+    from huggingface_hub import hf_hub_download
+    cfg_path = hf_hub_download('$1', 'config.json')
+    with open(cfg_path) as f: d = json.load(f)
+
+tc = d.get('text_config', d)
 info = {
-    'model_type': getattr(config, 'model_type', 'unknown'),
-    'num_hidden_layers': getattr(config, 'num_hidden_layers', None),
-    'hidden_size': getattr(config, 'hidden_size', None),
-    'num_attention_heads': getattr(config, 'num_attention_heads', None),
-    'num_key_value_heads': getattr(config, 'num_key_value_heads', None),
-    'intermediate_size': getattr(config, 'intermediate_size', None),
-    'vocab_size': getattr(config, 'vocab_size', None),
+    'model_type': d.get('model_type', 'unknown'),
+    'architectures': d.get('architectures', []),
+    'num_hidden_layers': tc.get('num_hidden_layers', None),
+    'hidden_size': tc.get('hidden_size', None),
+    'num_attention_heads': tc.get('num_attention_heads', None),
+    'num_key_value_heads': tc.get('num_key_value_heads', None),
+    'intermediate_size': tc.get('intermediate_size', None),
+    'vocab_size': tc.get('vocab_size', None),
+    'layer_types': tc.get('layer_types', None),
+    'full_attention_interval': tc.get('full_attention_interval', None),
 }
 print(json.dumps(info, indent=2))
 with open('<output_dir>/model_config.json', 'w') as f:
@@ -484,12 +518,21 @@ echo "start_profile response: $PROFILE_RESP"
 echo "$PROFILE_RESP" | grep -qi "error" && { echo "FAILED to start profiler"; kill $VLLM_PID 2>/dev/null; exit 1; }
 sleep 2
 
+# Adaptive trace sizing: 5 prompts is sufficient for bottleneck analysis.
+# Hybrid architectures (mamba/linear_attention) produce ~2x trace data per iteration,
+# so token lengths are reduced to keep the trace under ~1GB.
+TRACE_NUM_PROMPTS=5; TRACE_INPUT_LEN=1024; TRACE_OUTPUT_LEN=1024; TRACE_MAX_CONC=16
+if python3 -c "import json; c=json.load(open('<output_dir>/model_config.json')); exit(0 if c.get('layer_types') or 'mamba' in str(c.get('model_type','')) else 1)" 2>/dev/null; then
+  echo "Hybrid architecture detected — reducing token lengths to keep trace <1GB"
+  TRACE_INPUT_LEN=256; TRACE_OUTPUT_LEN=256
+fi
+
 # Send requests for trace — output to file
 vllm bench serve \
   --model $1 --port 8193 \
   --dataset-name random \
-  --input-len 1024 --output-len 1024 \
-  --num-prompts 30 --max-concurrency 16 \
+  --input-len $TRACE_INPUT_LEN --output-len $TRACE_OUTPUT_LEN \
+  --num-prompts $TRACE_NUM_PROMPTS --max-concurrency $TRACE_MAX_CONC \
   --request-rate inf --save-result \
   --result-dir <output_dir>/profile --result-filename trace_benchmark.json \
   --label trace &> <output_dir>/profile/bench_trace.log
@@ -499,9 +542,11 @@ STOP_RESP=$(curl -s -X POST http://localhost:8193/stop_profile)
 echo "stop_profile response: $STOP_RESP"
 
 # Wait for trace file to be fully written (poll until size stabilizes)
+# ⚠️ Do NOT kill the server until the trace file has fully stabilized.
+# Trace flush may take 15+ minutes for large/hybrid models.
 echo "Waiting for trace flush (may take several minutes for large models)..."
 PREV_SIZE=0; STABLE=0
-for i in $(seq 1 120); do
+for i in $(seq 1 240); do
   TRACE_FILE=$(ls -S <output_dir>/profile/traces/rank*.gz 2>/dev/null | head -1)
   if [ -n "$TRACE_FILE" ]; then
     CUR_SIZE=$(stat -c%s "$TRACE_FILE" 2>/dev/null || echo 0)
@@ -579,7 +624,7 @@ export TRACELENS_DIR=/path/to/TraceLens
 
 ```bash
 cd <output_dir>/profile
-cp <output_dir>/scripts/analyze_kernels.py .
+cp <output_dir>/scripts/analyze_kernels.py <output_dir>/scripts/split_vllm_trace_annotation.py .
 
 # Full analysis: validate → split trace → run TraceLens on each phase
 # TraceLens is auto-detected or auto-cloned if not found
@@ -612,7 +657,8 @@ metrics from `unified_perf_summary.csv` (GFLOPS, TB/s, arithmetic intensity, bou
 ```bash
 cd <output_dir>/profile
 python3 -c "
-import csv, json, os, glob, ast
+import csv, json, os, glob, ast, sys
+csv.field_size_limit(sys.maxsize)
 
 # ══════════════════════════════════════════════════════════════════════════
 # Platform peak specs — used for roofline efficiency calculation.
@@ -716,6 +762,8 @@ for row in ops:
     elif 'norm' in name.lower() or 'rms' in name.lower(): reason = 'Normalization'; optimizable = True
     elif 'silu' in name.lower() or 'gelu' in name.lower(): reason = 'Activation'; optimizable = True
     elif 'copy' in name.lower() or 'memcpy' in name.lower(): reason = 'Memory op'; optimizable = False
+    elif 'fill' in name.lower(): reason = 'Memory op'; optimizable = False
+    elif 'DeltaRule' in name or 'Chunk' in name or 'Recurrent' in name: reason = 'Linear Attention'; optimizable = True
     elif 'elementwise' in cats: reason = 'Elementwise'; optimizable = True
     else: reason = 'Other'
 
@@ -868,17 +916,31 @@ TB/s, arithmetic intensity, and compute spec. Use this to determine whether each
 source <output_dir>/venv/bin/activate
 python3 -c "
 import json
-from transformers import AutoConfig
-c = AutoConfig.from_pretrained('$1', trust_remote_code=True)
+try:
+    from transformers import AutoConfig
+    config = AutoConfig.from_pretrained('$1', trust_remote_code=True)
+    d = config.to_dict()
+except Exception:
+    from huggingface_hub import hf_hub_download
+    cfg_path = hf_hub_download('$1', 'config.json')
+    with open(cfg_path) as f: d = json.load(f)
+
+tc = d.get('text_config', d)
 shapes = {
-    'hidden_size': getattr(c, 'hidden_size', None),
-    'intermediate_size': getattr(c, 'intermediate_size', None),
-    'num_attention_heads': getattr(c, 'num_attention_heads', None),
-    'num_key_value_heads': getattr(c, 'num_key_value_heads', None),
-    'head_dim': getattr(c, 'hidden_size', 0) // max(getattr(c, 'num_attention_heads', 1), 1),
-    'num_hidden_layers': getattr(c, 'num_hidden_layers', None),
-    'vocab_size': getattr(c, 'vocab_size', None),
+    'hidden_size': tc.get('hidden_size', None),
+    'intermediate_size': tc.get('intermediate_size', None),
+    'num_attention_heads': tc.get('num_attention_heads', None),
+    'num_key_value_heads': tc.get('num_key_value_heads', None),
+    'head_dim': tc.get('head_dim', tc.get('hidden_size', 0) // max(tc.get('num_attention_heads', 1), 1)),
+    'num_hidden_layers': tc.get('num_hidden_layers', None),
+    'vocab_size': tc.get('vocab_size', None),
+    'layer_types': tc.get('layer_types', None),
+    'linear_key_head_dim': tc.get('linear_key_head_dim', None),
+    'linear_value_head_dim': tc.get('linear_value_head_dim', None),
+    'linear_num_key_heads': tc.get('linear_num_key_heads', None),
+    'linear_num_value_heads': tc.get('linear_num_value_heads', None),
 }
+shapes = {k: v for k, v in shapes.items() if v is not None}
 with open('<output_dir>/profile/model_shapes.json', 'w') as f:
     json.dump(shapes, f, indent=2)
 print(json.dumps(shapes, indent=2))

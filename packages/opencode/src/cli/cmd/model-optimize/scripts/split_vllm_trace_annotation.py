@@ -534,7 +534,7 @@ def find_steady_state_iterations(iteration_roots: List[dict], num_steps: int = 5
     sub_regions=[]
     for s, e in regions:
         if (e-s)> num_steps:
-            for s1 in range(s,e,num_steps//10):
+            for s1 in range(s,e,max(1,num_steps//10)):
                 region=iter_details[s1:s1+num_steps]
                 sub_regions.append([s1, s1+num_steps,len([t for t in region if t['context_requests']>0])])
         else:
