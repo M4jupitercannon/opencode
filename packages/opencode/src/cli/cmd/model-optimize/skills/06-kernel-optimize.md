@@ -69,7 +69,7 @@ python3 {{OUTPUT_DIR}}/scripts/kernel_finalize.py \
 | **HIGH** | Fused SwiGLU | 1.5x | Activation fusion |
 | **HIGH** | Fused RoPE | 1.5x | Custom optimization |
 | MEDIUM | Individual norms | 1.3x | If not covered by fused version |
-| LOW | Linear/GEMM | 1.1x | rocBLAS usually optimal |
+| MEDIUM | Linear/GEMM | 1.1x | Check roofline efficiency vs rocBLAS |
 | **SKIP** | Simple add/copy | — | Overhead > benefit |
 
 ## When to SKIP a kernel

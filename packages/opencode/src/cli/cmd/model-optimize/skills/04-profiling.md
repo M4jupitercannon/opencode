@@ -346,7 +346,7 @@ for phase_key, report_dir in report_dirs.items():
       cats = row.get('Categories', '')
 
       optimizable = True; reason = ''
-      if 'GEMM' in cats:       reason = 'GEMM/rocBLAS'; optimizable = False
+      if 'GEMM' in cats:       reason = 'GEMM'; optimizable = True
       elif 'SDPA' in cats or 'attention' in name.lower(): reason = 'Attention'; optimizable = True
       elif 'norm' in name.lower() or 'rms' in name.lower(): reason = 'Normalization'; optimizable = True
       elif 'silu' in name.lower() or 'gelu' in name.lower(): reason = 'Activation'; optimizable = True

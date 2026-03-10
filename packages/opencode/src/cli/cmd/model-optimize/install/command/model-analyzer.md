@@ -17,9 +17,27 @@ agent: model-opt
 3. Create directory structure + `.gitignore` (exclude venv/, model/, \*.safetensors, etc.)
 4. Copy helper scripts from `~/.config/opencode/scripts/` to `<output_dir>/scripts/`
 
+## Variable Definitions
+
+Skills use `{{VAR}}` placeholders. When reading skills, substitute:
+
+| Placeholder | Value |
+|---|---|
+| `{{HF_MODEL}}` | `$1` |
+| `{{OUTPUT_DIR}}` | `$2` or `/tmp/model_opt_<short_name>` |
+| `{{PROFILE_DIR}}` | `<output_dir>/profile` |
+| `{{PROBLEMS_DIR}}` | `<output_dir>/problems` |
+| `{{OPTIMIZED_DIR}}` | `<output_dir>/optimized` |
+| `{{REPORT_DIR}}` | `<output_dir>/report` |
+| `{{INPUT_LEN}}` | `1024` |
+| `{{OUTPUT_LEN}}` | `1024` |
+| `{{NUM_PROMPTS}}` | `100` |
+| `{{CONCURRENCY}}` | `16` |
+| `{{SKIP_LABEL}}` | (empty — execute all phases) |
+
 ## CRITICAL RULES
 
-- **Docker mode** (preferred): If `env_info.json` has `env_type: "docker"`, search available docker images on dockerhub(rocm/vllm-dev:nightly preferred). prefix commands with `docker exec $CONTAINER_NAME bash -c "..."`. Set `HIP_VISIBLE_DEVICES=$BEST_GPU`.
+- **Docker mode** (preferred): If `env_info.json` has `env_type: "docker"`, search available docker images on dockerhub (rocm/vllm-dev:nightly preferred). Prefix commands with `docker exec $CONTAINER_NAME bash -c "..."`. Set `HIP_VISIBLE_DEVICES=$BEST_GPU`.
 - **venv mode** (fallback): If `env_type: "venv"`, activate venv: `source <output_dir>/venv/bin/activate`
 - **ALL vLLM commands MUST redirect output to log files** (`&> logfile`) — NEVER dump vLLM logs into bash output
 - **ALL decisions MUST be data-driven** — read shapes from TraceLens `analysis_summary.json` / `unified_perf_summary.csv`, not hardcoded
@@ -29,7 +47,7 @@ agent: model-opt
 
 # Phase 0: Environment Setup
 
-Follow `skills/00-env-setup.md`.
+Read and follow `~/.config/opencode/skills/00-env-setup.md`.
 
 Detect host platform, search DockerHub for a compatible `rocm/vllm-dev` nightly image, create container (or fall back to venv). Patches vLLM BlockSize for hybrid architectures. Saves `env_info.json`.
 
@@ -39,7 +57,7 @@ CRITICAL for all subsequent phases: If `env_type` is `docker` in `env_info.json`
 
 # Phase 1: Model Serving with vLLM
 
-Follow `skills/01-model-download.md`.
+Read and follow `~/.config/opencode/skills/01-model-download.md`.
 
 Start the model using `vllm serve` and verify inference works. Record model config (including hybrid architecture fields like `layer_types` and `architectures`). In vLLM mode, this covers download + demo + compatibility in one step.
 
@@ -61,7 +79,7 @@ If vLLM serve failed in Phase 1, debug using vLLM logs (check `--dtype`, `--tens
 
 # Phase 4: Performance Profiling
 
-Follow `skills/04-profiling.md`.
+Read and follow `~/.config/opencode/skills/04-profiling.md`.
 
 Benchmark vLLM serving throughput AND collect GPU kernel trace for bottleneck analysis. Steps:
 
