@@ -28,12 +28,13 @@ build:
 	@command -v bun >/dev/null 2>&1 || { \
 		echo "Installing bun..."; \
 		curl -fsSL https://bun.sh/install | bash; \
-		export PATH="$$HOME/.bun/bin:$$PATH"; \
-	}
-	@echo "Installing dependencies..."
-	@bun install
-	@echo "Building opencode..."
-	@cd packages/opencode && bun run build --single
+	}; \
+	export PATH="$$HOME/.bun/bin:$$PATH"; \
+	export HUSKY=0; \
+	echo "Installing dependencies..."; \
+	bun install --ignore-scripts; \
+	echo "Building opencode..."; \
+	cd packages/opencode && bun run build --single
 
 clean:
 	@rm -rf packages/opencode/dist
