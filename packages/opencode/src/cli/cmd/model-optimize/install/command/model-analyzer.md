@@ -648,11 +648,11 @@ Key output files per phase:
 - `gpu_timeline.csv` — GPU utilization (busy/idle/communication split)
 - `kernel_summary.csv` — raw kernel-level statistics
 
-## Step 4: Generate bottlenecks.json from TraceLens Results
+## Step 4: Generate per-phase bottlenecks and analysis reports
 
-Read TraceLens standalone analysis CSVs and generate the bottlenecks manifest for downstream phases.
-Uses `ops_summary.csv` for the op-level time breakdown and enriches each entry with roofline
-metrics from `unified_perf_summary.csv` (GFLOPS, TB/s, arithmetic intensity, bound type).
+Read TraceLens standalone analysis CSVs and generate bottleneck manifests **for each phase**
+(decode, prefill-decode, full). Uses `ops_summary.csv` for the op-level time breakdown and
+enriches each entry with roofline metrics from `unified_perf_summary.csv`.
 
 ```bash
 cd <output_dir>/profile
@@ -704,187 +704,207 @@ for d in sorted(glob.glob('*_report')):
     if os.path.isdir(d) and os.path.isfile(os.path.join(d, 'ops_summary.csv')):
         report_dirs[d.replace('_report', '')] = d
 
-phase_key = next((k for k in ('decode', 'prefilldecode', 'combined', 'full') if k in report_dirs), None)
-if not phase_key:
-    phase_key = list(report_dirs.keys())[0] if report_dirs else None
-if not phase_key:
+if not report_dirs:
     print('ERROR: No TraceLens report directories found.'); exit(1)
-report_dir = report_dirs[phase_key]
-print(f'Using phase: {phase_key}  (report dir: {report_dir})')
 
-# ── 1. Read ops_summary.csv ──
-ops = []
-with open(os.path.join(report_dir, 'ops_summary.csv')) as f:
-    for row in csv.DictReader(f): ops.append(row)
+for phase_key, report_dir in report_dirs.items():
+  print(f'\n{\"═\"*90}')
+  print(f'Processing phase: {phase_key}  (report dir: {report_dir})')
+  print(f'{\"═\"*90}')
 
-# ── 2. Read unified_perf_summary.csv (GEMM roofline data) ──
-unified = []
-unified_path = os.path.join(report_dir, 'unified_perf_summary.csv')
-if os.path.isfile(unified_path):
-    with open(unified_path) as f:
-        for row in csv.DictReader(f): unified.append(row)
+  # ── 1. Read ops_summary.csv ──
+  ops = []
+  with open(os.path.join(report_dir, 'ops_summary.csv')) as f:
+      for row in csv.DictReader(f): ops.append(row)
 
-op_roofline = {}
-for row in unified:
-    name = row.get('name', '')
-    op_roofline.setdefault(name, [])
-    entry = {'input_dims': row.get('Input Dims', ''), 'count': int(float(row.get('operation_count', 0) or 0))}
-    for col in ('GFLOPS', 'Data Moved (MB)', 'FLOPS/Byte', 'TB/s_mean', 'TFLOPS/s_mean', 'Percentage (%)'):
-        val = row.get(col, '')
-        if val:
-            try: entry[col] = float(val)
-            except ValueError: pass
-    entry['compute_spec'] = row.get('Compute Spec', '')
-    entry['has_perf_model'] = row.get('has_perf_model', '').lower() == 'true'
-    op_roofline[name].append(entry)
+  # ── 2. Read unified_perf_summary.csv (GEMM roofline data) ──
+  unified = []
+  unified_path = os.path.join(report_dir, 'unified_perf_summary.csv')
+  if os.path.isfile(unified_path):
+      with open(unified_path) as f:
+          for row in csv.DictReader(f): unified.append(row)
 
-# ── 3. Read ops_unique_args.csv (Attention kernel breakdown) ──
-unique_args = []
-unique_path = os.path.join(report_dir, 'ops_unique_args.csv')
-if os.path.isfile(unique_path):
-    with open(unique_path) as f:
-        for row in csv.DictReader(f): unique_args.append(row)
+  op_roofline = {}
+  for row in unified:
+      name = row.get('name', '')
+      op_roofline.setdefault(name, [])
+      entry = {'input_dims': row.get('Input Dims', ''), 'count': int(float(row.get('operation_count', 0) or 0))}
+      for col in ('GFLOPS', 'Data Moved (MB)', 'FLOPS/Byte', 'TB/s_mean', 'TFLOPS/s_mean', 'Percentage (%)'):
+          val = row.get(col, '')
+          if val:
+              try: entry[col] = float(val)
+              except ValueError: pass
+      entry['compute_spec'] = row.get('Compute Spec', '')
+      entry['has_perf_model'] = row.get('has_perf_model', '').lower() == 'true'
+      op_roofline[name].append(entry)
 
-attn_shapes = [r for r in unique_args if r.get('op category', '') == 'SDPA_fwd']
+  # ── 3. Read ops_unique_args.csv (Attention kernel breakdown) ──
+  unique_args = []
+  unique_path = os.path.join(report_dir, 'ops_unique_args.csv')
+  if os.path.isfile(unique_path):
+      with open(unique_path) as f:
+          for row in csv.DictReader(f): unique_args.append(row)
 
-# ── 4. Build bottlenecks list ──
-bottlenecks = []
-for row in ops:
-    name = row.get('name', '')
-    pct = float(row.get('Percentage (%)', 0))
-    total_ms = float(row.get('total_direct_kernel_time_ms', 0))
-    count = int(float(row.get('Count', 0)))
-    cats = row.get('Categories', '')
+  attn_shapes = [r for r in unique_args if r.get('op category', '') == 'SDPA_fwd']
 
-    optimizable = True; reason = ''
-    if 'GEMM' in cats:       reason = 'GEMM/rocBLAS'; optimizable = False
-    elif 'SDPA' in cats or 'attention' in name.lower(): reason = 'Attention'; optimizable = True
-    elif 'norm' in name.lower() or 'rms' in name.lower(): reason = 'Normalization'; optimizable = True
-    elif 'silu' in name.lower() or 'gelu' in name.lower(): reason = 'Activation'; optimizable = True
-    elif 'copy' in name.lower() or 'memcpy' in name.lower(): reason = 'Memory op'; optimizable = False
-    elif 'fill' in name.lower(): reason = 'Memory op'; optimizable = False
-    elif 'DeltaRule' in name or 'Chunk' in name or 'Recurrent' in name: reason = 'Linear Attention'; optimizable = True
-    elif 'elementwise' in cats: reason = 'Elementwise'; optimizable = True
-    else: reason = 'Other'
+  # ── 4. Build bottlenecks list ──
+  bottlenecks = []
+  for row in ops:
+      name = row.get('name', '')
+      pct = float(row.get('Percentage (%)', 0))
+      total_ms = float(row.get('total_direct_kernel_time_ms', 0))
+      count = int(float(row.get('Count', 0)))
+      cats = row.get('Categories', '')
 
-    entry = {'name': name, 'count': count, 'total_dur_ms': total_ms, 'cuda_time_percent': pct,
-             'optimizable': optimizable, 'reason': reason, 'phase': phase_key, 'categories': cats}
+      optimizable = True; reason = ''
+      if 'GEMM' in cats:       reason = 'GEMM/rocBLAS'; optimizable = False
+      elif 'SDPA' in cats or 'attention' in name.lower(): reason = 'Attention'; optimizable = True
+      elif 'norm' in name.lower() or 'rms' in name.lower(): reason = 'Normalization'; optimizable = True
+      elif 'silu' in name.lower() or 'gelu' in name.lower(): reason = 'Activation'; optimizable = True
+      elif 'copy' in name.lower() or 'memcpy' in name.lower(): reason = 'Memory op'; optimizable = False
+      elif 'fill' in name.lower(): reason = 'Memory op'; optimizable = False
+      elif 'DeltaRule' in name or 'Chunk' in name or 'Recurrent' in name: reason = 'Linear Attention'; optimizable = True
+      elif 'elementwise' in cats: reason = 'Elementwise'; optimizable = True
+      else: reason = 'Other'
 
-    shapes = op_roofline.get(name, [])
-    if shapes:
-        top_shapes = sorted(shapes, key=lambda s: s.get('Percentage (%)', 0), reverse=True)[:5]
-        entry['top_shapes'] = []
-        for s in top_shapes:
-            se = {'input_dims': s['input_dims'], 'count': s['count']}
-            for k, jk in [('GFLOPS','gflops'),('Data Moved (MB)','data_moved_mb'),('FLOPS/Byte','flops_per_byte'),
-                          ('TFLOPS/s_mean','tflops_per_s'),('TB/s_mean','tb_per_s'),('Percentage (%)','pct_of_total')]:
-                if k in s: se[jk] = s[k]
-            if s.get('compute_spec'): se['compute_spec'] = s['compute_spec']
-            if 'FLOPS/Byte' in s and 'TFLOPS/s_mean' in s and 'TB/s_mean' in s:
-                eff, bound = roofline_eff(s['FLOPS/Byte'], s['TFLOPS/s_mean'], s['TB/s_mean'])
-                se['roofline_efficiency_pct'] = round(eff, 2)
-                se['bound'] = bound
-            entry['top_shapes'].append(se)
-    bottlenecks.append(entry)
+      entry = {'name': name, 'count': count, 'total_dur_ms': total_ms, 'cuda_time_percent': pct,
+               'optimizable': optimizable, 'reason': reason, 'phase': phase_key, 'categories': cats}
 
-# ══════════════════════════════════════════════════════════════════════════
-# 5. Print summary
-# ══════════════════════════════════════════════════════════════════════════
-total_ms = sum(b['total_dur_ms'] for b in bottlenecks)
-print(f'\nTotal GPU time ({phase_key}): {total_ms:.2f} ms')
-print(f'Top bottlenecks:')
-print(f'  {\"#\":>3s}  {\"Op\":45s} {\"Time%\":>6s} {\"Time(ms)\":>9s} {\"Count\":>6s}  Category')
-print(f'  {\"─\"*85}')
-for i, b in enumerate(bottlenecks[:15], 1):
-    flag = '🔒' if not b['optimizable'] else '  '
-    print(f'  {i:3d}. {flag}{b[\"name\"][:43]:<43s} {b[\"cuda_time_percent\"]:5.1f}% {b[\"total_dur_ms\"]:9.2f} {b[\"count\"]:6d}  {b[\"reason\"]}')
-    for s in b.get('top_shapes', [])[:2]:
-        tflops = f'{s[\"tflops_per_s\"]:.1f} TFLOPS/s' if 'tflops_per_s' in s else ''
-        tbps = f'{s[\"tb_per_s\"]:.2f} TB/s' if 'tb_per_s' in s else ''
-        print(f'       └─ {s[\"input_dims\"][:60]:60s} {s.get(\"pct_of_total\",0):5.1f}%  {tflops}  {tbps}')
+      shapes = op_roofline.get(name, [])
+      if shapes:
+          top_shapes = sorted(shapes, key=lambda s: s.get('Percentage (%)', 0), reverse=True)[:5]
+          entry['top_shapes'] = []
+          for s in top_shapes:
+              se = {'input_dims': s['input_dims'], 'count': s['count']}
+              for k, jk in [('GFLOPS','gflops'),('Data Moved (MB)','data_moved_mb'),('FLOPS/Byte','flops_per_byte'),
+                            ('TFLOPS/s_mean','tflops_per_s'),('TB/s_mean','tb_per_s'),('Percentage (%)','pct_of_total')]:
+                  if k in s: se[jk] = s[k]
+              if s.get('compute_spec'): se['compute_spec'] = s['compute_spec']
+              if 'FLOPS/Byte' in s and 'TFLOPS/s_mean' in s and 'TB/s_mean' in s:
+                  eff, bound = roofline_eff(s['FLOPS/Byte'], s['TFLOPS/s_mean'], s['TB/s_mean'])
+                  se['roofline_efficiency_pct'] = round(eff, 2)
+                  se['bound'] = bound
+              entry['top_shapes'].append(se)
+      bottlenecks.append(entry)
 
-# ══════════════════════════════════════════════════════════════════════════
-# 6. GEMM Roofline Efficiency (per-shape)
-# ══════════════════════════════════════════════════════════════════════════
-gemm_shapes = []
-for row in unified:
-    if row.get('op category', '') != 'GEMM': continue
-    fb = row.get('FLOPS/Byte', ''); ts = row.get('TFLOPS/s_mean', ''); bs = row.get('TB/s_mean', '')
-    if not (fb and ts and bs): continue
-    fb, ts, bs = float(fb), float(ts), float(bs)
-    eff, bound = roofline_eff(fb, ts, bs)
-    gemm_shapes.append({
-        'dims': row.get('Input Dims',''), 'count': int(float(row.get('operation_count',0) or 0)),
-        'pct': float(row.get('Percentage (%)',0)), 'gflops': float(row.get('GFLOPS',0)),
-        'data_mb': float(row.get('Data Moved (MB)',0)), 'flops_byte': fb,
-        'tflops_s': ts, 'tb_s': bs, 'eff': eff, 'bound': bound,
-    })
+  # ══════════════════════════════════════════════════════════════════════════
+  # 5. Print summary
+  # ══════════════════════════════════════════════════════════════════════════
+  total_ms = sum(b['total_dur_ms'] for b in bottlenecks)
+  print(f'\nTotal GPU time ({phase_key}): {total_ms:.2f} ms')
+  print(f'Top bottlenecks:')
+  print(f'  {\"#\":>3s}  {\"Op\":45s} {\"Time%\":>6s} {\"Time(ms)\":>9s} {\"Count\":>6s}  Category')
+  print(f'  {\"─\"*85}')
+  for i, b in enumerate(bottlenecks[:15], 1):
+      flag = '🔒' if not b['optimizable'] else '  '
+      print(f'  {i:3d}. {flag}{b[\"name\"][:43]:<43s} {b[\"cuda_time_percent\"]:5.1f}% {b[\"total_dur_ms\"]:9.2f} {b[\"count\"]:6d}  {b[\"reason\"]}')
+      for s in b.get('top_shapes', [])[:2]:
+          tflops = f'{s[\"tflops_per_s\"]:.1f} TFLOPS/s' if 'tflops_per_s' in s else ''
+          tbps = f'{s[\"tb_per_s\"]:.2f} TB/s' if 'tb_per_s' in s else ''
+          print(f'       └─ {s[\"input_dims\"][:60]:60s} {s.get(\"pct_of_total\",0):5.1f}%  {tflops}  {tbps}')
 
-if gemm_shapes:
-    print(f'\n{\"═\"*110}')
-    print(f'  GEMM ROOFLINE EFFICIENCY ({phase_key} phase, {gpu_name})')
-    print(f'  Peak: {PEAK_BF16_TFLOPS} TFLOPS BF16 | {PEAK_MEM_BW_TBPS} TB/s | Ridge: {RIDGE_POINT:.1f} FLOPS/Byte')
-    print(f'{\"═\"*110}')
-    print(f'  {\"Input Dims\":45s} {\"Time%\":>6s} {\"GFLOPS\":>8s} {\"Data(MB)\":>9s} {\"FL/B\":>7s} {\"TFLOPS/s\":>9s} {\"TB/s\":>7s} {\"Bound\":>8s} {\"Eff%\":>6s}')
-    print(f'  {\"─\"*106}')
-    for s in sorted(gemm_shapes, key=lambda x: x['pct'], reverse=True):
-        dims_short = s['dims'].replace('((','(').replace('))',')')[:45]
-        bound_tag = 'MEM' if s['bound'] == 'memory' else 'COMP'
-        print(f'  {dims_short:45s} {s[\"pct\"]:5.1f}% {s[\"gflops\"]:8.1f} {s[\"data_mb\"]:9.1f} {s[\"flops_byte\"]:7.1f} {s[\"tflops_s\"]:9.2f} {s[\"tb_s\"]:7.3f} {bound_tag:>8s} {s[\"eff\"]:5.1f}%')
+  # ══════════════════════════════════════════════════════════════════════════
+  # 6. GEMM Roofline Efficiency (per-shape)
+  # ══════════════════════════════════════════════════════════════════════════
+  gemm_shapes = []
+  for row in unified:
+      if row.get('op category', '') != 'GEMM': continue
+      fb = row.get('FLOPS/Byte', ''); ts = row.get('TFLOPS/s_mean', ''); bs = row.get('TB/s_mean', '')
+      if not (fb and ts and bs): continue
+      fb, ts, bs = float(fb), float(ts), float(bs)
+      eff, bound = roofline_eff(fb, ts, bs)
+      gemm_shapes.append({
+          'dims': row.get('Input Dims',''), 'count': int(float(row.get('operation_count',0) or 0)),
+          'pct': float(row.get('Percentage (%)',0)), 'gflops': float(row.get('GFLOPS',0)),
+          'data_mb': float(row.get('Data Moved (MB)',0)), 'flops_byte': fb,
+          'tflops_s': ts, 'tb_s': bs, 'eff': eff, 'bound': bound,
+      })
 
-# ══════════════════════════════════════════════════════════════════════════
-# 7. Attention Kernel Breakdown (per-shape from ops_unique_args.csv)
-# ══════════════════════════════════════════════════════════════════════════
-if attn_shapes:
-    print(f'\n{\"═\"*110}')
-    print(f'  ATTENTION (SDPA) KERNEL BREAKDOWN ({phase_key} phase)')
-    print(f'  Note: TraceLens does not compute GFLOPS/TB/s for SDPA — showing kernel time breakdown')
-    print(f'{\"═\"*110}')
-    print(f'  {\"Input Dims\":50s} {\"Time%\":>6s} {\"Count\":>6s} {\"Avg(us)\":>9s} {\"Sub-kernels\":40s}')
-    print(f'  {\"─\"*115}')
-    for row in attn_shapes:
-        dims = row.get('Input Dims','')[:50]
-        pct = float(row.get('Percentage (%)',0))
-        cnt = int(float(row.get('operation_count',0)))
-        avg = float(row.get('total_direct_kernel_time_mean',0))
-        # Parse kernel breakdown from trunc_kernel_details
-        kdetails = row.get('trunc_kernel_details', '')
-        sub_kernels = []
-        if kdetails:
-            try:
-                parts = ast.literal_eval(kdetails.replace('np.float64(','').replace(')',''))
-                for p in parts:
-                    kname = p.get('name','')[:30]
-                    kdur = p.get('mean_duration_us', 0)
-                    sub_kernels.append(f'{kname}={kdur:.1f}us')
-            except Exception:
-                sub_kernels = ['(parse error)']
-        sk_str = ', '.join(sub_kernels)[:40] if sub_kernels else ''
-        print(f'  {dims:50s} {pct:5.1f}% {cnt:6d} {avg:9.1f} {sk_str:40s}')
-    # Estimate attention mem BW utilization from raw kernel time + data size heuristic
-    for row in attn_shapes:
-        dims_str = row.get('Input Dims','')
-        try:
-            parsed = ast.literal_eval(dims_str)
-            if len(parsed) >= 4:
-                q_shape = parsed[0]; k_shape = parsed[1]; v_shape = parsed[2]
-                batch = q_shape[0]; heads = q_shape[1]; head_dim = q_shape[2]
-                kv_heads = k_shape[1]; seq_est = 1
-                data_bytes = 2 * (batch * heads * head_dim + 2 * batch * kv_heads * head_dim + batch * heads * head_dim)
-                data_mb = data_bytes / 1e6
-                avg_us = float(row.get('total_direct_kernel_time_mean',0))
-                if avg_us > 0:
-                    est_tb_s = (data_mb / 1e6) / (avg_us / 1e6)
-                    est_bw_eff = (est_tb_s / PEAK_MEM_BW_TBPS) * 100
-                    print(f'  Attention est. data/call: {data_mb:.3f} MB, est. BW: {est_tb_s:.3f} TB/s, est. BW eff: {est_bw_eff:.1f}% (Q/K/V only, excl. KV cache)')
-        except Exception:
-            pass
+  if gemm_shapes:
+      print(f'\n{\"═\"*110}')
+      print(f'  GEMM ROOFLINE EFFICIENCY ({phase_key} phase, {gpu_name})')
+      print(f'  Peak: {PEAK_BF16_TFLOPS} TFLOPS BF16 | {PEAK_MEM_BW_TBPS} TB/s | Ridge: {RIDGE_POINT:.1f} FLOPS/Byte')
+      print(f'{\"═\"*110}')
+      print(f'  {\"Input Dims\":45s} {\"Time%\":>6s} {\"GFLOPS\":>8s} {\"Data(MB)\":>9s} {\"FL/B\":>7s} {\"TFLOPS/s\":>9s} {\"TB/s\":>7s} {\"Bound\":>8s} {\"Eff%\":>6s}')
+      print(f'  {\"─\"*106}')
+      for s in sorted(gemm_shapes, key=lambda x: x['pct'], reverse=True):
+          dims_short = s['dims'].replace('((','(').replace('))',')')[:45]
+          bound_tag = 'MEM' if s['bound'] == 'memory' else 'COMP'
+          print(f'  {dims_short:45s} {s[\"pct\"]:5.1f}% {s[\"gflops\"]:8.1f} {s[\"data_mb\"]:9.1f} {s[\"flops_byte\"]:7.1f} {s[\"tflops_s\"]:9.2f} {s[\"tb_s\"]:7.3f} {bound_tag:>8s} {s[\"eff\"]:5.1f}%')
 
-print(f'\n{\"═\"*110}')
+  # ══════════════════════════════════════════════════════════════════════════
+  # 7. Attention Kernel Breakdown (per-shape from ops_unique_args.csv)
+  # ══════════════════════════════════════════════════════════════════════════
+  if attn_shapes:
+      print(f'\n{\"═\"*110}')
+      print(f'  ATTENTION (SDPA) KERNEL BREAKDOWN ({phase_key} phase)')
+      print(f'  Note: TraceLens does not compute GFLOPS/TB/s for SDPA — showing kernel time breakdown')
+      print(f'{\"═\"*110}')
+      print(f'  {\"Input Dims\":50s} {\"Time%\":>6s} {\"Count\":>6s} {\"Avg(us)\":>9s} {\"Sub-kernels\":40s}')
+      print(f'  {\"─\"*115}')
+      for row in attn_shapes:
+          dims = row.get('Input Dims','')[:50]
+          pct = float(row.get('Percentage (%)',0))
+          cnt = int(float(row.get('operation_count',0)))
+          avg = float(row.get('total_direct_kernel_time_mean',0))
+          kdetails = row.get('trunc_kernel_details', '')
+          sub_kernels = []
+          if kdetails:
+              try:
+                  parts = ast.literal_eval(kdetails.replace('np.float64(','').replace(')',''))
+                  for p in parts:
+                      kname = p.get('name','')[:30]
+                      kdur = p.get('mean_duration_us', 0)
+                      sub_kernels.append(f'{kname}={kdur:.1f}us')
+              except Exception:
+                  sub_kernels = ['(parse error)']
+          sk_str = ', '.join(sub_kernels)[:40] if sub_kernels else ''
+          print(f'  {dims:50s} {pct:5.1f}% {cnt:6d} {avg:9.1f} {sk_str:40s}')
+      for row in attn_shapes:
+          dims_str = row.get('Input Dims','')
+          try:
+              parsed = ast.literal_eval(dims_str)
+              if len(parsed) >= 4:
+                  q_shape = parsed[0]; k_shape = parsed[1]; v_shape = parsed[2]
+                  batch = q_shape[0]; heads = q_shape[1]; head_dim = q_shape[2]
+                  kv_heads = k_shape[1]; seq_est = 1
+                  data_bytes = 2 * (batch * heads * head_dim + 2 * batch * kv_heads * head_dim + batch * heads * head_dim)
+                  data_mb = data_bytes / 1e6
+                  avg_us = float(row.get('total_direct_kernel_time_mean',0))
+                  if avg_us > 0:
+                      est_tb_s = (data_mb / 1e6) / (avg_us / 1e6)
+                      est_bw_eff = (est_tb_s / PEAK_MEM_BW_TBPS) * 100
+                      print(f'  Attention est. data/call: {data_mb:.3f} MB, est. BW: {est_tb_s:.3f} TB/s, est. BW eff: {est_bw_eff:.1f}% (Q/K/V only, excl. KV cache)')
+          except Exception:
+              pass
 
-with open('bottlenecks.json', 'w') as f:
-    json.dump(bottlenecks, f, indent=2)
-print(f'Saved bottlenecks.json ({len(bottlenecks)} entries from {phase_key} phase)')
+  print(f'\n{\"═\"*110}')
+
+  # ── 8. Save per-phase bottlenecks and analysis ──
+  with open(f'{phase_key}_bottlenecks.json', 'w') as f:
+      json.dump(bottlenecks, f, indent=2)
+  print(f'Saved {phase_key}_bottlenecks.json ({len(bottlenecks)} entries)')
+
+  analysis = {
+      'phase': phase_key,
+      'platform': {'gpu': gpu_name, 'peak_mem_bw_tbps': PEAK_MEM_BW_TBPS, 'peak_bf16_tflops': PEAK_BF16_TFLOPS, 'ridge_point': round(RIDGE_POINT, 1)},
+      'category_breakdown': [{
+          'category': row.get('op category', ''), 'count': int(float(row.get('Count', 0))),
+          'total_kernel_time_ms': float(row.get('total_direct_kernel_time_ms', 0)),
+          'percentage': float(row.get('Percentage (%)', 0)),
+      } for row in (list(csv.DictReader(open(os.path.join(report_dir, 'ops_summary_by_category.csv')))) if os.path.isfile(os.path.join(report_dir, 'ops_summary_by_category.csv')) else [])],
+      'gemm_roofline': sorted(gemm_shapes, key=lambda x: x['pct'], reverse=True),
+      'top_bottlenecks': [{'name': b['name'], 'cuda_time_percent': b['cuda_time_percent'], 'total_dur_ms': b['total_dur_ms'], 'reason': b['reason'], 'optimizable': b['optimizable']} for b in bottlenecks[:15]],
+  }
+  with open(f'{phase_key}_analysis.json', 'w') as f:
+      json.dump(analysis, f, indent=2)
+  print(f'Saved {phase_key}_analysis.json')
+
+# ── Backward compat: copy best phase to bottlenecks.json ──
+best = next((k for k in ('decode', 'prefilldecode', 'combined', 'full') if f'{k}_bottlenecks.json' in os.listdir('.')), list(report_dirs.keys())[0])
+import shutil
+shutil.copy2(f'{best}_bottlenecks.json', 'bottlenecks.json')
+print(f'\nbottlenecks.json -> {best}_bottlenecks.json (backward compat)')
 
 # Also save per-phase category summary for quick reference
 phase_summary = {}
@@ -973,8 +993,12 @@ This data was collected with `--enforce-eager` and `torch_profiler_record_shapes
 | ...      | ...   | ...       | ...     | ...  | ...       | ...   |
 
 ## Files Generated
-- profile/bottlenecks.json - Kernel bottleneck ranking
+- profile/decode_bottlenecks.json - Bottlenecks from decode-only phase
+- profile/decode_analysis.json - Analysis report for decode phase (categories, GEMM roofline, top bottlenecks)
+- profile/prefilldecode_bottlenecks.json - Bottlenecks from prefill-decode phase
+- profile/prefilldecode_analysis.json - Analysis report for prefill-decode phase
 - profile/analysis_summary.json - TraceLens analysis summary (all phases)
+- profile/phase_category_summary.json - Per-phase category breakdown
 - profile/phase_traces/ - Split trace files (steady-state, prefill-decode, decode-only)
 - profile/prefilldecode_report/ - TraceLens CSVs for prefill-decode phase
 - profile/decode_report/ - TraceLens CSVs for decode-only phase
