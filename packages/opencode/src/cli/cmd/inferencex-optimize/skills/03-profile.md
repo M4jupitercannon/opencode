@@ -77,6 +77,19 @@ print('Patched benchmark scripts with --profiler-config')
 
 This only modifies the copy inside the container, not the host repo.
 
+### 3b. Disable Relay Trace Staging
+The `move_profile_trace_for_relay()` function in `benchmark_lib.sh` copies the rank trace to the repo root as a relay file. This is for CI/CD workflows and not needed here — we collect rank traces directly from the profiles directory. Neutralize it inside the container:
+```bash
+docker exec "$CONTAINER_NAME" python3 -c "
+with open('/workspace/benchmarks/benchmark_lib.sh') as f:
+    content = f.read()
+content = content.replace('move_profile_trace_for_relay', '# move_profile_trace_for_relay')
+with open('/workspace/benchmarks/benchmark_lib.sh', 'w') as f:
+    f.write(content)
+print('Disabled move_profile_trace_for_relay')
+"
+```
+
 ### 4. Run Each Profile via `docker exec`
 For each selected config, run the benchmark script with profiling env vars inside the persistent container.
 
@@ -123,14 +136,23 @@ docker rm "$CONTAINER_NAME"
 ```
 
 ### 6. Collect Profile Traces and Benchmark Results
-Copy the **actual torch profiler traces** (produced by vLLM to `VLLM_TORCH_PROFILER_DIR`), relay traces, and benchmark result JSONs:
+Copy the **actual torch profiler traces** (produced by vLLM to `VLLM_TORCH_PROFILER_DIR`) and benchmark result JSONs to the output directory, then clean up all generated files from the repo:
 ```bash
 # Torch profiler traces written by vLLM to the profiles subdirectory
-cp {{REPO_DIR}}/profiles/*.json* "{{PROFILE_DIR}}/" 2>/dev/null || true
+# Skip async_llm traces (CPU-side scheduling only, not needed for GPU analysis)
+for f in {{REPO_DIR}}/profiles/*.json*; do
+    [ -f "$f" ] || continue
+    case "$(basename "$f")" in
+        *async_llm*) rm -f "$f" ;;
+        *)           cp "$f" "{{PROFILE_DIR}}/" && rm -f "$f" ;;
+    esac
+done
 
 # Copy benchmark result JSONs from the repo to the output results directory
 mkdir -p "{{OUTPUT_DIR}}/results"
 cp {{REPO_DIR}}/results/*.json "{{OUTPUT_DIR}}/results/" 2>/dev/null || true
+rm -f {{REPO_DIR}}/results/*.json 2>/dev/null || true
+
 echo "Collected trace files:"
 ls -lh "{{PROFILE_DIR}}/"
 echo "Collected benchmark results:"

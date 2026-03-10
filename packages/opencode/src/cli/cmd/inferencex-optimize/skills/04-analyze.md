@@ -94,7 +94,7 @@ echo "DOCKER_LOG: $DOCKER_LOG"
 docker exec "$TRACELENS_CONTAINER" bash -c '
     if ! command -v TraceLens_generate_perf_report_pytorch &>/dev/null; then
         echo "Installing TraceLens..."
-        pip install git+https://github.com/AMD-AIG-AIMA/TraceLens.git
+        pip install git+https://github.com/AMD-AGI/TraceLens.git
     fi
     TraceLens_generate_perf_report_pytorch --help > /dev/null 2>&1 && echo "TraceLens CLI available" || echo "ERROR: TraceLens CLI not found"
 ' > "$DOCKER_LOG" 2>&1

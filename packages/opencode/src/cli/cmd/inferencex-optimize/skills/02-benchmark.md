@@ -112,6 +112,11 @@ echo "Benchmark exit code: $?"
 Do NOT print or display the contents of the docker log file. The log is saved for debugging purposes only.
 
 After each benchmark run, copy result files from the repo directory to `{{OUTPUT_DIR}}/results/`.
+Then remove the copied result files from the repo directory to keep it clean:
+```bash
+cp {{REPO_DIR}}/results/${RESULT_FILENAME}*.json "{{OUTPUT_DIR}}/results/" 2>/dev/null || true
+rm -f {{REPO_DIR}}/results/${RESULT_FILENAME}*.json 2>/dev/null || true
+```
 Log the result filename and status, then proceed to the next config.
 
 ### 7. Clean Up Container
