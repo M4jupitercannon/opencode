@@ -127,6 +127,29 @@ print(best)
 ")
   echo "Best GPU: cuda:$BEST_GPU"
 
+  # Patch vLLM BlockSize for hybrid architectures (mamba/linear_attention)
+  # that require non-standard block sizes (e.g. block_size=528).
+  # Safe: the computed block size is always a multiple of 16 (kernel alignment).
+  docker exec "$CONTAINER_NAME" bash -c "
+    python3 -c \"
+from typing import get_args
+from vllm.config.cache import BlockSize
+sizes = get_args(BlockSize)
+if max(sizes) < 512:
+    cache_file = '/usr/local/lib/python3.12/dist-packages/vllm/config/cache.py'
+    with open(cache_file) as f: src = f.read()
+    old = f'BlockSize = Literal[{\\\", \\\".join(str(s) for s in sizes)}]'
+    new = old.rstrip(']') + ', 528]'
+    if old in src:
+        with open(cache_file, 'w') as f: f.write(src.replace(old, new))
+        print('Patched BlockSize to include 528 (hybrid arch support)')
+    else:
+        print('BlockSize definition not found — patch skipped')
+else:
+    print(f'BlockSize already includes large values: {sizes}')
+\"
+  "
+
   # Save environment info
   docker exec "$CONTAINER_NAME" bash -c "
     mkdir -p /workspace/output

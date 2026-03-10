@@ -161,12 +161,21 @@ echo "start_profile response: $PROFILE_RESP"
 echo "$PROFILE_RESP" | grep -qi "error" && { echo "⛔ FAILED to start profiler — check vllm_trace.log"; kill $VLLM_PID 2>/dev/null; exit 1; }
 sleep 2
 
+# Adaptive trace sizing: 5 prompts is sufficient for bottleneck analysis.
+# Hybrid architectures (mamba/linear_attention) produce ~2x trace data per iteration,
+# so token lengths are reduced to keep the trace under ~1GB.
+TRACE_NUM_PROMPTS=5; TRACE_INPUT_LEN={{INPUT_LEN}}; TRACE_OUTPUT_LEN={{OUTPUT_LEN}}; TRACE_MAX_CONC={{CONCURRENCY}}
+if python3 -c "import json; c=json.load(open('{{OUTPUT_DIR}}/model_config.json')); exit(0 if c.get('layer_types') or 'mamba' in str(c.get('model_type','')) else 1)" 2>/dev/null; then
+  echo "Hybrid architecture detected — reducing token lengths to keep trace <1GB"
+  TRACE_INPUT_LEN=256; TRACE_OUTPUT_LEN=256
+fi
+
 # Send requests for trace — output to file
 vllm bench serve \
   --model {{HF_MODEL}} --port 8193 \
   --dataset-name random \
-  --input-len {{INPUT_LEN}} --output-len {{OUTPUT_LEN}} \
-  --num-prompts 30 --max-concurrency {{CONCURRENCY}} \
+  --input-len $TRACE_INPUT_LEN --output-len $TRACE_OUTPUT_LEN \
+  --num-prompts $TRACE_NUM_PROMPTS --max-concurrency $TRACE_MAX_CONC \
   --request-rate inf --save-result \
   --result-dir {{PROFILE_DIR}} --result-filename trace_benchmark.json \
   --label trace &> {{PROFILE_DIR}}/bench_trace.log
@@ -176,9 +185,11 @@ STOP_RESP=$(curl -s -X POST http://localhost:8193/stop_profile)
 echo "stop_profile response: $STOP_RESP"
 
 # Wait for trace file to be fully written (poll until size stabilizes)
+# ⚠️ Do NOT kill the server until the trace file has fully stabilized.
+# Trace flush may take 15+ minutes for large/hybrid models.
 echo "Waiting for trace flush (may take several minutes for large models)..."
 PREV_SIZE=0; STABLE=0
-for i in $(seq 1 120); do
+for i in $(seq 1 240); do
   TRACE_FILE=$(ls -S {{PROFILE_DIR}}/traces/rank*.gz 2>/dev/null | head -1)
   if [ -n "$TRACE_FILE" ]; then
     CUR_SIZE=$(stat -c%s "$TRACE_FILE" 2>/dev/null || echo 0)
@@ -226,7 +237,7 @@ The `analyze_kernels.py` script handles trace splitting and TraceLens analysis i
 
 ```bash
 cd {{PROFILE_DIR}}
-cp {{OUTPUT_DIR}}/scripts/analyze_kernels.py .
+cp {{OUTPUT_DIR}}/scripts/analyze_kernels.py {{OUTPUT_DIR}}/scripts/split_vllm_trace_annotation.py .
 
 # TraceLens is auto-discovered or cloned from GitHub if not found.
 # Use --tracelens-dir to point to a local copy, or set TRACELENS_DIR env var.
@@ -241,35 +252,222 @@ This produces:
 - `decode_report/` — TraceLens CSVs for decode-only phase
 - `analysis_summary.json` — machine-readable summary with roofline data
 
-## Step 4: Generate bottlenecks.json from TraceLens Results
+## Step 4: Generate per-phase bottlenecks and analysis reports
 
-See `model-optimize.md` Phase 4, Step 4 for the full inline script that:
+Read TraceLens standalone analysis CSVs and generate bottleneck manifests **for each phase**
+(decode, prefill-decode, full). Uses `ops_summary.csv` for the op-level time breakdown and
+enriches each entry with roofline metrics from `unified_perf_summary.csv`.
 
-- Reads TraceLens `ops_summary.csv` and `unified_perf_summary.csv`
-- Calculates roofline efficiency for GEMM kernels
-- Breaks down Attention (SDPA) sub-kernels
-- Produces `bottlenecks.json` with per-shape roofline data
+```bash
+cd {{PROFILE_DIR}}
+python3 -c "
+import csv, json, os, glob, ast, sys
+csv.field_size_limit(sys.maxsize)
+
+PLATFORM_PEAKS = {
+    'MI300X': {'mem_bw_tbps': 5.3, 'matrix_bf16_tflops': 708, 'matrix_fp16_tflops': 654, 'matrix_fp8_tflops': 1273},
+    'MI325X': {'mem_bw_tbps': 6.0, 'matrix_bf16_tflops': 843, 'matrix_fp16_tflops': 794, 'matrix_fp8_tflops': 1519},
+    'MI355X': {'mem_bw_tbps': 8.0, 'matrix_bf16_tflops': 1686, 'matrix_fp16_tflops': 1686, 'matrix_fp8_tflops': 3567},
+}
+gpu_name = 'MI300X'
+try:
+    import subprocess
+    out = subprocess.check_output(['rocm-smi', '--showproductname'], text=True, timeout=5)
+    for name in PLATFORM_PEAKS:
+        if name in out:
+            gpu_name = name; break
+except Exception:
+    pass
+
+peak = PLATFORM_PEAKS[gpu_name]
+PEAK_MEM_BW_TBPS = peak['mem_bw_tbps']
+PEAK_BF16_TFLOPS = peak['matrix_bf16_tflops']
+RIDGE_POINT = PEAK_BF16_TFLOPS / PEAK_MEM_BW_TBPS
+print(f'Platform: {gpu_name}  Peak BW: {PEAK_MEM_BW_TBPS} TB/s  Peak BF16: {PEAK_BF16_TFLOPS} TFLOPS  Ridge: {RIDGE_POINT:.1f} FLOPS/Byte')
+
+def roofline_eff(flops_byte, tflops_s, tb_s):
+    if flops_byte < RIDGE_POINT:
+        eff = (tb_s / PEAK_MEM_BW_TBPS) * 100 if PEAK_MEM_BW_TBPS else 0
+        return eff, 'memory'
+    else:
+        eff = (tflops_s / PEAK_BF16_TFLOPS) * 100 if PEAK_BF16_TFLOPS else 0
+        return eff, 'compute'
+
+report_dirs = {}
+for d in sorted(glob.glob('*_report')):
+    if os.path.isdir(d) and os.path.isfile(os.path.join(d, 'ops_summary.csv')):
+        report_dirs[d.replace('_report', '')] = d
+
+if not report_dirs:
+    print('ERROR: No TraceLens report directories found.'); exit(1)
+
+for phase_key, report_dir in report_dirs.items():
+  print(f'\n{\"═\"*90}')
+  print(f'Processing phase: {phase_key}  (report dir: {report_dir})')
+  print(f'{\"═\"*90}')
+
+  ops = []
+  with open(os.path.join(report_dir, 'ops_summary.csv')) as f:
+      for row in csv.DictReader(f): ops.append(row)
+
+  unified = []
+  unified_path = os.path.join(report_dir, 'unified_perf_summary.csv')
+  if os.path.isfile(unified_path):
+      with open(unified_path) as f:
+          for row in csv.DictReader(f): unified.append(row)
+
+  op_roofline = {}
+  for row in unified:
+      name = row.get('name', '')
+      op_roofline.setdefault(name, [])
+      entry = {'input_dims': row.get('Input Dims', ''), 'count': int(float(row.get('operation_count', 0) or 0))}
+      for col in ('GFLOPS', 'Data Moved (MB)', 'FLOPS/Byte', 'TB/s_mean', 'TFLOPS/s_mean', 'Percentage (%)'):
+          val = row.get(col, '')
+          if val:
+              try: entry[col] = float(val)
+              except ValueError: pass
+      entry['compute_spec'] = row.get('Compute Spec', '')
+      entry['has_perf_model'] = row.get('has_perf_model', '').lower() == 'true'
+      op_roofline[name].append(entry)
+
+  unique_args = []
+  unique_path = os.path.join(report_dir, 'ops_unique_args.csv')
+  if os.path.isfile(unique_path):
+      with open(unique_path) as f:
+          for row in csv.DictReader(f): unique_args.append(row)
+  attn_shapes = [r for r in unique_args if r.get('op category', '') == 'SDPA_fwd']
+
+  bottlenecks = []
+  for row in ops:
+      name = row.get('name', '')
+      pct = float(row.get('Percentage (%)', 0))
+      total_ms = float(row.get('total_direct_kernel_time_ms', 0))
+      count = int(float(row.get('Count', 0)))
+      cats = row.get('Categories', '')
+
+      optimizable = True; reason = ''
+      if 'GEMM' in cats:       reason = 'GEMM/rocBLAS'; optimizable = False
+      elif 'SDPA' in cats or 'attention' in name.lower(): reason = 'Attention'; optimizable = True
+      elif 'norm' in name.lower() or 'rms' in name.lower(): reason = 'Normalization'; optimizable = True
+      elif 'silu' in name.lower() or 'gelu' in name.lower(): reason = 'Activation'; optimizable = True
+      elif 'copy' in name.lower() or 'memcpy' in name.lower(): reason = 'Memory op'; optimizable = False
+      elif 'fill' in name.lower(): reason = 'Memory op'; optimizable = False
+      elif 'DeltaRule' in name or 'Chunk' in name or 'Recurrent' in name: reason = 'Linear Attention'; optimizable = True
+      elif 'elementwise' in cats: reason = 'Elementwise'; optimizable = True
+      else: reason = 'Other'
+
+      entry = {'name': name, 'count': count, 'total_dur_ms': total_ms, 'cuda_time_percent': pct,
+               'optimizable': optimizable, 'reason': reason, 'phase': phase_key, 'categories': cats}
+
+      shapes = op_roofline.get(name, [])
+      if shapes:
+          top_shapes = sorted(shapes, key=lambda s: s.get('Percentage (%)', 0), reverse=True)[:5]
+          entry['top_shapes'] = []
+          for s in top_shapes:
+              se = {'input_dims': s['input_dims'], 'count': s['count']}
+              for k, jk in [('GFLOPS','gflops'),('Data Moved (MB)','data_moved_mb'),('FLOPS/Byte','flops_per_byte'),
+                            ('TFLOPS/s_mean','tflops_per_s'),('TB/s_mean','tb_per_s'),('Percentage (%)','pct_of_total')]:
+                  if k in s: se[jk] = s[k]
+              if s.get('compute_spec'): se['compute_spec'] = s['compute_spec']
+              if 'FLOPS/Byte' in s and 'TFLOPS/s_mean' in s and 'TB/s_mean' in s:
+                  eff, bound = roofline_eff(s['FLOPS/Byte'], s['TFLOPS/s_mean'], s['TB/s_mean'])
+                  se['roofline_efficiency_pct'] = round(eff, 2)
+                  se['bound'] = bound
+              entry['top_shapes'].append(se)
+      bottlenecks.append(entry)
+
+  total_ms = sum(b['total_dur_ms'] for b in bottlenecks)
+  print(f'\nTotal GPU time ({phase_key}): {total_ms:.2f} ms')
+  print(f'Top bottlenecks:')
+  print(f'  {\"#\":>3s}  {\"Op\":45s} {\"Time%\":>6s} {\"Time(ms)\":>9s} {\"Count\":>6s}  Category')
+  print(f'  {\"─\"*85}')
+  for i, b in enumerate(bottlenecks[:15], 1):
+      flag = 'X ' if not b['optimizable'] else '  '
+      print(f'  {i:3d}. {flag}{b[\"name\"][:43]:<43s} {b[\"cuda_time_percent\"]:5.1f}% {b[\"total_dur_ms\"]:9.2f} {b[\"count\"]:6d}  {b[\"reason\"]}')
+      for s in b.get('top_shapes', [])[:2]:
+          tflops = f'{s[\"tflops_per_s\"]:.1f} TFLOPS/s' if 'tflops_per_s' in s else ''
+          tbps = f'{s[\"tb_per_s\"]:.2f} TB/s' if 'tb_per_s' in s else ''
+          print(f'       > {s[\"input_dims\"][:60]:60s} {s.get(\"pct_of_total\",0):5.1f}%  {tflops}  {tbps}')
+
+  gemm_shapes = []
+  for row in unified:
+      if row.get('op category', '') != 'GEMM': continue
+      fb = row.get('FLOPS/Byte', ''); ts = row.get('TFLOPS/s_mean', ''); bs = row.get('TB/s_mean', '')
+      if not (fb and ts and bs): continue
+      fb, ts, bs = float(fb), float(ts), float(bs)
+      eff, bound = roofline_eff(fb, ts, bs)
+      gemm_shapes.append({
+          'dims': row.get('Input Dims',''), 'count': int(float(row.get('operation_count',0) or 0)),
+          'pct': float(row.get('Percentage (%)',0)), 'gflops': float(row.get('GFLOPS',0)),
+          'data_mb': float(row.get('Data Moved (MB)',0)), 'flops_byte': fb,
+          'tflops_s': ts, 'tb_s': bs, 'eff': eff, 'bound': bound,
+      })
+
+  with open(f'{phase_key}_bottlenecks.json', 'w') as f:
+      json.dump(bottlenecks, f, indent=2)
+  print(f'Saved {phase_key}_bottlenecks.json ({len(bottlenecks)} entries)')
+
+  analysis = {
+      'phase': phase_key,
+      'platform': {'gpu': gpu_name, 'peak_mem_bw_tbps': PEAK_MEM_BW_TBPS, 'peak_bf16_tflops': PEAK_BF16_TFLOPS, 'ridge_point': round(RIDGE_POINT, 1)},
+      'category_breakdown': [{
+          'category': row.get('op category', ''), 'count': int(float(row.get('Count', 0))),
+          'total_kernel_time_ms': float(row.get('total_direct_kernel_time_ms', 0)),
+          'percentage': float(row.get('Percentage (%)', 0)),
+      } for row in (list(csv.DictReader(open(os.path.join(report_dir, 'ops_summary_by_category.csv')))) if os.path.isfile(os.path.join(report_dir, 'ops_summary_by_category.csv')) else [])],
+      'gemm_roofline': sorted(gemm_shapes, key=lambda x: x['pct'], reverse=True),
+      'top_bottlenecks': [{'name': b['name'], 'cuda_time_percent': b['cuda_time_percent'], 'total_dur_ms': b['total_dur_ms'], 'reason': b['reason'], 'optimizable': b['optimizable']} for b in bottlenecks[:15]],
+  }
+  with open(f'{phase_key}_analysis.json', 'w') as f:
+      json.dump(analysis, f, indent=2)
+  print(f'Saved {phase_key}_analysis.json')
+
+phase_summary = {}
+for label, rdir in report_dirs.items():
+    cat_path = os.path.join(rdir, 'ops_summary_by_category.csv')
+    if os.path.isfile(cat_path):
+        with open(cat_path) as f:
+            phase_summary[label] = list(csv.DictReader(f))
+with open('phase_category_summary.json', 'w') as f:
+    json.dump(phase_summary, f, indent=2)
+print(f'Saved phase_category_summary.json ({len(phase_summary)} phases)')
+"
+```
 
 ⚠️ **CRITICAL**: The shapes are real traced shapes from the profiled workload. Use this data in Phase 5 to pick exact dimensions for problem files and prioritize which (operator, shape) combinations to optimize first.
 
-## Step 6: Save model shapes
+## Step 5: Save model shapes
 
 ```bash
 # venv mode only:
 # source {{OUTPUT_DIR}}/venv/bin/activate
 python3 -c "
 import json
-from transformers import AutoConfig
-c = AutoConfig.from_pretrained('{{HF_MODEL}}', trust_remote_code=True)
+try:
+    from transformers import AutoConfig
+    config = AutoConfig.from_pretrained('{{HF_MODEL}}', trust_remote_code=True)
+    d = config.to_dict()
+except Exception:
+    from huggingface_hub import hf_hub_download
+    cfg_path = hf_hub_download('{{HF_MODEL}}', 'config.json')
+    with open(cfg_path) as f: d = json.load(f)
+
+tc = d.get('text_config', d)
 shapes = {
-    'hidden_size': getattr(c, 'hidden_size', None),
-    'intermediate_size': getattr(c, 'intermediate_size', None),
-    'num_attention_heads': getattr(c, 'num_attention_heads', None),
-    'num_key_value_heads': getattr(c, 'num_key_value_heads', None),
-    'head_dim': getattr(c, 'hidden_size', 0) // max(getattr(c, 'num_attention_heads', 1), 1),
-    'num_hidden_layers': getattr(c, 'num_hidden_layers', None),
-    'vocab_size': getattr(c, 'vocab_size', None),
+    'hidden_size': tc.get('hidden_size', None),
+    'intermediate_size': tc.get('intermediate_size', None),
+    'num_attention_heads': tc.get('num_attention_heads', None),
+    'num_key_value_heads': tc.get('num_key_value_heads', None),
+    'head_dim': tc.get('head_dim', tc.get('hidden_size', 0) // max(tc.get('num_attention_heads', 1), 1)),
+    'num_hidden_layers': tc.get('num_hidden_layers', None),
+    'vocab_size': tc.get('vocab_size', None),
+    'layer_types': tc.get('layer_types', None),
+    'linear_key_head_dim': tc.get('linear_key_head_dim', None),
+    'linear_value_head_dim': tc.get('linear_value_head_dim', None),
+    'linear_num_key_heads': tc.get('linear_num_key_heads', None),
+    'linear_num_value_heads': tc.get('linear_num_value_heads', None),
 }
+shapes = {k: v for k, v in shapes.items() if v is not None}
 with open('{{PROFILE_DIR}}/model_shapes.json', 'w') as f:
     json.dump(shapes, f, indent=2)
 print(json.dumps(shapes, indent=2))

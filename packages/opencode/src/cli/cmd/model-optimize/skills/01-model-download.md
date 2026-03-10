@@ -68,17 +68,28 @@ kill $VLLM_PID 2>/dev/null; wait $VLLM_PID 2>/dev/null
 # venv mode only:
 # source {{OUTPUT_DIR}}/venv/bin/activate
 python3 -c "
-from transformers import AutoConfig
-config = AutoConfig.from_pretrained('{{HF_MODEL}}', trust_remote_code=True)
 import json
+try:
+    from transformers import AutoConfig
+    config = AutoConfig.from_pretrained('{{HF_MODEL}}', trust_remote_code=True)
+    d = config.to_dict()
+except Exception:
+    from huggingface_hub import hf_hub_download
+    cfg_path = hf_hub_download('{{HF_MODEL}}', 'config.json')
+    with open(cfg_path) as f: d = json.load(f)
+
+tc = d.get('text_config', d)
 info = {
-    'model_type': getattr(config, 'model_type', 'unknown'),
-    'num_hidden_layers': getattr(config, 'num_hidden_layers', None),
-    'hidden_size': getattr(config, 'hidden_size', None),
-    'num_attention_heads': getattr(config, 'num_attention_heads', None),
-    'num_key_value_heads': getattr(config, 'num_key_value_heads', None),
-    'intermediate_size': getattr(config, 'intermediate_size', None),
-    'vocab_size': getattr(config, 'vocab_size', None),
+    'model_type': d.get('model_type', 'unknown'),
+    'architectures': d.get('architectures', []),
+    'num_hidden_layers': tc.get('num_hidden_layers', None),
+    'hidden_size': tc.get('hidden_size', None),
+    'num_attention_heads': tc.get('num_attention_heads', None),
+    'num_key_value_heads': tc.get('num_key_value_heads', None),
+    'intermediate_size': tc.get('intermediate_size', None),
+    'vocab_size': tc.get('vocab_size', None),
+    'layer_types': tc.get('layer_types', None),
+    'full_attention_interval': tc.get('full_attention_interval', None),
 }
 print(json.dumps(info, indent=2))
 with open('{{OUTPUT_DIR}}/model_config.json', 'w') as f:
