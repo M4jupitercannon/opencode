@@ -6,8 +6,10 @@ Analyze benchmark results and profiling data to identify performance characteris
 ## Steps
 
 ### 1. Collect All Benchmark Results
-Gather all result files from `{{OUTPUT_DIR}}/results/` and `{{REPO_DIR}}/`.
-Look for JSON result files matching the experiment naming pattern.
+Gather result files **only** from the output directory: `{{OUTPUT_DIR}}/results/` and `{{PROFILE_DIR}}/`.
+Do **NOT** search `{{REPO_DIR}}/` — it contains pre-existing results from other experiments that are not part of this run.
+Look for JSON result files matching the experiment naming pattern (e.g., `*_profile*.json`, `*_conc*.json`).
+For profile mode, the docker log in `{{PROFILE_DIR}}/` may also contain benchmark metrics in its output.
 
 ### 2. Parse Benchmark Metrics
 For each result file, extract key metrics:

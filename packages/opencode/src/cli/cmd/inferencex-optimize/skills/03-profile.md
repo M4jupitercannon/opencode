@@ -56,15 +56,23 @@ docker run -d \
 ### 3a. Inject vLLM Profiler Config
 vLLM v0.16+ requires `--profiler-config` on the `vllm serve` command to register the `/start_profile` and `/stop_profile` API endpoints. The `VLLM_TORCH_PROFILER_DIR` env var alone is not enough; without `--profiler-config`, the profiling routes are never attached and calls to `/start_profile` silently fail, producing no torch traces.
 
-After starting the container, patch the resolved benchmark script **inside the container** so that any `vllm serve` invocation includes the profiler config:
+After starting the container, patch the resolved benchmark script **inside the container** so that any `vllm serve` invocation includes the profiler config.
+
+Use Python to avoid nested bash/sed quoting issues — `json.dumps` guarantees valid JSON and `chr(39)` inserts shell single-quotes around the value so bash treats it as one argument:
 ```bash
-docker exec "$CONTAINER_NAME" bash -c '
-    PROF_DIR="${VLLM_TORCH_PROFILER_DIR:-/workspace/profiles}"
-    PROFILER_CFG="--profiler-config {\"profiler\": \"torch\", \"torch_profiler_dir\": \"${PROF_DIR}\", \"torch_profiler_use_gzip\": true}"
-    find /workspace/benchmarks -name "*.sh" -exec \
-        sed -i "s|vllm serve |vllm serve ${PROFILER_CFG} |" {} \;
-    echo "Patched benchmark scripts with --profiler-config"
-'
+docker exec "$CONTAINER_NAME" python3 -c "
+import glob, json, os
+prof_dir = os.environ.get('VLLM_TORCH_PROFILER_DIR', '/workspace/profiles')
+cfg = json.dumps({'profiler': 'torch', 'torch_profiler_dir': prof_dir, 'torch_profiler_use_gzip': True})
+q = chr(39)
+for f in glob.glob('/workspace/benchmarks/**/*.sh', recursive=True):
+    with open(f) as fh:
+        content = fh.read()
+    content = content.replace('vllm serve ', 'vllm serve --profiler-config ' + q + cfg + q + ' ', 1)
+    with open(f, 'w') as fh:
+        fh.write(content)
+print('Patched benchmark scripts with --profiler-config')
+"
 ```
 
 This only modifies the copy inside the container, not the host repo.
@@ -114,15 +122,19 @@ docker stop "$CONTAINER_NAME"
 docker rm "$CONTAINER_NAME"
 ```
 
-### 6. Collect Profile Traces
-Copy the **actual torch profiler traces** (produced by vLLM to `VLLM_TORCH_PROFILER_DIR`) and any relay traces:
+### 6. Collect Profile Traces and Benchmark Results
+Copy the **actual torch profiler traces** (produced by vLLM to `VLLM_TORCH_PROFILER_DIR`), relay traces, and benchmark result JSONs:
 ```bash
 # Torch profiler traces written by vLLM to the profiles subdirectory
 cp {{REPO_DIR}}/profiles/*.json* "{{PROFILE_DIR}}/" 2>/dev/null || true
-# Relay traces from benchmark_lib (in repo root)
-cp {{REPO_DIR}}/profile_*.trace.json* "{{PROFILE_DIR}}/" 2>/dev/null || true
+
+# Copy benchmark result JSONs from the repo to the output results directory
+mkdir -p "{{OUTPUT_DIR}}/results"
+cp {{REPO_DIR}}/results/*.json "{{OUTPUT_DIR}}/results/" 2>/dev/null || true
 echo "Collected trace files:"
 ls -lh "{{PROFILE_DIR}}/"
+echo "Collected benchmark results:"
+ls -lh "{{OUTPUT_DIR}}/results/" 2>/dev/null || echo "(none)"
 ```
 
 ### 6a. Validate Trace Files
