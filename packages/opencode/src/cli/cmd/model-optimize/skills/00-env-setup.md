@@ -244,7 +244,43 @@ if [ "$ENV_TYPE" = "docker" ]; then
 fi
 ```
 
-### 7. Update progress.json
+### 7. Install geak-oe dependencies (for HIP/CK/ASM kernel optimization in Phase 6)
+
+If Phase 5 classifies any bottleneck as `hip`, `ck`, or `asm`, the `geak --kernel-url` pipeline requires `geak-oe`. Install it proactively since Phase 5 runs later.
+
+```bash
+if [ "$ENV_TYPE" = "docker" ]; then
+  # Save current triton version before geak-oe install
+  TRITON_VER=$(docker exec "$CONTAINER_NAME" python3 -c "import triton; print(triton.__version__)" 2>/dev/null || echo "")
+
+  docker exec "$CONTAINER_NAME" bash -c "
+    if [ ! -d /opt/geak-oe ]; then
+      git clone --depth 1 --branch optimizer-geak-openevolve-benchmark \
+        https://github.com/AMD-AGI/GEAK.git /opt/geak-oe 2>/dev/null && \
+      cd /opt/geak-oe && pip install -e . --ignore-installed blinker 2>/dev/null && \
+      echo 'geak-oe: installed' || echo 'geak-oe: install FAILED'
+    else
+      echo 'geak-oe: already installed'
+    fi
+
+    # Python 3.12+ regex fix for commandment_evaluator.py
+    EVAL_FILE=/opt/geak-oe/openevolve/commandment_evaluator.py
+    if [ -f \$EVAL_FILE ]; then
+      sed -i 's/_BENIGN_RE = _re.compile(\"|\".join(_BENIGN_STDERR_PATTERNS))/_BENIGN_RE = _re.compile(\"|\".join(_BENIGN_STDERR_PATTERNS), _re.IGNORECASE)/' \$EVAL_FILE
+      sed -i \"s/r\\\"(?i)/r\\\"/g\" \$EVAL_FILE
+      echo 'geak-oe: Python 3.12 regex fix applied'
+    fi
+  "
+
+  # Restore triton version (geak-oe may install incompatible version)
+  if [ -n "$TRITON_VER" ]; then
+    docker exec "$CONTAINER_NAME" pip3 install "triton==$TRITON_VER" 2>/dev/null
+    echo "Restored triton $TRITON_VER"
+  fi
+fi
+```
+
+### 8. Update progress.json
 Update progress.json: phase="env", phases_completed.append("env")
 
 ⚠️ **CRITICAL for all subsequent phases**: If `env_type` is `docker` in `env_info.json`, prefix all commands with `docker exec $CONTAINER_NAME bash -c "..."` and use `/workspace/output` as the output directory inside the container. Set `HIP_VISIBLE_DEVICES=$BEST_GPU` to target the GPU with the most free memory.

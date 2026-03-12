@@ -1,14 +1,16 @@
 # Phase 6: Kernel Optimization via GEAK {{SKIP_LABEL}}
 
 ## Goal
-Optimize each problem file using GEAK (GPU Evolutionary Agent for Kernels) to produce
-Triton kernels that beat the PyTorch baseline.
+Optimize each bottleneck kernel using the appropriate GEAK mode based on `kernel_type`:
+- **C++ kernels** (`hip`, `ck`, `asm`, `triton_composite`): use `geak --kernel-url` to optimize the source in-place
+- **Python/Triton kernels** (`triton`, `aten_gemm`, `aten_elementwise`): use `geak -t` (simple mode) to write optimized Triton replacements
 
 ## Prerequisites
 - GEAK must be installed in the Docker container (`geak --help` works)
 - `AMD_LLM_API_KEY` must be set in `/root/.config/mini-swe-agent/.env`
+- For `hip`/`ck`/`asm` kernels: `geak-oe` must be installed (`/opt/geak-oe`) -- see Phase 0
 - Problem files from Phase 5 in `{{PROBLEMS_DIR}}/`
-- `optimization_manifest.json` in `{{PROBLEMS_DIR}}/`
+- `optimization_manifest.json` in `{{PROBLEMS_DIR}}/` with `kernel_type` and `source_file` metadata
 
 ## Docker vs venv
 If Phase 0 created a Docker container (`env_type: "docker"` in `env_info.json`), run GEAK inside it.
@@ -37,50 +39,105 @@ GPU_ARCH=$(docker exec $CONTAINER_NAME bash -c "rocminfo 2>/dev/null | grep -oP 
 GPU_NAME=$(docker exec $CONTAINER_NAME bash -c "rocm-smi --showproductname 2>/dev/null | grep -oP 'MI\w+' | head -1 || echo 'AMD GPU'")
 ```
 
-## Step 3: Run GEAK on each enabled problem file
+## Step 3a: Optimize C++ kernels via `geak --kernel-url`
 
-For each optimization in `optimization_manifest.json` where `enabled: true`:
+For each manifest entry where `kernel_type` is `hip`, `ck`, `asm`, or `triton_composite` AND `source_file` is available:
+
+1. **Prepare workspace**: copy source file and dependencies, init git repo, set up build system
+2. **Launch**: `geak --kernel-url <source_file>#L<line> --workspace ... --repo ... --gpu-ids 0,1 --yolo`
+3. **Monitor**: check `geak_output/results/round_*/*/task_*.log` for patches and speedups
+
+For the full procedure, see `hip-kernel-optimize-geak.md`.
 
 ```bash
-# Read manifest and launch GEAK for each enabled problem
-python3 -c "
-import json
-manifest = json.load(open('{{PROBLEMS_DIR}}/optimization_manifest.json'))
-gpu_idx = 0
-for opt in manifest['optimizations']:
-    if not opt.get('enabled', False) or not opt.get('file'):
-        continue
-    print(f'GEAK: {opt[\"name\"]} -> {opt[\"file\"]} (GPU {gpu_idx})')
-    gpu_idx = (gpu_idx + 1) % $GPU_COUNT
+docker exec -d -e HIP_VISIBLE_DEVICES=$GPU_IDS -e GEAK_OE_ROOT=/opt/geak-oe $CONTAINER_NAME bash -c "
+  cd /workspace/${NAME}_opt
+  geak -m claude-opus-4.6 \
+    --kernel-url /workspace/${NAME}_opt/csrc/kernels/${SOURCE_FILE}#L${LINE} \
+    --workspace /workspace/${NAME}_opt \
+    --repo /workspace/${NAME}_opt \
+    --gpu-ids 0,1 \
+    -o /workspace/${NAME}_opt/geak_output \
+    --yolo &> /workspace/${NAME}_opt/geak.log
 "
+```
 
-# Launch GEAK for each problem (parallel across GPUs)
-# For each enabled problem file:
+If a `geak --kernel-url` optimization finds speedup > 1.0x, install the winning source via the appropriate rebuild mechanism (e.g., `AITER_REBUILD=1` for aiter kernels, `pip install -e .` for others).
+
+## Step 3b: Optimize Triton/ATen kernels via `geak -t` (simple mode)
+
+For each manifest entry where `kernel_type` is `triton`, `aten_gemm`, or `aten_elementwise`:
+
+Build kernel-type-aware task descriptions and launch one GEAK agent per problem, parallel across GPUs. Run in **priority order** (HIGH first).
+
+```python
+import json, os
+
+gpu_arch = os.environ.get('GPU_ARCH', 'gfx942')
+manifest = json.load(open('{{PROBLEMS_DIR}}/optimization_manifest.json'))
+
+priority_order = {'HIGH': 0, 'MEDIUM': 1, 'LOW': 2}
+simple_types = {'triton', 'aten_gemm', 'aten_elementwise', 'unknown'}
+enabled = [o for o in manifest['optimizations']
+           if o.get('enabled') and o.get('file') and o.get('kernel_type', 'unknown') in simple_types]
+enabled.sort(key=lambda o: priority_order.get(o.get('priority', 'LOW'), 3))
+
+gpu_idx = 0
+for opt in enabled:
+    kt = opt.get('kernel_type', 'unknown')
+    src = opt.get('source_file', '')
+    name = opt['name']
+    f = opt['file']
+
+    if kt == 'triton':
+        task = f"Optimize {f}: the baseline is a Triton kernel (source: {src}). Write a faster ModelNew with @triton.jit + @triton.autotune for AMD {gpu_arch}. The Model class is the baseline."
+    elif kt == 'aten_gemm':
+        task = f"Optimize {f}: the baseline uses torch.mm dispatched to rocBLAS. Write a Triton GEMM ModelNew with @triton.jit that beats rocBLAS on AMD {gpu_arch}. The Model class is the baseline."
+    elif kt == 'aten_elementwise':
+        task = f"Optimize {f}: the baseline is a PyTorch ATen op. Write a Triton kernel ModelNew with @triton.jit on AMD {gpu_arch}. The Model class is the baseline."
+    else:
+        task = f"Optimize {f}: write a Triton ModelNew with @triton.jit that beats the baseline Model class on AMD {gpu_arch}."
+
+    print(f"GEAK [{opt.get('priority','?')}]: {name} -> {f} (GPU {gpu_idx}) | kernel_type={kt}")
+    gpu_idx = (gpu_idx + 1) % int(os.environ.get('GPU_COUNT', '1'))
+```
+
+```bash
 docker exec -d -e HIP_VISIBLE_DEVICES=$GPU_ID $CONTAINER_NAME bash -c "
   cd {{PROBLEMS_DIR}}
-  geak -m claude-4.6-opus \
-    -t 'Optimize $PROBLEM_FILE: write a Triton kernel for $DESCRIPTION on AMD $GPU_NAME ($GPU_ARCH). Shape: $SHAPE. The Model class is the baseline. Create a ModelNew class with @triton.jit kernel that beats it.' \
+  geak -m claude-opus-4.6 \
+    -t '$TASK' \
     --gpu-ids 0 --yolo &> {{PROBLEMS_DIR}}/geak_${NAME}.log
 "
 ```
 
-Run one GEAK agent per problem file, each on a different GPU. Monitor progress:
+## Step 3.5: Collect GEAK patches
+
+GEAK stores optimized kernels in `optimization_logs/<name>_<timestamp>/patch_N.patch` (simple mode) or `geak_output/results/round_N/worktrees/slot_N/` (kernel-url mode). These are NOT applied to the original problem files automatically.
+
+**For simple-mode patches**: extract the `kernel.py` from the best patch (lowest `GEAK_RESULT_LATENCY_MS` in `patch_N_test.txt`) and copy to `{{OPTIMIZED_DIR}}/`.
+
+**For kernel-url patches**: the winning source is already in the worktree. Copy it and install via the appropriate rebuild mechanism.
 
 ```bash
-# Check status
-docker exec $CONTAINER_NAME bash -c "
-  for f in {{PROBLEMS_DIR}}/geak_*.log; do
-    name=\$(basename \$f .log)
-    lines=\$(wc -l < \$f 2>/dev/null || echo 0)
-    done=\$(grep -c 'Selected best patch' \$f 2>/dev/null || echo 0)
-    echo \"\$name: \$lines lines, completed=\$done\"
-  done
-"
+# Simple mode: find best patch per kernel
+for dir in {{PROBLEMS_DIR}}/optimization_logs/*/; do
+  best=$(for t in $dir/patch_*_test.txt; do
+    [ -f "$t" ] && lat=$(grep -oP "GEAK_RESULT_LATENCY_MS=([0-9.]+)" "$t" | tail -1 | cut -d= -f2) && echo "$lat $t"
+  done | sort -n | head -1 | awk '{print $2}')
+  [ -n "$best" ] && echo "Best: $best"
+done
+
+# Kernel-url mode: find best patch
+for p in /workspace/*_opt/geak_output/results/round_*/*/patch_*_test.txt; do
+  lat=$(grep -oP "GEAK_RESULT_LATENCY_MS=([0-9.]+)" "$p" | tail -1 | cut -d= -f2)
+  echo "$lat $p"
+done | sort -n | head -1
 ```
 
 ## Step 4: Verify results
 
-After GEAK completes, each problem file should contain a `ModelNew` class with an optimized Triton kernel.
+After GEAK completes, verify optimized kernels pass correctness and benchmark faster than baseline.
 
 ```bash
 docker exec $CONTAINER_NAME bash -c "
@@ -172,6 +229,7 @@ Update progress.json: phases_completed.append("optimize")
 ## When GEAK is not available (fallback)
 
 If GEAK cannot be installed or the API key is not set, fall back to manual optimization:
-for each problem file, write a `ModelNew` class with `@triton.jit` kernels + `@triton.autotune`,
-test with `kernel_test_runner.py`, iterate, and finalize with `kernel_finalize.py`.
+for each problem file (regardless of `kernel_type`), write a `ModelNew` class with
+`@triton.jit` kernels + `@triton.autotune`, test with `kernel_test_runner.py`, iterate,
+and finalize with `kernel_finalize.py`.
 See the previous version of this skill for the manual workflow details.

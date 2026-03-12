@@ -68,15 +68,13 @@ python <output_dir>/scripts/validate_pipeline.py --project-dir <output_dir> --ph
 
 Read and follow `~/.config/opencode/skills/05-problem-generate.md`.
 
-Convert bottleneck operators into Problem files. Analyze operators for fusion opportunities BEFORE creating individual problem files. Steps:
+Convert bottleneck operators into Problem files. Classify each kernel type to determine the right GEAK optimization mode for Phase 6. Steps:
 
 1. **Review TraceLens Analysis** — examine `analysis_summary.json` and `unified_perf_summary.csv` for hottest (category, shape) pairs
 2. **Operator Fusion Analysis** — run `analyze_fusion.py` to detect fusable patterns (ResidualNorm, SwiGLU, RoPE, etc.)
-2b. **GEMM Roofline Problems** — generate problem files for GEMM shapes with roofline efficiency < 50% (rocBLAS underperforming)
-2c. **Attention Problems** — generate problem files for suboptimal SDPA kernels (e.g. head_dim=256)
-3. **Create Fused Problem Files** (HIGH priority) — using actual shapes from TraceLens reports
-4. **Create Individual Problem Files** (MEDIUM/LOW) — only for unfused ops taking > 5% time
-5. **Generate Optimization Manifest** — `optimization_manifest.json` controlling which optimizations to apply
+2.5. **Kernel Type Classification** — trace each bottleneck op to source, classify as `triton`/`hip`/`ck`/`asm`/`aten_gemm`/`aten_elementwise`/`triton_composite`. Record `source_file` for C++ kernels.
+3. **Generate Problem Files** — `generate_problems.py` (fusion + GEMM roofline + attention) + HIP/composite/individual problem files
+4. **Generate Optimization Manifest** — `optimization_manifest.json` with `kernel_type` metadata, all enabled by default
 
 ---
 
@@ -84,13 +82,16 @@ Convert bottleneck operators into Problem files. Analyze operators for fusion op
 
 Read and follow `~/.config/opencode/skills/06-kernel-optimize.md`.
 
-Use GEAK (GPU Evolutionary Agent for Kernels) to optimize each problem file. GEAK uses an LLM-driven agent (`claude-4.6-opus` by default) to generate, test, and iterate on Triton kernels automatically. Requires `AMD_LLM_API_KEY` and GEAK installed in the container.
+Use GEAK to optimize each bottleneck kernel using the appropriate mode based on `kernel_type`. Requires `AMD_LLM_API_KEY`, GEAK, and `geak-oe` (for C++ kernels) installed in the container.
 
 Steps:
-1. **Verify GEAK** — check `geak --help` in the container
-2. **Launch GEAK** — run `geak -m claude-4.6-opus -t "Optimize ..." --yolo` for each enabled problem file, parallel across GPUs
-3. **Verify results** — check correctness + benchmark each `ModelNew` against baseline
-4. **Copy winning kernels** — speedup > 1.0x go to `<output_dir>/optimized/`
+1. **Verify GEAK + geak-oe** — check `geak --help` and `/opt/geak-oe` in the container
+2. **Read manifest, detect GPU architecture**
+3a. **HIP/CK/ASM/composite kernels** — launch `geak --kernel-url` on C++ source (see `hip-kernel-optimize-geak.md`)
+3b. **Triton/ATen kernels** — launch `geak -m claude-opus-4.6 -t "Optimize ..." --yolo` with kernel-type-aware task descriptions
+3.5. **Collect patches** — extract optimized kernels from GEAK `optimization_logs/` and `geak_output/results/`
+4. **Verify results** — check correctness + benchmark each optimized kernel against baseline
+5. **Copy winning kernels** — speedup > 1.0x go to `<output_dir>/optimized/` (note: kernel speedup may not equal E2E speedup)
 
 If GEAK is unavailable, fall back to manual Triton kernel writing using `kernel_test_runner.py` and `kernel_finalize.py`.
 
