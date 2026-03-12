@@ -229,7 +229,22 @@ cp ~/.config/opencode/scripts/*.py {{OUTPUT_DIR}}/scripts/ 2>/dev/null
 ls {{OUTPUT_DIR}}/scripts/
 ```
 
-### 6. Update progress.json
+### 6. Verify GEAK availability (for Phase 6)
+
+Check if GEAK is installed in the container. If not, attempt to install it.
+GEAK is required for automated kernel optimization in Phase 6.
+
+```bash
+if [ "$ENV_TYPE" = "docker" ]; then
+  docker exec "$CONTAINER_NAME" bash -c "
+    geak --help >/dev/null 2>&1 && echo 'GEAK: available' || \
+    (cd /workspace/GEAK 2>/dev/null && pip install -e . >/dev/null 2>&1 && echo 'GEAK: installed') || \
+    echo 'GEAK: NOT available (Phase 6 will use manual fallback)'
+  "
+fi
+```
+
+### 7. Update progress.json
 Update progress.json: phase="env", phases_completed.append("env")
 
 ⚠️ **CRITICAL for all subsequent phases**: If `env_type` is `docker` in `env_info.json`, prefix all commands with `docker exec $CONTAINER_NAME bash -c "..."` and use `/workspace/output` as the output directory inside the container. Set `HIP_VISIBLE_DEVICES=$BEST_GPU` to target the GPU with the most free memory.

@@ -15,11 +15,16 @@ agent: model-opt
 Phases 0–4 (environment setup, model serving, profiling, bottleneck analysis) must be completed first.
 See `/model-analyze` for those phases. The following artifacts from Phase 4 are required:
 
-- `<output_dir>/profile/bottlenecks.json`
+- `<output_dir>/profile/{decode,prefilldecode}_bottlenecks.json`
+- `<output_dir>/profile/{decode,prefilldecode}_analysis.json`
 - `<output_dir>/profile/analysis_summary.json`
 - `<output_dir>/profile/model_shapes.json`
 - `<output_dir>/profile/decode_report/unified_perf_summary.csv`
 - `<output_dir>/profile/prefilldecode_report/unified_perf_summary.csv`
+
+**For Phase 6 (GEAK optimization):**
+- `AMD_LLM_API_KEY` environment variable must be set (used by GEAK to call the LLM orchestrator)
+- GEAK must be installed in the Docker container (checked during Phase 0)
 
 ## Variable Definitions
 
@@ -67,17 +72,27 @@ Convert bottleneck operators into Problem files. Analyze operators for fusion op
 
 1. **Review TraceLens Analysis** — examine `analysis_summary.json` and `unified_perf_summary.csv` for hottest (category, shape) pairs
 2. **Operator Fusion Analysis** — run `analyze_fusion.py` to detect fusable patterns (ResidualNorm, SwiGLU, RoPE, etc.)
+2b. **GEMM Roofline Problems** — generate problem files for GEMM shapes with roofline efficiency < 50% (rocBLAS underperforming)
+2c. **Attention Problems** — generate problem files for suboptimal SDPA kernels (e.g. head_dim=256)
 3. **Create Fused Problem Files** (HIGH priority) — using actual shapes from TraceLens reports
 4. **Create Individual Problem Files** (MEDIUM/LOW) — only for unfused ops taking > 5% time
 5. **Generate Optimization Manifest** — `optimization_manifest.json` controlling which optimizations to apply
 
 ---
 
-# Phase 6: Kernel Optimization
+# Phase 6: Kernel Optimization via GEAK
 
 Read and follow `~/.config/opencode/skills/06-kernel-optimize.md`.
 
-Write optimized Triton kernels for each problem file and verify speedup. Optimize kernels DIRECTLY in this session using the provided test scripts (`kernel_test_runner.py`, `kernel_finalize.py`). For each problem file: read source, write `ModelNew` with `@triton.jit` kernels + `@triton.autotune`, test accuracy + benchmark, iterate, finalize. Copy kernels with speedup > 1.0x to `<output_dir>/optimized/`.
+Use GEAK (GPU Evolutionary Agent for Kernels) to optimize each problem file. GEAK uses an LLM-driven agent (`claude-4.6-opus` by default) to generate, test, and iterate on Triton kernels automatically. Requires `AMD_LLM_API_KEY` and GEAK installed in the container.
+
+Steps:
+1. **Verify GEAK** — check `geak --help` in the container
+2. **Launch GEAK** — run `geak -m claude-4.6-opus -t "Optimize ..." --yolo` for each enabled problem file, parallel across GPUs
+3. **Verify results** — check correctness + benchmark each `ModelNew` against baseline
+4. **Copy winning kernels** — speedup > 1.0x go to `<output_dir>/optimized/`
+
+If GEAK is unavailable, fall back to manual Triton kernel writing using `kernel_test_runner.py` and `kernel_finalize.py`.
 
 ---
 
