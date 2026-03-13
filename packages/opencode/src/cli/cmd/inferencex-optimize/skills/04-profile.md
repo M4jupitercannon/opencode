@@ -1,4 +1,4 @@
-# Phase 3: Profiling {{SKIP_LABEL}}
+# Phase 4: Profiling {{SKIP_LABEL}}
 
 ## Objective
 Re-run selected benchmarks with profiling enabled to capture detailed performance traces.
@@ -18,15 +18,34 @@ mkdir -p "{{PROFILE_DIR}}"
 
 ### 3. Start Persistent Profiling Container
 Start **one** persistent container for all profiling runs. Add profiling environment variables.
-Detect GPU vendor and set appropriate flags:
+Detect GPU vendor, **select the most free GPUs** based on the TP value, and start the container.
+
+**3a. Select GPUs:**
+If GPUs were manually specified via `--gpus` or `CUDA_VISIBLE_DEVICES`/`HIP_VISIBLE_DEVICES`, use those directly. Otherwise, auto-select the most free GPUs based on the TP value:
+```bash
+MANUAL_GPUS="{{GPUS}}"
+TP=<TP value from profiling configs>
+if [ -n "$MANUAL_GPUS" ]; then
+    SELECTED_GPUS="$MANUAL_GPUS"
+    echo "Using manually specified GPUs: $SELECTED_GPUS"
+else
+    SELECTED_GPUS=$(python3 {{SCRIPTS_DIR}}/select_gpus.py $TP)
+    echo "Auto-selected most free GPUs: $SELECTED_GPUS"
+fi
+```
+
+**3b. Set GPU flags and visibility:**
 ```bash
 # For AMD GPUs (runner starts with "mi")
 GPU_FLAGS="--device=/dev/kfd --device=/dev/dri --group-add video --security-opt seccomp=unconfined"
+GPU_ENV="-e ROCR_VISIBLE_DEVICES=$SELECTED_GPUS -e HIP_VISIBLE_DEVICES=$SELECTED_GPUS"
 
 # For NVIDIA GPUs
 GPU_FLAGS="--gpus all"
+GPU_ENV="-e CUDA_VISIBLE_DEVICES=$SELECTED_GPUS"
 ```
 
+**3c. Start container:**
 ```bash
 CONTAINER_NAME="inferencex-profile-{{CONFIG_KEY}}"
 
@@ -35,6 +54,7 @@ docker run -d \
     --label inferencex-pipeline=true \
     --entrypoint /bin/bash \
     $GPU_FLAGS \
+    $GPU_ENV \
     --shm-size 64g \
     --ipc=host \
     --network=host \
@@ -54,36 +74,61 @@ docker run -d \
 {{DRY_RUN_NOTE}}
 
 ### 3a. Inject vLLM Profiler Config
-vLLM v0.16+ requires `--profiler-config` on the `vllm serve` command to register the `/start_profile` and `/stop_profile` API endpoints. The `VLLM_TORCH_PROFILER_DIR` env var alone is not enough; without `--profiler-config`, the profiling routes are never attached and calls to `/start_profile` silently fail, producing no torch traces.
+vLLM >= 0.15 requires `--profiler-config.*` CLI args on the `vllm serve` command to register the `/start_profile` and `/stop_profile` API endpoints. The `VLLM_TORCH_PROFILER_DIR` env var is deprecated; without `--profiler-config.*` args, the profiling routes are never attached and calls to `/start_profile` silently fail, producing no torch traces. 
 
-After starting the container, patch the resolved benchmark script **inside the container** so that any `vllm serve` invocation includes the profiler config.
-
-Use Python to avoid nested bash/sed quoting issues — `json.dumps` guarantees valid JSON and `chr(39)` inserts shell single-quotes around the value so bash treats it as one argument:
+First restore the benchmark script to its original state (previous runs may have patched the host copy via bind mount), then inject the profiler args:
 ```bash
-docker exec "$CONTAINER_NAME" python3 -c "
-import glob, json, os
-prof_dir = os.environ.get('VLLM_TORCH_PROFILER_DIR', '/workspace/profiles')
-cfg = json.dumps({'profiler': 'torch', 'torch_profiler_dir': prof_dir, 'torch_profiler_use_gzip': True})
-q = chr(39)
-for f in glob.glob('/workspace/benchmarks/**/*.sh', recursive=True):
-    with open(f) as fh:
-        content = fh.read()
-    content = content.replace('vllm serve ', 'vllm serve --profiler-config ' + q + cfg + q + ' ', 1)
-    with open(f, 'w') as fh:
-        fh.write(content)
-print('Patched benchmark scripts with --profiler-config')
-"
+cd {{REPO_DIR}} && git checkout -- "$BENCHMARK_SCRIPT" benchmarks/benchmark_lib.sh 2>/dev/null || true
 ```
 
-This only modifies the copy inside the container, not the host repo.
+Now patch the target benchmark script inside the container to inject `--profiler-config.*` args into the `vllm serve` command:
+```bash
+docker exec "$CONTAINER_NAME" python3 - "/workspace/$BENCHMARK_SCRIPT" <<'PYEOF'
+import sys, os, re
+target = sys.argv[1]
+prof_dir = os.environ.get('VLLM_TORCH_PROFILER_DIR', '/workspace/profiles')
+profiler_args = (
+    '--profiler-config.profiler torch '
+    '--profiler-config.torch_profiler_dir ' + prof_dir + ' '
+    '--profiler-config.torch_profiler_record_shapes True '
+    '--profiler-config.torch_profiler_with_memory True '
+    '--profiler-config.torch_profiler_with_flops True '
+    '--profiler-config.torch_profiler_use_gzip True '
+    '--profiler-config.ignore_frontend True'
+)
+with open(target) as fh:
+    content = fh.read()
+# Strip any stale profiler args or --enforce-eager from previous runs
+content = re.sub(r'--enforce-eager\s+', '', content)
+content = re.sub(r'--profiler-config\.\S+\s+\S+\s*', '', content)
+content = re.sub(r'--ignore_frontend\s+\S+\s*', '', content)
+new_content = content.replace('vllm serve ', 'vllm serve ' + profiler_args + ' ', 1)
+if new_content != content:
+    with open(target, 'w') as fh:
+        fh.write(new_content)
+    print(f'Patched {target} with --profiler-config.* args')
+else:
+    print(f'No "vllm serve" found in {target}, nothing to patch')
+PYEOF
+```
+
+NOTE: The container bind-mounts `{{REPO_DIR}}:/workspace`, so these changes affect the host repo. Step 6 cleans up generated files, and the `git checkout` above ensures a clean starting state.
 
 ### 3b. Disable Relay Trace Staging
-The `move_profile_trace_for_relay()` function in `benchmark_lib.sh` copies the rank trace to the repo root as a relay file. This is for CI/CD workflows and not needed here — we collect rank traces directly from the profiles directory. Neutralize it inside the container:
+The `move_profile_trace_for_relay()` function in `benchmark_lib.sh` copies the rank trace to the repo root as a relay file. This is for CI/CD workflows and not needed here — we collect rank traces directly from the profiles directory. Neutralize the function **call** inside the container by replacing it with a bash no-op (`:`) so the enclosing `if` block remains syntactically valid:
 ```bash
 docker exec "$CONTAINER_NAME" python3 -c "
+import re
 with open('/workspace/benchmarks/benchmark_lib.sh') as f:
     content = f.read()
-content = content.replace('move_profile_trace_for_relay', '# move_profile_trace_for_relay')
+# Only replace the bare function call (not the definition).
+# Use word-boundary matching to avoid clobbering the 'function_name() {' definition line.
+content = re.sub(
+    r'^(\s*)move_profile_trace_for_relay\s*$',
+    r'\1: # move_profile_trace_for_relay (disabled)',
+    content,
+    flags=re.MULTILINE,
+)
 with open('/workspace/benchmarks/benchmark_lib.sh', 'w') as f:
     f.write(content)
 print('Disabled move_profile_trace_for_relay')
@@ -123,10 +168,15 @@ docker exec \
     "$CONTAINER_NAME" \
     /bin/bash /workspace/$BENCHMARK_SCRIPT \
     > "$DOCKER_LOG" 2>&1
-echo "Profile exit code: $?"
+EXIT_CODE=$?
+echo "Profile exit code: $EXIT_CODE"
+if [ $EXIT_CODE -ne 0 ]; then
+    echo "=== Last 50 lines of docker log ==="
+    tail -n 50 "$DOCKER_LOG"
+fi
 ```
 
-Do NOT print or display the contents of the docker log file. The log is saved for debugging purposes only.
+IMPORTANT: The docker exec runs in the **foreground** writing stdout/stderr to the log file (no output is printed to the terminal). If the command fails (non-zero exit code), the last 50 lines of the log are printed to help diagnose the issue. On success, only the exit code line is shown.
 
 ### 5. Clean Up Container
 After **all** profiling runs are complete, stop and remove the container:
@@ -138,8 +188,11 @@ docker rm "$CONTAINER_NAME"
 ### 6. Collect Profile Traces and Benchmark Results
 Copy the **actual torch profiler traces** (produced by vLLM to `VLLM_TORCH_PROFILER_DIR`) and benchmark result JSONs to the output directory, then clean up all generated files from the repo:
 ```bash
-# Torch profiler traces written by vLLM to the profiles subdirectory
-# Skip async_llm traces (CPU-side scheduling only, not needed for GPU analysis)
+# Torch profiler traces written by vLLM to the profiles subdirectory.
+# With ignore_frontend: true, only rank-0 (worker) traces should be produced.
+# Defensively skip any async_llm traces that may appear — they contain only
+# frontend CPU scheduling and lack the GPU kernels / Input Dims needed for
+# shape analysis.
 for f in {{REPO_DIR}}/profiles/*.json*; do
     [ -f "$f" ] || continue
     case "$(basename "$f")" in
@@ -147,6 +200,13 @@ for f in {{REPO_DIR}}/profiles/*.json*; do
         *)           cp "$f" "{{PROFILE_DIR}}/" && rm -f "$f" ;;
     esac
 done
+
+# Copy InferenceX profiler summary (profiler_out_0.txt) and rename with config context
+if [ -f "{{REPO_DIR}}/profiles/profiler_out_0.txt" ]; then
+    cp "{{REPO_DIR}}/profiles/profiler_out_0.txt" "{{PROFILE_DIR}}/profiler_out_0.txt"
+    rm -f "{{REPO_DIR}}/profiles/profiler_out_0.txt"
+    echo "Collected profiler_out_0.txt"
+fi
 
 # Copy benchmark result JSONs from the repo to the output results directory
 mkdir -p "{{OUTPUT_DIR}}/results"
@@ -159,36 +219,6 @@ echo "Collected benchmark results:"
 ls -lh "{{OUTPUT_DIR}}/results/" 2>/dev/null || echo "(none)"
 ```
 
-### 6a. Validate Trace Files
-Verify that at least one collected trace file is a genuine torch profiler trace (contains `traceEvents` key), not just a benchmark result JSON:
-```bash
-python3 -c "
-import json, gzip, glob, sys
-trace_dir = '{{PROFILE_DIR}}'
-valid = []
-for f in sorted(glob.glob(trace_dir + '/*.json*')):
-    if '_docker.log' in f:
-        continue
-    try:
-        opener = gzip.open if f.endswith('.gz') else open
-        with opener(f, 'rt') as fh:
-            data = json.load(fh)
-        if isinstance(data, dict) and 'traceEvents' in data:
-            valid.append(f)
-            print(f'VALID torch trace: {f}')
-        else:
-            keys = list(data.keys())[:5] if isinstance(data, dict) else type(data).__name__
-            print(f'NOT a torch trace (keys: {keys}): {f}')
-    except Exception as e:
-        print(f'ERROR reading {f}: {e}')
-if not valid:
-    print('WARNING: No valid torch profiler traces found. TraceLens analysis will be skipped.')
-    print('This usually means vLLM profiling endpoints were not activated.')
-else:
-    print(f'Found {len(valid)} valid torch trace(s)')
-"
-```
-
 ### 7. Profile Summary
 List captured trace files and their sizes.
 Note: traces can be viewed at https://ui.perfetto.dev/
@@ -198,7 +228,7 @@ Update progress.json:
 ```json
 {
   "phase": "profile",
-  "phases_completed": ["env", "config", "benchmark", "profile"],
+  "phases_completed": ["env", "config", "benchmark", "benchmark-analyze", "profile"],
   "current_step": "profiling complete",
   "details": {
     "profile_runs": <N>,

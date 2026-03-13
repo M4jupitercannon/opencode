@@ -14,38 +14,49 @@ import skill01 from "./skills/01-config-parse.md" with { type: "text" }
 // @ts-ignore - Bun text import
 import skill02 from "./skills/02-benchmark.md" with { type: "text" }
 // @ts-ignore - Bun text import
-import skill03 from "./skills/03-profile.md" with { type: "text" }
+import skill03 from "./skills/03-benchmark-analyze.md" with { type: "text" }
 // @ts-ignore - Bun text import
-import skill04 from "./skills/04-analyze.md" with { type: "text" }
+import skill04 from "./skills/04-profile.md" with { type: "text" }
 // @ts-ignore - Bun text import
-import skill05 from "./skills/05-report.md" with { type: "text" }
+import skill05 from "./skills/05-profile-analyze.md" with { type: "text" }
 // @ts-ignore - Bun text import
 import skillAgentConfig from "./skills/agent-config.md" with { type: "text" }
+
+// @ts-ignore - Bun text import
+import scriptTraceAnalyzer from "./scripts/trace_analyzer.py" with { type: "text" }
+// @ts-ignore - Bun text import
+import scriptSelectGpus from "./scripts/select_gpus.py" with { type: "text" }
 
 const EMBEDDED_SKILLS: Record<string, string> = {
   "00-env-setup.md": skill00,
   "01-config-parse.md": skill01,
   "02-benchmark.md": skill02,
-  "03-profile.md": skill03,
-  "04-analyze.md": skill04,
-  "05-report.md": skill05,
+  "03-benchmark-analyze.md": skill03,
+  "04-profile.md": skill04,
+  "05-profile-analyze.md": skill05,
   "agent-config.md": skillAgentConfig,
+}
+
+export const EMBEDDED_SCRIPTS: Record<string, string> = {
+  "trace_analyzer.py": scriptTraceAnalyzer,
+  "select_gpus.py": scriptSelectGpus,
 }
 
 const SKILL_FILES = [
   "00-env-setup.md",
   "01-config-parse.md",
   "02-benchmark.md",
-  "03-profile.md",
-  "04-analyze.md",
-  "05-report.md",
+  "03-benchmark-analyze.md",
+  "04-profile.md",
+  "05-profile-analyze.md",
 ]
 
 const MODE_PHASES: Record<PipelineMode, readonly string[]> = {
-  full: ["env", "config", "benchmark", "analyze", "report"],
-  benchmark: ["env", "config", "benchmark", "analyze", "report"],
-  profile: ["env", "config", "profile", "analyze", "report"],
-  "benchmark+profile": ["env", "config", "benchmark", "profile", "analyze", "report"],
+  full: ["env", "config", "benchmark", "benchmark-analyze"],
+  benchmark: ["env", "config", "benchmark", "benchmark-analyze"],
+  profile: ["env", "config", "profile", "profile-analyze"],
+  "benchmark+profile": ["env", "config", "benchmark", "benchmark-analyze", "profile", "profile-analyze"],
+  analyze: ["benchmark-analyze", "profile-analyze"],
 }
 
 function computeSkipLabels(startPhase: string, mode: PipelineMode): Record<string, string> {
@@ -58,9 +69,9 @@ function computeSkipLabels(startPhase: string, mode: PipelineMode): Record<strin
     "00": "env",
     "01": "config",
     "02": "benchmark",
-    "03": "profile",
-    "04": "analyze",
-    "05": "report",
+    "03": "benchmark-analyze",
+    "04": "profile",
+    "05": "profile-analyze",
   }
 
   const labels: Record<string, string> = {}
@@ -104,6 +115,7 @@ export function buildAgentPrompt(config: InferenceXConfig): string {
     filterConcStart,
     filterConcEnd,
     filterSeq,
+    gpus,
     dryRun,
     profile,
     mode,
@@ -123,10 +135,12 @@ export function buildAgentPrompt(config: InferenceXConfig): string {
     RESULTS_DIR: dirs.results,
     PROFILE_DIR: dirs.profiles,
     REPORT_DIR: dirs.report,
+    SCRIPTS_DIR: outputDir + "/scripts",
     FILTER_TP: filterTp,
     FILTER_CONC_START: filterConcStart,
     FILTER_CONC_END: filterConcEnd,
     FILTER_SEQ: filterSeq,
+    GPUS: gpus,
     DRY_RUN: String(dryRun),
     PROFILE: String(profile),
     DRY_RUN_NOTE: dryRun
@@ -135,6 +149,9 @@ export function buildAgentPrompt(config: InferenceXConfig): string {
     PROFILE_SKIP_NOTE: activePhases.includes("profile")
       ? ""
       : "**NOTE**: Profiling was not requested. Skip this phase entirely.",
+    PROFILE_ANALYSIS_NOTE: activePhases.includes("profile")
+      ? ""
+      : "**NOTE**: Profiling may not have been run. If no profile traces exist in `" + dirs.profiles + "`, skip this phase entirely and proceed to the next phase.",
     PROGRESS_FILE: outputDir + "/progress.json",
     START_PHASE: startPhase,
   }
@@ -147,9 +164,9 @@ export function buildAgentPrompt(config: InferenceXConfig): string {
     "00": "env",
     "01": "config",
     "02": "benchmark",
-    "03": "profile",
-    "04": "analyze",
-    "05": "report",
+    "03": "benchmark-analyze",
+    "04": "profile",
+    "05": "profile-analyze",
   }
 
   const filteredSkillFiles = SKILL_FILES.filter((file) => {
@@ -195,6 +212,7 @@ function buildHeader(
   const modeLabel = mode === "full" ? "Full Pipeline" :
     mode === "benchmark" ? "Benchmark Only" :
     mode === "profile" ? "Profile Only" :
+    mode === "analyze" ? "Analyze Only" :
     "Benchmark + Profile"
 
   return "# InferenceX Benchmark & Profiling Pipeline\n\n" +
@@ -210,6 +228,7 @@ function buildHeader(
     "  results/        # Benchmark results and analysis\n" +
     "  profiles/       # Profiling trace files\n" +
     "  report/         # Final benchmark report\n" +
+    "  scripts/        # Pipeline utility scripts (e.g. trace_analyzer.py)\n" +
     "  config.json     # Pipeline configuration\n" +
     "  progress.json   # Progress tracking\n" +
     "```\n\n" +
@@ -235,6 +254,7 @@ function buildExecutionInstructions(
   const modeLabel = mode === "full" ? "Full Pipeline" :
     mode === "benchmark" ? "Benchmark Only" :
     mode === "profile" ? "Profile Only" :
+    mode === "analyze" ? "Analyze Only" :
     "Benchmark + Profile"
 
   let modeInstructions: string

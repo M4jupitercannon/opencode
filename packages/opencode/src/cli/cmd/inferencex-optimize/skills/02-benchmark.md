@@ -41,15 +41,34 @@ Group all configs by their `image` field. Configs sharing the same Docker image 
 Typically all configs for a given config-key use the same image, so there will be a single group.
 
 ### 5. Start One Persistent Container Per Image Group
-Detect GPU vendor and set appropriate flags:
+Detect GPU vendor, **select the most free GPUs** based on the TP value, and start the container.
+
+**5a. Select GPUs:**
+If GPUs were manually specified via `--gpus` or `CUDA_VISIBLE_DEVICES`/`HIP_VISIBLE_DEVICES`, use those directly. Otherwise, auto-select the most free GPUs based on the TP value:
+```bash
+MANUAL_GPUS="{{GPUS}}"
+MAX_TP=<max TP value from configs in this group>
+if [ -n "$MANUAL_GPUS" ]; then
+    SELECTED_GPUS="$MANUAL_GPUS"
+    echo "Using manually specified GPUs: $SELECTED_GPUS"
+else
+    SELECTED_GPUS=$(python3 {{SCRIPTS_DIR}}/select_gpus.py $MAX_TP)
+    echo "Auto-selected most free GPUs: $SELECTED_GPUS"
+fi
+```
+
+**5b. Set GPU flags and visibility:**
 ```bash
 # For AMD GPUs (runner starts with "mi")
 GPU_FLAGS="--device=/dev/kfd --device=/dev/dri --group-add video --security-opt seccomp=unconfined"
+GPU_ENV="-e ROCR_VISIBLE_DEVICES=$SELECTED_GPUS -e HIP_VISIBLE_DEVICES=$SELECTED_GPUS"
 
 # For NVIDIA GPUs
 GPU_FLAGS="--gpus all"
+GPU_ENV="-e CUDA_VISIBLE_DEVICES=$SELECTED_GPUS"
 ```
 
+**5c. Start container:**
 Start **one** container per image group in detached mode with `sleep infinity` to keep it alive:
 ```bash
 CONTAINER_NAME="inferencex-benchmark-{{CONFIG_KEY}}"
@@ -59,6 +78,7 @@ docker run -d \
     --label inferencex-pipeline=true \
     --entrypoint /bin/bash \
     $GPU_FLAGS \
+    $GPU_ENV \
     --shm-size 64g \
     --ipc=host \
     --network=host \
@@ -106,10 +126,15 @@ docker exec \
     "$CONTAINER_NAME" \
     /bin/bash /workspace/$BENCHMARK_SCRIPT \
     > "$DOCKER_LOG" 2>&1
-echo "Benchmark exit code: $?"
+EXIT_CODE=$?
+echo "Benchmark exit code: $EXIT_CODE"
+if [ $EXIT_CODE -ne 0 ]; then
+    echo "=== Last 50 lines of docker log ==="
+    tail -n 50 "$DOCKER_LOG"
+fi
 ```
 
-Do NOT print or display the contents of the docker log file. The log is saved for debugging purposes only.
+IMPORTANT: The docker exec runs in the **foreground** writing stdout/stderr to the log file (no output is printed to the terminal). If the command fails (non-zero exit code), the last 50 lines of the log are printed to help diagnose the issue. On success, only the exit code line is shown.
 
 After each benchmark run, copy result files from the repo directory to `{{OUTPUT_DIR}}/results/`.
 Then remove the copied result files from the repo directory to keep it clean:

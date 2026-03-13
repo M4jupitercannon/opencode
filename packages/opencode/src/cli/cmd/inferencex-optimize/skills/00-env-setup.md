@@ -12,13 +12,15 @@ docker --version
 If Docker is not available, report an error and stop.
 
 ### 2. Check GPU Availability
-Detect GPU vendor and architecture:
+Detect GPU vendor, architecture, and current utilization:
 ```bash
 # Try AMD GPU detection via rocminfo
 if command -v rocminfo &>/dev/null; then
     AMD_ARCH=$(rocminfo 2>/dev/null | grep -oP 'gfx\w+' | head -1 | tr '[:upper:]' '[:lower:]')
     if [ -n "$AMD_ARCH" ]; then
         echo "AMD GPU detected: $AMD_ARCH"
+        # Show GPU count and utilization
+        rocm-smi --showuse 2>/dev/null || true
     fi
 fi
 
@@ -27,6 +29,8 @@ if command -v nvidia-smi &>/dev/null; then
     NVIDIA_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.' | sed 's/^/sm_/')
     if [ -n "$NVIDIA_ARCH" ]; then
         echo "NVIDIA GPU detected: $NVIDIA_ARCH"
+        # Show GPU count and utilization
+        nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total --format=csv,noheader 2>/dev/null || true
     fi
 fi
 

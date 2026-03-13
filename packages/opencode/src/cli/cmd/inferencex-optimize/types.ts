@@ -11,7 +11,7 @@ export interface InferenceXDirs {
 }
 
 /** Pipeline execution mode */
-export type PipelineMode = "full" | "benchmark" | "profile" | "benchmark+profile"
+export type PipelineMode = "full" | "benchmark" | "profile" | "benchmark+profile" | "analyze"
 
 /** Full configuration for the InferenceX optimization pipeline */
 export interface InferenceXConfig {
@@ -35,6 +35,8 @@ export interface InferenceXConfig {
   filterConcEnd: string
   /** Filter to a specific sequence length (e.g., "1k1k", "1k8k", "8k1k") */
   filterSeq: string
+  /** Manually specified GPU device IDs (e.g. "0,1,2,3"), empty for auto-select */
+  gpus: string
   /** Whether this is a dry run (preview commands only) */
   dryRun: boolean
   /** Whether to run profiling */
@@ -52,9 +54,9 @@ export const PHASE_ORDER = [
   "env",
   "config",
   "benchmark",
+  "benchmark-analyze",
   "profile",
-  "analyze",
-  "report",
+  "profile-analyze",
 ] as const
 
 export type PhaseName = (typeof PHASE_ORDER)[number]

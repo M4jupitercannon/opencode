@@ -18,7 +18,7 @@ import { select } from "@clack/prompts"
 
 import type { InferenceXConfig, InferenceXDirs, PipelineMode } from "./types"
 import { PHASE_ORDER } from "./types"
-import { buildAgentPrompt, buildAgentConfig } from "./prompt"
+import { buildAgentPrompt, buildAgentConfig, EMBEDDED_SCRIPTS } from "./prompt"
 
 const DOCKER_LABEL = "inferencex-pipeline=true"
 
@@ -91,6 +91,10 @@ export const InferenceXOptimizeCommand = cmd({
         type: "string",
         describe: "filter to specific sequence length (1k1k, 1k8k, 8k1k)",
       })
+      .option("gpus", {
+        type: "string",
+        describe: "comma-separated GPU device IDs to use (e.g., 0,1,2,3); overrides auto-selection. Also respects CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES env vars",
+      })
       .option("dry-run", {
         type: "boolean",
         describe: "preview Docker commands without running them",
@@ -98,12 +102,17 @@ export const InferenceXOptimizeCommand = cmd({
       })
       .option("benchmark", {
         type: "boolean",
-        describe: "run benchmark without profiling (env + config + benchmark + analyze + report)",
+        describe: "run benchmark without profiling (env + config + benchmark + benchmark-analyze)",
         default: false,
       })
       .option("profile", {
         type: "boolean",
-        describe: "run profiling with analysis (env + config + profile + analyze + report)",
+        describe: "run profiling only (env + config + profile)",
+        default: false,
+      })
+      .option("analyze", {
+        type: "boolean",
+        describe: "analyze existing traces/results only (benchmark-analyze + profile-analyze), use with -o to point at existing output dir",
         default: false,
       })
       .option("resume", {
@@ -114,7 +123,7 @@ export const InferenceXOptimizeCommand = cmd({
       .option("from-phase", {
         type: "string",
         alias: "f",
-        describe: "start from specific phase (env, config, benchmark, profile, analyze, report)",
+        describe: "start from specific phase (env, config, benchmark, benchmark-analyze, profile, profile-analyze)",
       }),
   async handler(args) {
     const llmArg = args.llm as string | undefined
@@ -161,10 +170,19 @@ export const InferenceXOptimizeCommand = cmd({
     UI.println(`Output Directory:  ${outputDir}`)
     UI.println(`Repo Directory:    ${repoDir}`)
     UI.println(`HF Cache:          ${hfCache}`)
+    const gpus =
+      (args.gpus as string | undefined) ||
+      process.env.CUDA_VISIBLE_DEVICES ||
+      process.env.ROCR_VISIBLE_DEVICES ||
+      process.env.HIP_VISIBLE_DEVICES ||
+      ""
+
     const benchmarkOnly = args.benchmark as boolean
     const profileOnly = args.profile as boolean
+    const analyzeOnly = args.analyze as boolean
     let mode: PipelineMode = "full"
-    if (benchmarkOnly && profileOnly) mode = "benchmark+profile"
+    if (analyzeOnly) mode = "analyze"
+    else if (benchmarkOnly && profileOnly) mode = "benchmark+profile"
     else if (benchmarkOnly) mode = "benchmark"
     else if (profileOnly) mode = "profile"
 
@@ -177,6 +195,8 @@ export const InferenceXOptimizeCommand = cmd({
       UI.println(`Filter Conc:       ${start} – ${end}`)
     }
     if (args["seq-len"]) UI.println(`Filter Seq Len:    ${args["seq-len"]}`)
+    if (gpus) UI.println(`GPUs:              ${gpus}`)
+    else UI.println(`GPUs:              auto (most free)`)
     if (llmArg) UI.println(`LLM Model:         ${llmArg}`)
     UI.println("============================================")
     UI.println("")
@@ -192,8 +212,17 @@ export const InferenceXOptimizeCommand = cmd({
     Object.values(dirs).forEach((d) => fs.mkdirSync(d, { recursive: true }))
 
     const resumeMode = args.resume as boolean
-    const fromPhase = args["from-phase"] as string | undefined
+    let fromPhase = args["from-phase"] as string | undefined
     const progressFile = path.join(outputDir, "progress.json")
+
+    if (analyzeOnly) {
+      if (!fromPhase) fromPhase = "benchmark-analyze"
+      if (!args.output) {
+        UI.error("--analyze requires --output (-o) pointing to an existing pipeline output directory")
+        UI.println("Example: opencode inferencex-optimize -k <config-key> --analyze -o ./inferencex_<config-key>_<timestamp>")
+        process.exit(1)
+      }
+    }
 
     let existingProgress: any = null
     let startPhase = "env"
@@ -217,7 +246,7 @@ export const InferenceXOptimizeCommand = cmd({
             const completed = existingProgress.phases_completed as string[]
             for (let i = phasesOrder.length - 1; i >= 0; i--) {
               if (completed.includes(phasesOrder[i])) {
-                startPhase = phasesOrder[i + 1] || "report"
+                startPhase = phasesOrder[i + 1] || phasesOrder[phasesOrder.length - 1]
                 break
               }
             }
@@ -246,6 +275,7 @@ export const InferenceXOptimizeCommand = cmd({
       filter_seq: args["seq-len"] || "",
       repo_url: args["repo-url"],
       hf_cache: hfCache,
+      gpus,
     }
     fs.writeFileSync(configFile, JSON.stringify(configData, null, 2))
 
@@ -257,6 +287,12 @@ export const InferenceXOptimizeCommand = cmd({
     }
     if (!existingProgress) {
       fs.writeFileSync(progressFile, JSON.stringify(progress, null, 2))
+    }
+
+    const scriptsDir = path.join(outputDir, "scripts")
+    fs.mkdirSync(scriptsDir, { recursive: true })
+    for (const [name, content] of Object.entries(EMBEDDED_SCRIPTS)) {
+      fs.writeFileSync(path.join(scriptsDir, name), content)
     }
 
     const onExit = () => {
@@ -277,8 +313,9 @@ export const InferenceXOptimizeCommand = cmd({
       filterConcStart: args["conc-start"] != null ? String(args["conc-start"]) : "",
       filterConcEnd: args["conc-end"] != null ? String(args["conc-end"]) : "",
       filterSeq: (args["seq-len"] as string) || "",
+      gpus,
       dryRun: args["dry-run"] as boolean,
-      profile: mode === "profile" || mode === "benchmark+profile",
+      profile: mode === "profile" || mode === "benchmark+profile" || mode === "analyze",
       mode,
       startPhase,
       existingProgress,
@@ -471,12 +508,12 @@ export const InferenceXOptimizeCommand = cmd({
                     { match: "Config Pars", phase: "config", title: "Phase 1: Config Parsing" },
                     { match: "Phase 2", phase: "benchmark", title: "Phase 2: Benchmark Execution" },
                     { match: "Benchmark Execution", phase: "benchmark", title: "Phase 2: Benchmark Execution" },
-                    { match: "Phase 3", phase: "profile", title: "Phase 3: Profiling" },
-                    { match: "Profiling", phase: "profile", title: "Phase 3: Profiling" },
-                    { match: "Phase 4", phase: "analyze", title: "Phase 4: Results Analysis" },
-                    { match: "Results Analysis", phase: "analyze", title: "Phase 4: Results Analysis" },
-                    { match: "Phase 5", phase: "report", title: "Phase 5: Report Generation" },
-                    { match: "Report Generation", phase: "report", title: "Phase 5: Report Generation" },
+                    { match: "Phase 3", phase: "benchmark-analyze", title: "Phase 3: Benchmark Analysis" },
+                    { match: "Benchmark Analysis", phase: "benchmark-analyze", title: "Phase 3: Benchmark Analysis" },
+                    { match: "Phase 4", phase: "profile", title: "Phase 4: Profiling" },
+                    { match: "Profiling", phase: "profile", title: "Phase 4: Profiling" },
+                    { match: "Phase 5", phase: "profile-analyze", title: "Phase 5: Profile Analysis" },
+                    { match: "Profile Analysis", phase: "profile-analyze", title: "Phase 5: Profile Analysis" },
                   ]
                   for (const detection of phaseDetections) {
                     if (content.includes(detection.match) && currentPhase !== detection.phase) {
