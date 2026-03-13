@@ -16,8 +16,7 @@ Run the InferenceX benchmark pipeline for config key: **{{CONFIG_KEY}}**
 - AMD GPUs use `--device=/dev/kfd --device=/dev/dri --group-add video --security-opt seccomp=unconfined`
 - NVIDIA GPUs use `--gpus all`
 - Always use `--shm-size 64g --ipc=host --network=host`
-- **GPU selection strategy**: Start containers with ALL GPUs accessible (no visibility env vars at `docker run` time). Select the most free GPU(s) **inside the container** at `docker exec` time using `select_gpus.py`, then pass the visibility env var to `docker exec`.
-- **CRITICAL AMD caveat**: On ROCm, NEVER set `HIP_VISIBLE_DEVICES` — it breaks PyTorch GPU detection (`RuntimeError: No HIP GPUs are available`). Only use `ROCR_VISIBLE_DEVICES` for AMD GPU visibility.
+- **GPU selection strategy**: Start containers with ALL GPUs accessible (no visibility env vars at `docker run` time). Select the most free GPU(s) **inside the container** at `docker exec` time using `select_gpus.py`, then pass visibility env vars to `docker exec`. For AMD, set both `CUDA_VISIBLE_DEVICES` and `HIP_VISIBLE_DEVICES`. For NVIDIA, set `CUDA_VISIBLE_DEVICES` only.
 
 ## Benchmark Knowledge
 - InferenceX benchmarks test LLM inference performance across different:
