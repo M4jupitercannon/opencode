@@ -14,15 +14,35 @@ def get_amd_gpus():
         if result.returncode != 0:
             return None
         data = json.loads(result.stdout)
-        gpus = []
+        gpus = {}
         for key, info in data.items():
             if not key.startswith("card"):
                 continue
             idx = int(key.replace("card", ""))
             use_str = str(info.get("GPU use (%)", "0"))
             use = float(use_str.replace("%", "").strip())
-            gpus.append((idx, use, 0.0))
-        return gpus
+            gpus[idx] = [idx, use, 0.0]
+
+        try:
+            mem_result = subprocess.run(
+                ["rocm-smi", "--showmeminfo", "vram", "--json"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if mem_result.returncode == 0:
+                mem_data = json.loads(mem_result.stdout)
+                for key, info in mem_data.items():
+                    if not key.startswith("card"):
+                        continue
+                    idx = int(key.replace("card", ""))
+                    if idx in gpus:
+                        used_bytes = float(
+                            str(info.get("VRAM Total Used Memory (B)", "0"))
+                        )
+                        gpus[idx][2] = used_bytes / (1024 ** 2)
+        except Exception:
+            pass
+
+        return [tuple(v) for v in gpus.values()]
     except Exception:
         return None
 

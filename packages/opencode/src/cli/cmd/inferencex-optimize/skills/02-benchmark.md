@@ -41,31 +41,25 @@ Group all configs by their `image` field. Configs sharing the same Docker image 
 Typically all configs for a given config-key use the same image, so there will be a single group.
 
 ### 5. Start One Persistent Container Per Image Group
-Detect GPU vendor, **select the most free GPUs** based on the TP value, and start the container.
+Detect GPU vendor and start the container with access to **all** GPUs. GPU selection happens later at `docker exec` time (not at container start).
 
-**5a. Select GPUs:**
-If GPUs were manually specified via `--gpus` or `CUDA_VISIBLE_DEVICES`/`HIP_VISIBLE_DEVICES`, use those directly. Otherwise, auto-select the most free GPUs based on the TP value:
+**5a. Detect GPU vendor:**
 ```bash
-MANUAL_GPUS="{{GPUS}}"
-MAX_TP=<max TP value from configs in this group>
-if [ -n "$MANUAL_GPUS" ]; then
-    SELECTED_GPUS="$MANUAL_GPUS"
-    echo "Using manually specified GPUs: $SELECTED_GPUS"
+if [[ "$RUNNER" == mi* ]]; then
+    GPU_VENDOR="amd"
 else
-    SELECTED_GPUS=$(python3 {{SCRIPTS_DIR}}/select_gpus.py $MAX_TP)
-    echo "Auto-selected most free GPUs: $SELECTED_GPUS"
+    GPU_VENDOR="nvidia"
 fi
 ```
 
-**5b. Set GPU flags and visibility:**
+**5b. Set GPU device flags (NO GPU visibility env vars):**
+The container gets access to all GPUs. Visibility is restricted per-benchmark at `docker exec` time.
 ```bash
 # For AMD GPUs (runner starts with "mi")
 GPU_FLAGS="--device=/dev/kfd --device=/dev/dri --group-add video --security-opt seccomp=unconfined"
-GPU_ENV="-e ROCR_VISIBLE_DEVICES=$SELECTED_GPUS -e HIP_VISIBLE_DEVICES=$SELECTED_GPUS"
 
 # For NVIDIA GPUs
 GPU_FLAGS="--gpus all"
-GPU_ENV="-e CUDA_VISIBLE_DEVICES=$SELECTED_GPUS"
 ```
 
 **5c. Start container:**
@@ -78,7 +72,6 @@ docker run -d \
     --label inferencex-pipeline=true \
     --entrypoint /bin/bash \
     $GPU_FLAGS \
-    $GPU_ENV \
     --shm-size 64g \
     --ipc=host \
     --network=host \
@@ -91,19 +84,43 @@ docker run -d \
     -c "sleep infinity"
 ```
 
+**5d. Copy GPU selection script into the container:**
+```bash
+docker cp {{SCRIPTS_DIR}}/select_gpus.py "$CONTAINER_NAME":/tmp/select_gpus.py
+```
+
 {{DRY_RUN_NOTE}}
 
 ### 6. Run Each Benchmark via `docker exec`
-For each config in the group, run the benchmark script inside the already-running container using `docker exec`.
+For each config in the group, **select the most free GPUs inside the container**, then run the benchmark script.
 
-CRITICAL: You MUST use **two separate bash tool calls** for each benchmark run — one to print the info, and a second to execute `docker exec`. Do NOT combine them into a single bash call.
+CRITICAL: You MUST use **two separate bash tool calls** for each benchmark run — one to select GPUs and print the info, and a second to execute `docker exec`. Do NOT combine them into a single bash call.
 
-**Bash call 1 — Print DOCKER_LOG and RUN_CMD (separate bash call):**
+**Bash call 1 — Select GPUs and print DOCKER_LOG and RUN_CMD (separate bash call):**
+Select the most free GPUs **inside the container** based on real-time VRAM usage. If GPUs were manually specified, use those instead.
 ```bash
+MANUAL_GPUS="{{GPUS}}"
+if [ -n "$MANUAL_GPUS" ]; then
+    SELECTED_GPUS="$MANUAL_GPUS"
+    echo "Using manually specified GPUs: $SELECTED_GPUS"
+else
+    SELECTED_GPUS=$(docker exec "$CONTAINER_NAME" python3 /tmp/select_gpus.py $TP)
+    echo "Auto-selected most free GPUs (inside container): $SELECTED_GPUS"
+fi
+
+# Set GPU visibility env var for docker exec
+# AMD: ONLY set ROCR_VISIBLE_DEVICES — NEVER set HIP_VISIBLE_DEVICES (it breaks PyTorch/ROCm GPU detection)
+# NVIDIA: set CUDA_VISIBLE_DEVICES
+if [ "$GPU_VENDOR" = "amd" ]; then
+    GPU_ENV="-e ROCR_VISIBLE_DEVICES=$SELECTED_GPUS"
+else
+    GPU_ENV="-e CUDA_VISIBLE_DEVICES=$SELECTED_GPUS"
+fi
+
 RESULT_FILENAME="${EXP_NAME}_${PRECISION}_${FRAMEWORK}_tp${TP}-ep${EP}_conc${CONC}"
 DOCKER_LOG="{{OUTPUT_DIR}}/results/${RESULT_FILENAME}_docker.log"
 echo "DOCKER_LOG: $DOCKER_LOG"
-RUN_CMD="docker exec -e MODEL=$MODEL -e TP=$TP -e EP_SIZE=$EP -e CONC=$CONC -e ISL=$ISL -e OSL=$OSL -e MAX_MODEL_LEN=$MAX_MODEL_LEN -e RANDOM_RANGE_RATIO=0.5 -e RESULT_FILENAME=$RESULT_FILENAME -e PRECISION=$PRECISION -e FRAMEWORK=$FRAMEWORK -e EXP_NAME=$EXP_NAME $CONTAINER_NAME /bin/bash /workspace/$BENCHMARK_SCRIPT"
+RUN_CMD="docker exec $GPU_ENV -e MODEL=$MODEL -e TP=$TP -e EP_SIZE=$EP -e CONC=$CONC -e ISL=$ISL -e OSL=$OSL -e MAX_MODEL_LEN=$MAX_MODEL_LEN -e RANDOM_RANGE_RATIO=0.5 -e RESULT_FILENAME=$RESULT_FILENAME -e PRECISION=$PRECISION -e FRAMEWORK=$FRAMEWORK -e EXP_NAME=$EXP_NAME $CONTAINER_NAME /bin/bash /workspace/$BENCHMARK_SCRIPT"
 echo "RUN_CMD: $RUN_CMD"
 ```
 All variables must be fully expanded to actual values (not shell variables).
@@ -111,6 +128,7 @@ All variables must be fully expanded to actual values (not shell variables).
 **Bash call 2 — Execute docker exec (separate bash call):**
 ```bash
 docker exec \
+    $GPU_ENV \
     -e MODEL=$MODEL \
     -e TP=$TP \
     -e EP_SIZE=$EP \
