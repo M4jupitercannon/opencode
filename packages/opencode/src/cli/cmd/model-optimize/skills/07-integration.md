@@ -8,10 +8,11 @@ Apply optimized kernels to vLLM via CustomOp and measure ACTUAL serving throughp
 
 **This phase is NOT complete until:**
 
-1. A patched vLLM server has ACTUALLY been started and served requests
-2. `vllm bench serve` has been run in **both compiled and eager modes** for baseline and optimized
-3. `optimized_serving.json` (compiled) and `optimized_eager_serving.json` (eager) exist with correct labels
-4. The validation script passes with comparison_results.json containing both modes
+1. `baseline_serving.json` exists (reused from Phase 4 `baseline_benchmark.json`)
+2. A patched vLLM server has ACTUALLY been started and served requests
+3. `vllm bench serve` has been run in **both compiled and eager modes** for the optimized server
+4. `optimized_serving.json` (compiled) and `optimized_eager_serving.json` (eager) exist with correct labels
+5. The validation script passes with `comparison_results.json` containing both modes
 
 **FORBIDDEN:**
 
@@ -36,14 +37,39 @@ BEST_GPU=$(python3 -c "import json; print(json.load(open('{{OUTPUT_DIR}}/env_inf
 
 ---
 
-## Integration Mechanism: vLLM CustomOp.register_oot()
+## Integration Mechanisms
 
-We use vLLM's OFFICIAL extension mechanism (not monkey-patching):
+### 1. vLLM CustomOp.register_oot() (primary)
+
+For kernels that map to vLLM ops (RMSNorm, SiluAndMul, attention, etc.):
 
 - Docs: https://docs.vllm.ai/en/latest/design/custom_op/
 - Each optimized kernel is wrapped as a vLLM CustomOp subclass
 - `CustomOp.register_oot()` replaces the default op at instantiation time
 - If the optimized kernel fails, vLLM falls back to the default
+
+### 2. torch.mm override (for GEMM kernels)
+
+For GEMM kernels (aten::mm) that don't map to a vLLM CustomOp, the plugin patches
+`torch.mm` to dispatch to the optimized Triton GEMM for decode-sized inputs:
+
+```python
+_original_mm = torch.mm
+
+def _patched_mm(a, b, **kwargs):
+    if (a.ndim == 2 and b.ndim == 2
+        and a.dtype == torch.bfloat16
+        and a.shape[0] <= 16
+        and a.shape[1] in MODEL_K_DIMS and b.shape[1] in MODEL_N_DIMS):
+        return optimized_gemm(a, b)
+    return _original_mm(a, b, **kwargs)
+
+torch.mm = _patched_mm
+```
+
+The `generate_vllm_plugin.py` script automatically adds this override for GEMM `_opt.py` files
+that don't have a CustomOp mapping. The shape conditions are derived from the model config
+(hidden_size, intermediate_size, num_kv_heads * head_dim, vocab_size).
 
 ---
 
@@ -106,70 +132,25 @@ rocm-smi --showuse --showmemuse 2>/dev/null | grep -A2 "GPU\[$BEST_GPU\]"
 
 Run this cleanup **before every server start** — not just once at the beginning.
 
-## Step 3: ⛔ MANDATORY — Benchmark Baseline (both modes)
+## Step 3: Reuse Phase 4 Baseline
 
-Benchmark the **unoptimized** vLLM server in two modes to establish comparison points:
-- **Compiled mode** (production): torch.compile + CUDAGraphs active — highest throughput
-- **Eager mode** (diagnostic): `--enforce-eager` — shows raw kernel execution without compilation optimizations
-
-> WHY BOTH? Kernel-level optimizations (from Phase 6) are often masked by torch.compile + CUDAGraphs
-> in compiled mode. Eager mode isolates the kernel impact. Compiled mode shows the real production number.
-
-### 3a: Baseline — compiled mode (production)
+Phase 4 already collected a baseline throughput benchmark (`baseline_benchmark.json`) with the same model, parameters, and container. **Do NOT re-run the baseline** — copy it to the report directory instead.
 
 ```bash
-vllm serve {{HF_MODEL}} --dtype auto --max-model-len 4096 --port 8192 --no-enable-log-requests --gpu-memory-utilization 0.85 &> {{OUTPUT_DIR}}/vllm_baseline_compiled.log &
-VLLM_PID=$!
-for i in $(seq 1 60); do curl -s http://localhost:8192/health > /dev/null 2>&1 && break; sleep 5; done
-curl -s http://localhost:8192/health > /dev/null 2>&1 && echo "Ready" || { echo "FAILED"; tail -3 {{OUTPUT_DIR}}/vllm_baseline_compiled.log; }
+cp {{PROFILE_DIR}}/baseline_benchmark.json {{REPORT_DIR}}/baseline_serving.json
+echo "Baseline reused from Phase 4"
 
-vllm bench serve \
-  --model {{HF_MODEL}} --port 8192 \
-  --dataset-name random \
-  --input-len {{INPUT_LEN}} --output-len {{OUTPUT_LEN}} \
-  --num-prompts {{NUM_PROMPTS}} --max-concurrency {{CONCURRENCY}} \
-  --request-rate inf --save-result \
-  --result-dir {{REPORT_DIR}} --result-filename baseline_serving.json --label baseline \
-  &> {{REPORT_DIR}}/bench_baseline.log
-
-kill $VLLM_PID 2>/dev/null; wait $VLLM_PID 2>/dev/null
-```
-
-### 3b: Baseline — eager mode (diagnostic)
-
-```bash
-vllm serve {{HF_MODEL}} --dtype auto --max-model-len 4096 --port 8192 --enforce-eager --no-enable-log-requests --gpu-memory-utilization 0.85 &> {{OUTPUT_DIR}}/vllm_baseline_eager.log &
-VLLM_PID=$!
-for i in $(seq 1 60); do curl -s http://localhost:8192/health > /dev/null 2>&1 && break; sleep 5; done
-curl -s http://localhost:8192/health > /dev/null 2>&1 && echo "Ready" || { echo "FAILED"; tail -3 {{OUTPUT_DIR}}/vllm_baseline_eager.log; }
-
-vllm bench serve \
-  --model {{HF_MODEL}} --port 8192 \
-  --dataset-name random \
-  --input-len {{INPUT_LEN}} --output-len {{OUTPUT_LEN}} \
-  --num-prompts {{NUM_PROMPTS}} --max-concurrency {{CONCURRENCY}} \
-  --request-rate inf --save-result \
-  --result-dir {{REPORT_DIR}} --result-filename baseline_eager_serving.json --label baseline_eager \
-  &> {{REPORT_DIR}}/bench_baseline_eager.log
-
-kill $VLLM_PID 2>/dev/null; wait $VLLM_PID 2>/dev/null
-```
-
-Print both baselines:
-
-```bash
 python3 -c "
 import json
-for fname, label in [('baseline_serving.json', 'Baseline (compiled)'), ('baseline_eager_serving.json', 'Baseline (eager)')]:
-    try:
-        d = json.load(open('{{REPORT_DIR}}/' + fname))
-        print(f'=== {label} ===')
-        for k in ['output_throughput','mean_tpot_ms','mean_ttft_ms','completed']:
-            print(f'  {k}: {d.get(k,\"N/A\")}')
-    except FileNotFoundError:
-        print(f'=== {label} === MISSING')
+d = json.load(open('{{REPORT_DIR}}/baseline_serving.json'))
+print('=== Baseline (from Phase 4) ===')
+for k in ['output_throughput','mean_tpot_ms','mean_ttft_ms','completed']:
+    print(f'  {k}: {d.get(k,\"N/A\")}')
 "
 ```
+
+> **Why reuse?** The baseline environment (same container, same GPU, same model weights) hasn't changed.
+> Re-running wastes ~10 minutes of server startup + benchmark time.
 
 ## Step 4: ⛔ MANDATORY — Benchmark Optimized vLLM (both modes)
 

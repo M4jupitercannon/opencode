@@ -23,8 +23,9 @@ See `/model-analyze` for those phases. The following artifacts from Phase 4 are 
 - `<output_dir>/profile/prefilldecode_report/unified_perf_summary.csv`
 
 **For Phase 6 (GEAK optimization):**
-- `AMD_LLM_API_KEY` environment variable must be set (used by GEAK to call the LLM orchestrator)
-- GEAK must be installed in the Docker container (checked during Phase 0)
+- An LLM API key (`AMD_LLM_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY`) must be configured (prompted during Phase 0 Step 6)
+- GEAK (`mini` CLI) must be installed in the Docker container (installed from `main` branch during Phase 0 Step 7)
+- Check `env_info.json` for `geak_available: true` — if `false`, Phase 6 uses manual Triton fallback
 
 ## Variable Definitions
 
@@ -51,7 +52,9 @@ Skills use `{{VAR}}` placeholders. When reading skills, substitute:
 - **ALL vLLM commands MUST redirect output to log files** (`&> logfile`) — NEVER dump vLLM logs into bash output
 - **ALL decisions MUST be data-driven** — read shapes from TraceLens `analysis_summary.json` / `unified_perf_summary.csv`, not hardcoded
 - **Optimized kernels MUST use @triton.jit** — torch rewrites are FORBIDDEN
-- **Integrate via vLLM CustomOp.register_oot()** — NEVER modify installed packages
+- **Integrate via vLLM CustomOp.register_oot()** for ops with CustomOp mappings (RMSNorm, SiluAndMul, etc.)
+- **Integrate GEMM kernels via torch.mm override** for decode shapes that don't map to CustomOps
+- **NEVER modify installed packages**
 - **Serving benchmarks MUST use `vllm bench serve --save-result`**
 
 ## MANDATORY VALIDATION
@@ -82,18 +85,18 @@ Convert bottleneck operators into Problem files. Classify each kernel type to de
 
 Read and follow `~/.config/opencode/skills/06-kernel-optimize.md`.
 
-Use GEAK to optimize each bottleneck kernel using the appropriate mode based on `kernel_type`. Requires `AMD_LLM_API_KEY`, GEAK, and `geak-oe` (for C++ kernels) installed in the container.
+Use GEAK (`mini` CLI) to optimize each bottleneck kernel using the appropriate mode based on `kernel_type`. Requires an LLM API key, GEAK (`mini`), and `geak-oe` (for C++ kernels) installed in the container.
 
 Steps:
-1. **Verify GEAK + geak-oe** — check `geak --help` and `/opt/geak-oe` in the container
+1. **Verify GEAK + API key** — check `mini --help`, API key in `.env`, `geak_available` in `env_info.json`. If missing, ask user for API key.
 2. **Read manifest, detect GPU architecture**
-3a. **HIP/CK/ASM/composite kernels** — launch `geak --kernel-url` on C++ source (see `hip-kernel-optimize-geak.md`)
-3b. **Triton/ATen kernels** — launch `geak -m claude-opus-4.6 -t "Optimize ..." --yolo` with kernel-type-aware task descriptions
-3.5. **Collect patches** — extract optimized kernels from GEAK `optimization_logs/` and `geak_output/results/`
+3a. **HIP/CK/ASM/composite kernels** — launch `mini --config mini_kernel.yaml` on C++ source (see `hip-kernel-optimize-geak.md`)
+3b. **Triton/ATen kernels** — launch `mini -m claude-opus-4.6 --config geak.yaml -t "Optimize ..." --yolo` with kernel-type-aware task descriptions, parallel across GPUs
+3.5. **Collect and recover patches** — extract optimized kernels from `optimization_logs/`. If `[SelectPatch]` fails to apply, recover the best kernel directly from the patch diff and re-verify with `kernel_test_runner.py`
 4. **Verify results** — check correctness + benchmark each optimized kernel against baseline
 5. **Copy winning kernels** — speedup > 1.0x go to `<output_dir>/optimized/` (note: kernel speedup may not equal E2E speedup)
 
-If GEAK is unavailable, fall back to manual Triton kernel writing using `kernel_test_runner.py` and `kernel_finalize.py`.
+If GEAK is unavailable or the user cannot provide an API key, fall back to manual Triton kernel writing using `kernel_test_runner.py` and `kernel_finalize.py`.
 
 ---
 
@@ -101,18 +104,19 @@ If GEAK is unavailable, fall back to manual Triton kernel writing using `kernel_
 
 Read and follow `~/.config/opencode/skills/07-integration.md`.
 
-Apply optimized kernels to vLLM via CustomOp and measure ACTUAL serving throughput.
+Apply optimized kernels to vLLM via CustomOp + torch.mm override and measure ACTUAL serving throughput.
 
 **This phase is NOT complete until:**
 
-1. A patched vLLM server has ACTUALLY been started and served requests
-2. `vllm bench serve` has been run against the patched server
-3. `optimized_serving.json` has `"label": "optimized"` (NOT "baseline")
-4. The validation script passes
+1. `baseline_serving.json` exists (reused from Phase 4 `baseline_benchmark.json` — do NOT re-run)
+2. A patched vLLM server has ACTUALLY been started and served requests
+3. `vllm bench serve` has been run in **both compiled and eager modes** for the optimized server
+4. `optimized_serving.json` (compiled) and `optimized_eager_serving.json` (eager) exist with correct labels
+5. The validation script passes with `comparison_results.json`
 
 **FORBIDDEN**: Estimating speedup with Amdahl's law, copying baseline numbers, reporting "estimated" speedup, skipping the patched server benchmark.
 
-Steps: generate vLLM plugin (`generate_vllm_plugin.py`), test plugin registration, benchmark baseline, benchmark patched server, validate results.
+Steps: generate vLLM plugin (`generate_vllm_plugin.py` — creates CustomOp registrations + torch.mm GEMM override), test plugin registration, reuse Phase 4 baseline, benchmark patched server (compiled + eager), validate results.
 
 ---
 

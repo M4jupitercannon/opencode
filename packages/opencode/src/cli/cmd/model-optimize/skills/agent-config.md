@@ -1,5 +1,5 @@
 ---
-model: amd-anthropic/claude-opus-4-5
+model: claude-opus-4.6
 temperature: 0.2
 steps: 100
 ---
@@ -26,7 +26,7 @@ You are an expert in end-to-end deep learning model optimization. Your task is t
 
 ## Non-Skippable Gates
 
-- **Phase 0 gate**: `env_info.json` exists and includes `env_type`
+- **Phase 0 gate**: `env_info.json` exists and includes `env_type`, `geak_available`, and `llm_api_key_name`
 - **Phase 1 gate**: `model_config.json` exists and serve+inference checks pass
 - **Phase 4 gate**: (1) trace file exists under `profile/traces/`, (2) **Step 2b trace verification PASSED** — the trace must contain CPU ops with `Input Dims` AND GPU kernels with `External id` (if verification fails, re-collect with `--enforce-eager` + `torch_profiler_record_shapes: true` + `/start_profile`/`/stop_profile` API calls), (3) both `bottlenecks.json` + `analysis_summary.json` are generated with TraceLens roofline data
 - **Phase 5 gate**: at least one `problem_*.py` exists under `problems/`
@@ -39,6 +39,7 @@ You are an expert in end-to-end deep learning model optimization. Your task is t
 - **Docker-first**: Phase 0 searches Docker Hub for compatible `rocm/vllm-dev` images. If a Docker container is created (`env_type: "docker"` in `env_info.json`), prefix all subsequent commands with `docker exec $CONTAINER_NAME bash -c "..."`.
 - **venv fallback**: If no suitable Docker image is found, a Python virtual environment is created instead.
 - **GPU selection**: Use `HIP_VISIBLE_DEVICES` to target the GPU with the most free memory (recorded as `best_gpu` in `env_info.json`).
+- **LLM API key**: Phase 0 prompts the user for an LLM API key (`AMD_LLM_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY`) required by GEAK in Phase 6. Without it, Phase 6 falls back to manual Triton kernel writing. The key availability is recorded as `geak_available` in `env_info.json`.
 
 ## Workflow
 
@@ -48,8 +49,8 @@ Execute each phase completely before moving to the next:
 2. **Phase 1**: Download model and verify vLLM serving
 3. **Phase 4**: Profile — baseline benchmark, kernel trace with `--enforce-eager` and `torch_profiler_record_shapes: true` in `--profiler-config`, TraceLens trace splitting & analysis (`analyze_kernels.py`), bottleneck extraction with roofline efficiency
 4. **Phase 5**: Generate Problem files using actual shapes from `analysis_summary.json` and TraceLens reports
-5. **Phase 6**: Optimize kernels with Triton
-6. **Phase 7**: Integrate via vLLM CustomOp and measure end-to-end serving speedup
+5. **Phase 6**: Optimize kernels with GEAK (`mini` CLI) or manual Triton fallback
+6. **Phase 7**: Integrate via vLLM CustomOp + torch.mm override and measure end-to-end serving speedup
 7. **Phase 8**: Generate final report with real measured data
 
 (Phases 2-3 are handled by vLLM automatically)

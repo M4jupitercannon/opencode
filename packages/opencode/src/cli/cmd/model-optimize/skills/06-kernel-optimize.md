@@ -2,13 +2,14 @@
 
 ## Goal
 Optimize each bottleneck kernel using the appropriate GEAK mode based on `kernel_type`:
-- **C++ kernels** (`hip`, `ck`, `asm`, `triton_composite`): use `geak --kernel-url` to optimize the source in-place
-- **Python/Triton kernels** (`triton`, `aten_gemm`, `aten_elementwise`): use `geak -t` (simple mode) to write optimized Triton replacements
+- **C++ kernels** (`hip`, `ck`, `asm`, `triton_composite`): use `mini --config mini_kernel.yaml` to optimize the source in-place
+- **Python/Triton kernels** (`triton`, `aten_gemm`, `aten_elementwise`): use `mini -t` (simple mode) to write optimized Triton replacements
 
 ## Prerequisites
-- GEAK must be installed in the Docker container (`geak --help` works)
-- `AMD_LLM_API_KEY` must be set in `/root/.config/mini-swe-agent/.env`
-- For `hip`/`ck`/`asm` kernels: `geak-oe` must be installed (`/opt/geak-oe`) -- see Phase 0
+- GEAK (mini CLI) must be installed in the Docker container (`mini --help` works) — installed from `main` branch in Phase 0
+- An LLM API key must be configured in `/root/.config/mini-swe-agent/.env` (set during Phase 0 Step 6)
+- Check `env_info.json` for `geak_available: true` — if `false`, skip to the manual fallback section
+- For `hip`/`ck`/`asm` kernels: `geak-oe` must be installed (`/opt/geak-oe`) — see Phase 0
 - Problem files from Phase 5 in `{{PROBLEMS_DIR}}/`
 - `optimization_manifest.json` in `{{PROBLEMS_DIR}}/` with `kernel_type` and `source_file` metadata
 
@@ -21,16 +22,22 @@ CONTAINER_NAME=$(python3 -c "import json; print(json.load(open('{{OUTPUT_DIR}}/e
 GPU_COUNT=$(python3 -c "import json; print(json.load(open('{{OUTPUT_DIR}}/env_info.json')).get('gpu_count',1))" 2>/dev/null || echo 1)
 ```
 
-## Step 1: Verify GEAK availability
+## Step 0: Verify GEAK availability and API key
+
+⛔ **Check BEFORE doing anything else.** If either check fails, skip to the manual fallback section at the bottom.
 
 ```bash
-docker exec $CONTAINER_NAME bash -c "geak --help >/dev/null 2>&1 && echo 'GEAK available' || echo 'GEAK NOT available -- install it first'"
+# Check GEAK (mini CLI) is installed
+docker exec $CONTAINER_NAME bash -c "python3 -c 'from minisweagent.run.mini import app; print(\"mini: OK\")'" 2>&1 | tail -1
+
+# Check API key is configured
+docker exec $CONTAINER_NAME bash -c "cat /root/.config/mini-swe-agent/.env 2>/dev/null | grep -qE 'AMD_LLM_API_KEY|ANTHROPIC_API_KEY|OPENAI_API_KEY' && echo 'API key: OK' || echo 'API key: MISSING'"
+
+# Check env_info.json
+python3 -c "import json; d=json.load(open('{{OUTPUT_DIR}}/env_info.json')); print(f'geak_available: {d.get(\"geak_available\", False)}')"
 ```
 
-If GEAK is not available, install it:
-```bash
-docker exec $CONTAINER_NAME bash -c "cd /workspace/GEAK && pip install -e . 2>/dev/null"
-```
+If `geak_available` is `false` or the API key is missing, **ask the user for an API key** (AMD_LLM_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY). If the user cannot provide one, skip to the manual fallback section.
 
 ## Step 2: Read optimization manifest and detect GPU architecture
 
@@ -39,32 +46,33 @@ GPU_ARCH=$(docker exec $CONTAINER_NAME bash -c "rocminfo 2>/dev/null | grep -oP 
 GPU_NAME=$(docker exec $CONTAINER_NAME bash -c "rocm-smi --showproductname 2>/dev/null | grep -oP 'MI\w+' | head -1 || echo 'AMD GPU'")
 ```
 
-## Step 3a: Optimize C++ kernels via `geak --kernel-url`
+## Step 3a: Optimize C++ kernels via `mini --config mini_kernel.yaml`
 
 For each manifest entry where `kernel_type` is `hip`, `ck`, `asm`, or `triton_composite` AND `source_file` is available:
 
 1. **Prepare workspace**: copy source file and dependencies, init git repo, set up build system
-2. **Launch**: `geak --kernel-url <source_file>#L<line> --workspace ... --repo ... --gpu-ids 0,1 --yolo`
-3. **Monitor**: check `geak_output/results/round_*/*/task_*.log` for patches and speedups
+2. **Launch**: `mini -m claude-opus-4.6 --config mini_kernel.yaml --repo <workspace> --gpu-ids 0,1 --yolo -t "Optimize <source_file>"`
+3. **Monitor**: check `optimization_logs/<name>_<timestamp>/mini_agent.log` for progress and patches
 
 For the full procedure, see `hip-kernel-optimize-geak.md`.
 
 ```bash
 docker exec -d -e HIP_VISIBLE_DEVICES=$GPU_IDS -e GEAK_OE_ROOT=/opt/geak-oe $CONTAINER_NAME bash -c "
   cd /workspace/${NAME}_opt
-  geak -m claude-opus-4.6 \
-    --kernel-url /workspace/${NAME}_opt/csrc/kernels/${SOURCE_FILE}#L${LINE} \
-    --workspace /workspace/${NAME}_opt \
+  mini -m claude-opus-4.6 \
+    --config mini_kernel.yaml \
     --repo /workspace/${NAME}_opt \
     --gpu-ids 0,1 \
-    -o /workspace/${NAME}_opt/geak_output \
-    --yolo &> /workspace/${NAME}_opt/geak.log
+    -o /workspace/${NAME}_opt/traj.json \
+    --yolo \
+    -t 'Optimize /workspace/${NAME}_opt/csrc/kernels/${SOURCE_FILE}: improve kernel performance on AMD ${GPU_ARCH}. Test: python3 test_harness.py --benchmark' \
+    &> /workspace/${NAME}_opt/mini.log
 "
 ```
 
-If a `geak --kernel-url` optimization finds speedup > 1.0x, install the winning source via the appropriate rebuild mechanism (e.g., `AITER_REBUILD=1` for aiter kernels, `pip install -e .` for others).
+If a kernel-url optimization finds speedup > 1.0x, install the winning source via the appropriate rebuild mechanism (e.g., `AITER_REBUILD=1` for aiter kernels, `pip install -e .` for others).
 
-## Step 3b: Optimize Triton/ATen kernels via `geak -t` (simple mode)
+## Step 3b: Optimize Triton/ATen kernels via `mini -t` (simple mode)
 
 For each manifest entry where `kernel_type` is `triton`, `aten_gemm`, or `aten_elementwise`:
 
@@ -102,38 +110,81 @@ for opt in enabled:
     gpu_idx = (gpu_idx + 1) % int(os.environ.get('GPU_COUNT', '1'))
 ```
 
+⚠️ **CRITICAL**: The `-o` output path must be short (e.g. `traj_${NAME}.json`). Long task descriptions used as filenames cause `OSError: File name too long`.
+
+⚠️ **CRITICAL**: Initialize git in the working directory before launching mini, otherwise patch generation fails:
+```bash
+docker exec $CONTAINER_NAME bash -c "cd {{PROBLEMS_DIR}} && git init && git add -A && git commit -m init" 2>/dev/null
+```
+
 ```bash
 docker exec -d -e HIP_VISIBLE_DEVICES=$GPU_ID $CONTAINER_NAME bash -c "
   cd {{PROBLEMS_DIR}}
-  geak -m claude-opus-4.6 \
+  mini -m claude-opus-4.6 \
+    --config geak.yaml \
+    --gpu-ids 0 --yolo \
+    -o {{PROBLEMS_DIR}}/traj_${NAME}.json \
     -t '$TASK' \
-    --gpu-ids 0 --yolo &> {{PROBLEMS_DIR}}/geak_${NAME}.log
+    &> {{PROBLEMS_DIR}}/log_${NAME}.txt
 "
 ```
 
-## Step 3.5: Collect GEAK patches
+## Step 3.5: Collect GEAK patches and recover best kernels
 
-GEAK stores optimized kernels in `optimization_logs/<name>_<timestamp>/patch_N.patch` (simple mode) or `geak_output/results/round_N/worktrees/slot_N/` (kernel-url mode). These are NOT applied to the original problem files automatically.
+GEAK stores results in `optimization_logs/<name>_<timestamp>/`:
+- `patch_N.patch` — git diff patches
+- `patch_N_test.txt` — test results with `RESULT_JSON: {...}` or `GEAK_RESULT_LATENCY_MS=...`
+- `mini_agent.log` — full agent log
 
-**For simple-mode patches**: extract the `kernel.py` from the best patch (lowest `GEAK_RESULT_LATENCY_MS` in `patch_N_test.txt`) and copy to `{{OPTIMIZED_DIR}}/`.
+⚠️ **CRITICAL**: GEAK's `[SelectPatch]` may fail to apply the best patch (e.g. git working directory conflicts). When this happens, the `_best.json` tracker will have a **lower speedup** than the actual best GEAK patch. You MUST recover the best kernel from the patch diff.
 
-**For kernel-url patches**: the winning source is already in the worktree. Copy it and install via the appropriate rebuild mechanism.
+### Recovery procedure
+
+For each kernel in `optimization_logs/`:
+
+1. **Check if `[SelectPatch]` succeeded** — look for `"Best patch applied successfully"` in the log. If yes, the `_opt.py` file already has the best code.
+
+2. **If `[SelectPatch] Failed to apply`** — extract the optimized `_opt.py` from the best patch:
 
 ```bash
-# Simple mode: find best patch per kernel
-for dir in {{PROBLEMS_DIR}}/optimization_logs/*/; do
-  best=$(for t in $dir/patch_*_test.txt; do
-    [ -f "$t" ] && lat=$(grep -oP "GEAK_RESULT_LATENCY_MS=([0-9.]+)" "$t" | tail -1 | cut -d= -f2) && echo "$lat $t"
-  done | sort -n | head -1 | awk '{print $2}')
-  [ -n "$best" ] && echo "Best: $best"
-done
+cd {{PROBLEMS_DIR}}
+for dir in optimization_logs/*/; do
+  name=$(basename $dir | sed 's/_[0-9]*$//')
 
-# Kernel-url mode: find best patch
-for p in /workspace/*_opt/geak_output/results/round_*/*/patch_*_test.txt; do
-  lat=$(grep -oP "GEAK_RESULT_LATENCY_MS=([0-9.]+)" "$p" | tail -1 | cut -d= -f2)
-  echo "$lat $p"
-done | sort -n | head -1
+  # Find the best patch by RESULT_JSON speedup
+  best_patch=""
+  best_speedup="0"
+  for t in $dir/patch_*_test.txt; do
+    [ -f "$t" ] || continue
+    speedup=$(grep 'RESULT_JSON' "$t" | tail -1 | python3 -c "import sys,json; d=json.loads(sys.stdin.read().split('RESULT_JSON: ')[1]); print(d.get('speedup',0))" 2>/dev/null || echo 0)
+    if python3 -c "exit(0 if float('$speedup') > float('$best_speedup') else 1)"; then
+      best_speedup="$speedup"
+      best_patch="${t%_test.txt}.patch"
+    fi
+  done
+
+  if [ -n "$best_patch" ] && [ -f "$best_patch" ]; then
+    echo "$name: best patch=$best_patch speedup=${best_speedup}x"
+
+    # Extract the _opt.py content from the patch diff
+    OPT_FILE=$(grep -oP 'problems/problem_\S+_opt\.py' "$best_patch" | head -1)
+    if [ -n "$OPT_FILE" ]; then
+      # Apply just this file from the patch
+      git apply --include="$OPT_FILE" "$best_patch" 2>/dev/null || \
+        git apply --include="$OPT_FILE" --3way "$best_patch" 2>/dev/null || \
+        echo "  WARNING: could not apply patch for $OPT_FILE — extract manually"
+    fi
+  fi
+done
 ```
+
+3. **Verify recovered code** — re-run `kernel_test_runner.py` to confirm the recovered kernel matches the GEAK patch speedup:
+
+```bash
+python3 {{OUTPUT_DIR}}/scripts/kernel_test_runner.py --src $PROBLEM.py --target ${PROBLEM}_opt.py
+```
+
+If the `_best.json` speedup is significantly lower than the patch speedup, the recovery was needed.
 
 ## Step 4: Verify results
 
@@ -228,8 +279,11 @@ Update progress.json: phases_completed.append("optimize")
 
 ## When GEAK is not available (fallback)
 
-If GEAK cannot be installed or the API key is not set, fall back to manual optimization:
-for each problem file (regardless of `kernel_type`), write a `ModelNew` class with
-`@triton.jit` kernels + `@triton.autotune`, test with `kernel_test_runner.py`, iterate,
-and finalize with `kernel_finalize.py`.
-See the previous version of this skill for the manual workflow details.
+If `env_info.json` has `geak_available: false` or the LLM API key is missing after asking the user, fall back to manual optimization:
+
+1. For each problem file (prioritized by `optimization_manifest.json` priority: HIGH first), write a `ModelNew` class with `@triton.jit` kernels + `@triton.autotune`
+2. Test with `kernel_test_runner.py --src <problem>.py --target <problem>_opt.py`
+3. Iterate on the kernel (adjust block sizes, num_warps, memory access patterns) until speedup > 1.0x or 5 attempts exhausted
+4. Finalize with `kernel_finalize.py --target <problem>_opt.py` (writes the BEST code, not last)
+
+Focus on the highest-impact kernels first: fused ops (residual+RMSNorm, SwiGLU) typically give the best speedups because they reduce memory traffic.
