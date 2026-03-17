@@ -52,7 +52,7 @@ const SKILL_FILES = [
 ]
 
 const MODE_PHASES: Record<PipelineMode, readonly string[]> = {
-  full: ["env", "config", "benchmark", "benchmark-analyze"],
+  full: ["env", "config", "benchmark", "benchmark-analyze", "profile", "profile-analyze"],
   benchmark: ["env", "config", "benchmark", "benchmark-analyze"],
   profile: ["env", "config", "profile", "profile-analyze"],
   "benchmark+profile": ["env", "config", "benchmark", "benchmark-analyze", "profile", "profile-analyze"],
@@ -204,8 +204,10 @@ function buildHeader(
     resumeContext = "\n## RESUME MODE ACTIVE\n" +
       "**Starting from Phase: " + startPhase + "**\n" +
       prevProgress +
-      "\n**IMPORTANT**: Skip phases before \"" + startPhase + "\" - their artifacts already exist.\n" +
-      "Review existing files before proceeding to understand current state.\n\n---\n"
+      "\n**IMPORTANT**: Skip phases before \"" + startPhase + "\" — their artifacts already exist.\n" +
+      "Review *input* artifacts from previous phases to understand current state, " +
+      "but **always re-run the starting phase fully** even if its output artifacts already exist " +
+      "(the user is explicitly requesting a re-run of this phase).\n\n---\n"
   }
 
   const activePhases = MODE_PHASES[mode]
@@ -267,14 +269,15 @@ function buildExecutionInstructions(
   } else {
     modeInstructions =
       '\n## ' + modeLabel + ' Mode — Starting from "' + startPhase + '"\n' +
-      '1. **Skip phases before "' + startPhase + '"** - their artifacts already exist\n' +
+      '1. **Skip phases before "' + startPhase + '"** — their artifacts already exist\n' +
       "2. **ONLY run these phases**: " + activePhases.join(" → ") + "\n" +
-      "3. **Review existing files first** to understand current state\n" +
-      "4. **Continue from Phase: " + startPhase + "**\n\n" +
+      "3. **Review input artifacts from previous phases** to understand current state\n" +
+      "4. **Re-run Phase " + startPhase + " fully** — clean up any old output from this phase and re-run from scratch\n\n" +
       "### Quick Start Checklist\n" +
       "- [ ] Read existing progress.json\n" +
-      "- [ ] Verify artifacts from previous phases exist\n" +
-      "- [ ] Start working on Phase: " + startPhase + "\n"
+      "- [ ] Verify input artifacts from previous phases exist\n" +
+      "- [ ] Clean up old output from Phase: " + startPhase + " (if any)\n" +
+      "- [ ] Run Phase: " + startPhase + " from scratch\n"
   }
 
   return "# EXECUTION INSTRUCTIONS\n" +

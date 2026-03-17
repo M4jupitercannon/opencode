@@ -62,6 +62,8 @@ CLI_GENERATE_REPORT = "TraceLens_generate_perf_report_pytorch"
 CLI_MULTI_RANK_COLLECTIVE = "TraceLens_generate_multi_rank_collective_report_pytorch"
 CLI_COMPARE_REPORTS = "TraceLens_compare_perf_reports_pytorch"
 TRACELENS_INSTALL_URL = "git+https://github.com/AMD-AIG-AIMA/TraceLens.git"
+TRACELENS_INTERNAL_REPO = "git@github.com:AMD-AGI/TraceLens-internal.git"
+TRACELENS_LOCAL_DIR = os.path.join(os.path.expanduser("~"), "TraceLens-internal")
 
 
 # ---------------------------------------------------------------------------
@@ -590,15 +592,35 @@ def ensure_tracelens_installed() -> bool:
     except ImportError:
         pass
 
-    logger.info(f"TraceLens not found. Installing from {TRACELENS_INSTALL_URL}...")
+    # Prefer local clone of the internal repo (matches skill 05-profile-analyze)
+    if os.path.isdir(TRACELENS_LOCAL_DIR):
+        logger.info(f"Installing TraceLens from local clone: {TRACELENS_LOCAL_DIR}")
+        install_src = TRACELENS_LOCAL_DIR
+    else:
+        # Try cloning the internal repo first
+        try:
+            logger.info(f"Cloning TraceLens from {TRACELENS_INTERNAL_REPO}...")
+            subprocess.run(
+                ["git", "clone", TRACELENS_INTERNAL_REPO, TRACELENS_LOCAL_DIR],
+                capture_output=True, text=True, timeout=120,
+            )
+            if os.path.isdir(TRACELENS_LOCAL_DIR):
+                install_src = TRACELENS_LOCAL_DIR
+            else:
+                install_src = TRACELENS_INSTALL_URL
+        except Exception:
+            logger.info(f"Internal repo unavailable, falling back to {TRACELENS_INSTALL_URL}")
+            install_src = TRACELENS_INSTALL_URL
 
+    logger.info(f"Installing TraceLens from {install_src}...")
     try:
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", TRACELENS_INSTALL_URL],
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
+        pip_cmd = [sys.executable, "-m", "pip", "install"]
+        if install_src == TRACELENS_LOCAL_DIR:
+            pip_cmd += ["--no-build-isolation", install_src]
+        else:
+            pip_cmd.append(install_src)
+
+        result = subprocess.run(pip_cmd, capture_output=True, text=True, timeout=300)
 
         if result.returncode == 0:
             logger.info("TraceLens installed successfully")

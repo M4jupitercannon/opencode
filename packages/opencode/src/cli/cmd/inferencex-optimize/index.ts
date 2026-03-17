@@ -107,7 +107,7 @@ export const InferenceXOptimizeCommand = cmd({
       })
       .option("profile", {
         type: "boolean",
-        describe: "run profiling only (env + config + profile)",
+        describe: "run profiling only (env + config + profile + profile-analyze)",
         default: false,
       })
       .option("analyze", {
@@ -315,7 +315,7 @@ export const InferenceXOptimizeCommand = cmd({
       filterSeq: (args["seq-len"] as string) || "",
       gpus,
       dryRun: args["dry-run"] as boolean,
-      profile: mode === "profile" || mode === "benchmark+profile" || mode === "analyze",
+      profile: mode === "full" || mode === "profile" || mode === "benchmark+profile" || mode === "analyze",
       mode,
       startPhase,
       existingProgress,
