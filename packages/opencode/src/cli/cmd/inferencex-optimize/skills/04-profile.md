@@ -81,22 +81,41 @@ cd {{REPO_DIR}} && git checkout -- "$BENCHMARK_SCRIPT" benchmarks/benchmark_lib.
 
 Now patch the target benchmark script inside the container to inject `--profiler-config.*` args into the `vllm serve` command:
 ```bash
-docker exec "$CONTAINER_NAME" python3 - "/workspace/$BENCHMARK_SCRIPT" <<'PYEOF'
-import sys, os, re
+docker exec \
+    -e OSL="${OSL}" -e CONC="${CONC}" -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO:-1.0}" \
+    "$CONTAINER_NAME" python3 - "/workspace/$BENCHMARK_SCRIPT" <<'PYEOF'
+import sys, os, re, math
+
 target = sys.argv[1]
 prof_dir = os.environ.get('VLLM_TORCH_PROFILER_DIR', '/workspace/profiles')
+
+osl = int(os.environ.get('OSL', '512'))
+conc = int(os.environ.get('CONC', '32'))
+rrr = float(os.environ.get('RANDOM_RANGE_RATIO', '1.0'))
+
+max_iters = int(min(osl, osl * 16 / conc))
+if rrr < 1:
+    delay_iters = int(osl * rrr * 6)
+else:
+    delay_iters = int(osl * 5 - max_iters / 2)
+
+print(f'Computed profiler iterations: delay={delay_iters}, max={max_iters}  '
+      f'(OSL={osl}, CONC={conc}, RANDOM_RANGE_RATIO={rrr})')
+
 profiler_args = (
+    '--enforce-eager '
     '--profiler-config.profiler torch '
     '--profiler-config.torch_profiler_dir ' + prof_dir + ' '
     '--profiler-config.torch_profiler_record_shapes True '
     '--profiler-config.torch_profiler_with_memory True '
-    '--profiler-config.torch_profiler_with_flops True '
+    '--profiler-config.torch_profiler_with_flops False '
     '--profiler-config.torch_profiler_use_gzip True '
-    '--profiler-config.ignore_frontend True'
+    '--profiler-config.ignore_frontend True '
+    '--profiler-config.delay_iterations ' + str(delay_iters) + ' '
+    '--profiler-config.max_iterations ' + str(max_iters)
 )
 with open(target) as fh:
     content = fh.read()
-# Strip any stale profiler args or --enforce-eager from previous runs
 content = re.sub(r'--enforce-eager\s+', '', content)
 content = re.sub(r'--profiler-config\.\S+\s+\S+\s*', '', content)
 content = re.sub(r'--ignore_frontend\s+\S+\s*', '', content)
@@ -133,6 +152,25 @@ print('Disabled move_profile_trace_for_relay')
 "
 ```
 
+### 3c. Keep Full Prompt Count for Steady-State Profiling
+By default `benchmark_lib.sh` caps `num_prompts` to `max_concurrency` when `PROFILE=1`, producing a single-batch run with no mixed prefill+decode steady state. Disable this cap so the benchmark sends `conc * 10` prompts, giving the profiler a continuous-flow workload with both prefill-decode and decode-only phases for phase-split roofline analysis:
+```bash
+docker exec "$CONTAINER_NAME" python3 -c "
+import re
+with open('/workspace/benchmarks/benchmark_lib.sh') as f:
+    content = f.read()
+content = re.sub(
+    r'^(\s*)num_prompts=\"\\\$max_concurrency\"',
+    r'\1: # num_prompts=\"\$max_concurrency\" (disabled for steady-state profiling)',
+    content,
+    flags=re.MULTILINE,
+)
+with open('/workspace/benchmarks/benchmark_lib.sh', 'w') as f:
+    f.write(content)
+print('Disabled num_prompts capping — benchmark will use original num_prompts (conc * 10)')
+"
+```
+
 ### 4. Run Each Profile via `docker exec`
 For each selected config, **select the most free GPUs inside the container**, then run the benchmark script with profiling env vars.
 
@@ -155,9 +193,16 @@ fi
 
 PROFILE_RESULT="${EXP_NAME}_${PRECISION}_${FRAMEWORK}_tp${TP}-ep${EP}_conc${CONC}_profile"
 DOCKER_LOG="{{PROFILE_DIR}}/${PROFILE_RESULT}_docker.log"
+```
+
+**Print the log file path and the full docker exec command to the terminal** so the user can monitor progress and reproduce the run:
+```bash
 echo "DOCKER_LOG: $DOCKER_LOG"
 echo "RUN_CMD: docker exec $GPU_ENV -e MODEL=$MODEL -e TP=$TP -e EP_SIZE=$EP -e CONC=$CONC -e ISL=$ISL -e OSL=$OSL -e MAX_MODEL_LEN=$MAX_MODEL_LEN -e RANDOM_RANGE_RATIO=0.5 -e RESULT_FILENAME=$PROFILE_RESULT -e PRECISION=$PRECISION -e FRAMEWORK=$FRAMEWORK -e EXP_NAME=$EXP_NAME $CONTAINER_NAME /bin/bash /workspace/$BENCHMARK_SCRIPT"
+```
 
+Then start the profiling benchmark run:
+```bash
 docker exec \
     $GPU_ENV \
     -e MODEL=$MODEL \

@@ -32,13 +32,22 @@ Locate torch profiler trace files in `{{PROFILE_DIR}}/`, filtering out async_llm
 
 Detect per-rank trace files by matching the `*-rank-N*.json.gz` or `*-rank-N*.json` naming pattern (also match `rank0`, `rank1` without the dash). Fall back to any `.json.gz` / `.json` files if no rank pattern is found.
 
+**CRITICAL — DO NOT take shortcuts with trace validation.** PyTorch profiler traces place
+`deviceProperties` metadata before `traceEvents`, so the key typically appears 2–5 KB
+into the decompressed content. **Never** check only the first N characters/bytes — this
+will incorrectly reject valid traces. The script below streams 64 KB (more than enough to
+cover metadata) and performs a string search, which is fast even for 1 GB+ gzipped files.
+Run it **exactly as written**:
+
 ```bash
 python3 -c "
-import json, gzip, glob, re, sys, os
+import gzip, glob, re, sys, os
 
 trace_dir = '{{PROFILE_DIR}}'
 valid_traces = []
 rank_map = {}
+
+PEEK_BYTES = 65536  # 64 KB decompressed — covers all metadata before traceEvents
 
 for f in sorted(glob.glob(os.path.join(trace_dir, '*.json*'))):
     basename = os.path.basename(f)
@@ -50,17 +59,16 @@ for f in sorted(glob.glob(os.path.join(trace_dir, '*.json*'))):
     try:
         opener = gzip.open if f.endswith('.gz') else open
         with opener(f, 'rt') as fh:
-            data = json.load(fh)
-        if isinstance(data, dict) and 'traceEvents' in data:
+            prefix = fh.read(PEEK_BYTES)
+        if '\"traceEvents\"' in prefix:
             valid_traces.append(f)
             rank_match = re.search(r'rank[-_]?(\d+)', basename)
             rank = int(rank_match.group(1)) if rank_match else len(valid_traces) - 1
             rank_map[f] = rank
-            n_events = len(data['traceEvents'])
-            print(f'VALID torch trace (rank {rank}, {n_events} events): {f}')
+            size_mb = os.path.getsize(f) / (1024 * 1024)
+            print(f'VALID torch trace (rank {rank}, {size_mb:.1f} MB compressed): {f}')
         else:
-            keys = list(data.keys())[:5] if isinstance(data, dict) else type(data).__name__
-            print(f'SKIPPED (not a torch trace, keys: {keys}): {f}')
+            print(f'SKIPPED (no traceEvents key in first {PEEK_BYTES} bytes): {f}')
     except Exception as e:
         print(f'ERROR reading {f}: {e}')
 
