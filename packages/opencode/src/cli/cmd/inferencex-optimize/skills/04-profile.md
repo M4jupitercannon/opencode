@@ -82,7 +82,7 @@ cd {{REPO_DIR}} && git checkout -- "$BENCHMARK_SCRIPT" benchmarks/benchmark_lib.
 Now patch the target benchmark script inside the container to inject `--profiler-config.*` args into the `vllm serve` command:
 ```bash
 docker exec \
-    -e OSL="${OSL}" -e CONC="${CONC}" -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO:-1.0}" \
+    -e OSL="${OSL}" -e CONC="${CONC}" -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO:-0.5}" \
     "$CONTAINER_NAME" python3 - "/workspace/$BENCHMARK_SCRIPT" <<'PYEOF'
 import sys, os, re, math
 
@@ -91,23 +91,39 @@ prof_dir = os.environ.get('VLLM_TORCH_PROFILER_DIR', '/workspace/profiles')
 
 osl = int(os.environ.get('OSL', '512'))
 conc = int(os.environ.get('CONC', '32'))
-rrr = float(os.environ.get('RANDOM_RANGE_RATIO', '1.0'))
+rrr = float(os.environ.get('RANDOM_RANGE_RATIO', '0.5'))
 
-max_iters = int(min(osl, osl * 16 / conc))
-if rrr < 1:
-    delay_iters = int(osl * rrr * 6)
-else:
-    delay_iters = int(osl * 5 - max_iters / 2)
+# Phase-split profiling: position the window to capture both
+# prefill-decode (mixed) and decode-only phases so the
+# split_vllm_trace_annotation.py (--find-steady-state --num-steps 32)
+# can extract both phase traces for roofline analysis.
+#
+# With num_prompts = conc * 10 (step 3c disables capping), the
+# workload runs in ~10 "waves" of conc concurrent requests.
+# Each iteration produces one token per active sequence.
+#   total_iters ≈ 10 * avg_osl
+# The mixed→decode-only transition occurs when the last wave
+# finishes prefilling, at ~90% of total iterations.
+num_prompts = conc * 10
+avg_osl = osl * (1 + rrr) / 2 if rrr < 1 else osl
+total_iters = int(num_prompts * avg_osl / conc)
+transition = int(0.9 * total_iters)
+
+# Profile 256 iterations centered on the estimated transition:
+# ~128 mixed-phase steps + ~128 decode-only steps.
+max_iters = 256
+delay_iters = max(0, transition - max_iters // 2)
 
 print(f'Computed profiler iterations: delay={delay_iters}, max={max_iters}  '
-      f'(OSL={osl}, CONC={conc}, RANDOM_RANGE_RATIO={rrr})')
+      f'(OSL={osl}, CONC={conc}, RANDOM_RANGE_RATIO={rrr}, '
+      f'avg_osl={avg_osl:.0f}, total_est={total_iters}, transition_est={transition})')
 
 profiler_args = (
     '--enforce-eager '
     '--profiler-config.profiler torch '
     '--profiler-config.torch_profiler_dir ' + prof_dir + ' '
     '--profiler-config.torch_profiler_record_shapes True '
-    '--profiler-config.torch_profiler_with_memory True '
+    '--profiler-config.torch_profiler_with_memory False '
     '--profiler-config.torch_profiler_with_flops False '
     '--profiler-config.torch_profiler_use_gzip True '
     '--profiler-config.ignore_frontend True '

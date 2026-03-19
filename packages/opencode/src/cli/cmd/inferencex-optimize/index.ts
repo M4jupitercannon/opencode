@@ -623,7 +623,9 @@ export const InferenceXOptimizeCommand = cmd({
     UI.println("============================================")
     UI.println(`Output directory: ${outputDir}`)
 
-    const reportPath = path.join(dirs.report, "benchmark_report.md")
+    const profilingReportPath = path.join(dirs.report, "profiling_report.md")
+    const benchmarkReportPath = path.join(dirs.report, "benchmark_report.md")
+    const reportPath = fs.existsSync(profilingReportPath) ? profilingReportPath : benchmarkReportPath
     UI.println(`Report: ${reportPath}`)
     if (fs.existsSync(reportPath)) {
       UI.println("============================================")

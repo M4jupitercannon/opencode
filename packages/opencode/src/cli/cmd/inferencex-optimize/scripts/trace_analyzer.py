@@ -397,13 +397,20 @@ class GapAnalyzer:
         if start_pct <= 0 and end_pct >= 100:
             return events
 
+        # Compute time range only from duration events (ph='X') to avoid
+        # metadata (ph='M') and instant (ph='i') events that can have
+        # timestamps far outside the actual profiling window (e.g.
+        # "Record Window End"), which would inflate the range and cause
+        # the percentage-based window to miss all real events.
         t_min = float("inf")
         t_max = float("-inf")
         for e in events:
             ts = e.get("ts")
             if ts is None:
                 continue
-            dur = e.get("dur", 0)
+            dur = e.get("dur")
+            if not dur or dur <= 0:
+                continue
             t_min = min(t_min, ts)
             t_max = max(t_max, ts + dur)
 
@@ -477,7 +484,9 @@ class GapAnalyzer:
             ts = e.get("ts")
             if ts is None:
                 continue
-            dur = e.get("dur", 0)
+            dur = e.get("dur")
+            if not dur or dur <= 0:
+                continue
             t_min = min(t_min, ts)
             t_max = max(t_max, ts + dur)
 

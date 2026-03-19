@@ -84,17 +84,16 @@ else:
 
 If TRACE_COUNT is 0, print a warning and skip to step 4 (bottleneck analysis using benchmark data only). Do NOT run trace analysis on files that lack `traceEvents`.
 
-### 2. Gap Analysis (Time-Windowed Kernel Profiling) — Primary
+### 2. Gap Analysis (Kernel Profiling) — Primary
 Run gap analysis **first** — it uses only standard Python (no external dependencies) and is the primary kernel-level analysis method.
 
-This analyzes a configurable time window of the trace to focus on steady-state inference behavior (skipping warmup and cooldown), producing a ranked list of the most expensive GPU kernels.
+This produces a ranked list of the most expensive GPU kernels from the profiling trace. Since `delay_iterations` and `max_iterations` in Phase 4 already capture only steady-state iterations, no additional time windowing is needed — the full trace is analyzed.
 
 The gap analysis pipeline:
-1. **Apply time window** — focus on the 50%–80% range of trace duration to capture steady-state behavior (skips warmup at start, cooldown at end)
-2. **Filter by category** — include only `kernel` and `gpu` events (case-insensitive substring matching), exclude `gpu_user_annotation`
-3. **Aggregate per kernel** — group by kernel name, sum total CUDA time, count calls
-4. **Merge across ranks** — combine stats from all rank traces into a single ranking
-5. **Rank by total duration** — sort kernels by cumulative GPU time descending
+1. **Filter by category** — include only `kernel` and `gpu` events (case-insensitive substring matching), exclude `gpu_user_annotation`
+2. **Aggregate per kernel** — group by kernel name, sum total CUDA time, count calls
+3. **Merge across ranks** — combine stats from all rank traces into a single ranking
+4. **Rank by total duration** — sort kernels by cumulative GPU time descending
 
 **IMPORTANT**: This script processes large trace files (potentially millions of events). Set a long bash timeout (at least 600 seconds). The trace file loading step alone can take 30+ seconds for a 100MB+ gzipped trace.
 
@@ -104,14 +103,7 @@ The pipeline deploys `trace_analyzer.py` to `{{SCRIPTS_DIR}}/`. Use it for gap a
 python3 "{{SCRIPTS_DIR}}/trace_analyzer.py" "{{PROFILE_DIR}}" \
     --gap-analysis \
     --output-dir "{{OUTPUT_DIR}}/results/gap_analysis" \
-    --start-pct 50 --end-pct 80 --top-k 20
-```
-
-You can also generate clamped (time-windowed) trace files alongside the analysis:
-```bash
-python3 "{{SCRIPTS_DIR}}/trace_analyzer.py" "{{PROFILE_DIR}}" \
-    --gap-analysis --clamped-traces \
-    --output-dir "{{OUTPUT_DIR}}/results/gap_analysis"
+    --start-pct 0 --end-pct 100 --top-k 20
 ```
 
 You can also run a full (non-windowed) kernel summary:
@@ -216,9 +208,11 @@ import json, subprocess, re, os
 gpu_arch_path = '{{OUTPUT_DIR}}/results/gpu_arch.json'
 
 PLATFORM_SPECS = {
-    'MI300X': {'name': 'MI300X', 'mem_bw_gbps': 5300, 'max_achievable_tflops': {'matrix_fp16': 654, 'matrix_bf16': 708, 'matrix_fp32': 163, 'matrix_fp64': 81, 'matrix_fp8': 1273, 'matrix_int8': 2600, 'vector_fp16': 163, 'vector_bf16': 163, 'vector_fp32': 81, 'vector_fp64': 40}},
-    'MI325X': {'name': 'MI325X', 'mem_bw_gbps': 6000, 'max_achievable_tflops': {'matrix_fp16': 794, 'matrix_bf16': 843, 'matrix_fp32': 194, 'matrix_fp64': 97, 'matrix_fp8': 1519, 'matrix_int8': 3094, 'vector_fp16': 194, 'vector_bf16': 194, 'vector_fp32': 97, 'vector_fp64': 48}},
-    'MI355X': {'name': 'MI355X', 'mem_bw_gbps': 8000, 'max_achievable_tflops': {'matrix_fp16': 1686, 'matrix_bf16': 1686, 'matrix_fp32': 137, 'matrix_fp64': 68, 'matrix_fp8': 3567, 'matrix_fp6': 4574, 'matrix_fp4': 5663, 'matrix_int8': 7134, 'vector_fp16': 274, 'vector_bf16': 274, 'vector_fp32': 137, 'vector_fp64': 68}},
+    'MI300X': {'name': 'MI300X', 'mem_bw_gbps': 5300, 'memory_gb': 192, 'max_achievable_tflops': {'matrix_fp16': 654, 'matrix_bf16': 708, 'matrix_fp32': 163, 'matrix_fp64': 81, 'matrix_fp8': 1273, 'matrix_int8': 2600, 'vector_fp16': 163, 'vector_bf16': 163, 'vector_fp32': 81, 'vector_fp64': 40}},
+    'MI325X': {'name': 'MI325X', 'mem_bw_gbps': 6000, 'memory_gb': 256, 'max_achievable_tflops': {'matrix_fp16': 794, 'matrix_bf16': 843, 'matrix_fp32': 194, 'matrix_fp64': 97, 'matrix_fp8': 1519, 'matrix_int8': 3094, 'vector_fp16': 194, 'vector_bf16': 194, 'vector_fp32': 97, 'vector_fp64': 48}},
+    'MI350X': {'name': 'MI350X', 'mem_bw_gbps': 6000, 'memory_gb': 288, 'max_achievable_tflops': {'matrix_fp16': 794, 'matrix_bf16': 843, 'matrix_fp32': 194, 'matrix_fp64': 97, 'matrix_fp8': 1519, 'matrix_int8': 3094, 'vector_fp16': 194, 'vector_bf16': 194, 'vector_fp32': 97, 'vector_fp64': 48}},
+    'MI355X': {'name': 'MI355X', 'mem_bw_gbps': 8000, 'memory_gb': 288, 'max_achievable_tflops': {'matrix_fp16': 1686, 'matrix_bf16': 1686, 'matrix_fp32': 137, 'matrix_fp64': 68, 'matrix_fp8': 3567, 'matrix_fp6': 4574, 'matrix_fp4': 5663, 'matrix_int8': 7134, 'vector_fp16': 274, 'vector_bf16': 274, 'vector_fp32': 137, 'vector_fp64': 68}},
+    'MI400': {'name': 'MI400', 'mem_bw_gbps': 19600, 'memory_gb': 432, 'max_achievable_tflops': {'matrix_fp16': 2500, 'matrix_bf16': 2500, 'matrix_fp32': 1250, 'matrix_fp64': 625, 'matrix_fp8': 20000, 'matrix_fp4': 40000, 'matrix_int8': 20000, 'vector_fp16': 625, 'vector_bf16': 625, 'vector_fp32': 312, 'vector_fp64': 156}},
 }
 
 gpu_name = None
@@ -512,36 +506,47 @@ From **phase-split roofline analysis** (step 3 — available when trace annotati
 
 Save profile bottleneck findings to `{{OUTPUT_DIR}}/results/profile_analysis.json` (merge with TraceLens data if already created in step 3).
 
-### 5. Generate / Update Benchmark Report
+### 5. Generate Profiling Report
 
-Generate (or update if it already exists) the benchmark report at `{{REPORT_DIR}}/benchmark_report.md`.
+Generate the profiling report at `{{REPORT_DIR}}/profiling_report.md`. This is a **standalone** report — it does NOT include benchmark results (those live in `benchmark_report.md` from Phase 3).
 
-If an existing report from Phase 3 (benchmark-analyze) is present, **append** a "Profile Analysis" section to it. If no report exists yet, create one from scratch using the template below, filling in benchmark data from `{{OUTPUT_DIR}}/results/benchmark_summary.json` if available.
+Read `{{OUTPUT_DIR}}/results/profile_analysis.json` and `{{OUTPUT_DIR}}/results/gap_analysis/gap_analysis.json` to populate the report.
 
-Read `{{OUTPUT_DIR}}/results/profile_analysis.json` and `{{OUTPUT_DIR}}/results/gap_analysis/gap_analysis.json` to populate the profile sections.
-
-The report MUST include the following profile analysis sections (append to existing report or include in new report):
+The report MUST use the following template:
 
 ```markdown
-## Profile Analysis
+# InferenceX Profiling Report
 
-### GPU Utilization
-| Metric | Value |
-|--------|-------|
-| Computation Time (%) | <from gpu_timeline.csv> |
-| Exposed Communication Time (%) | <from gpu_timeline.csv> |
-| Exposed Memcpy Time (%) | <from gpu_timeline.csv> |
-| GPU Busy Time (%) | <from gpu_timeline.csv> |
+## Configuration
+- **Config Key**: {{CONFIG_KEY}}
+- **Date**: <current date>
+- **GPU**: <detected GPU>
+- **Framework**: <framework from config>
+- **Model**: <model name>
+- **Precision**: <precision>
+- **Tensor Parallelism**: <TP value>
+- **Sequence Length**: ISL=<ISL>, OSL=<OSL>
+- **Concurrency**: <concurrency used for profiling>
 
-### Top GPU Kernels (Steady-State, 50%-80% Window)
+## GPU Utilization
 
-From gap analysis of the steady-state inference window:
+| Metric | Full Trace | Prefill-Decode | Decode-Only |
+|--------|------------|----------------|-------------|
+| Computation Time (%) | <from gpu_timeline.csv> | <from prefill-decode gpu_timeline.csv> | <from decode-only gpu_timeline.csv> |
+| Exposed Comm Time (%) | ... | ... | ... |
+| Exposed Memcpy Time (%) | ... | ... | ... |
+| GPU Busy Time (%) | ... | ... | ... |
+| GPU Idle Time (%) | ... | ... | ... |
+
+## Top GPU Kernels (Steady-State)
+
+From gap analysis of the profiled steady-state iterations:
 
 | Rank | Kernel Name | Calls | Total Time (us) | Avg (us) | % Total |
 |------|-------------|-------|-----------------|----------|---------|
 | 1 | ... | ... | ... | ... | ... |
 
-### Kernel Category Breakdown
+## Kernel Category Breakdown
 
 From TraceLens ops_summary_by_category:
 
@@ -549,11 +554,11 @@ From TraceLens ops_summary_by_category:
 |----------|-------|-----------------|------------------|
 | ... | ... | ... | ... |
 
-### Phase-Split Roofline Analysis
+## Phase-Split Roofline Analysis
 
-Traces are split into prefill-decode and decode-only phases using TraceLens-internal's `split_vllm_trace_annotation.py`, then analyzed with `generate_perf_report_pytorch_inference.py` for per-phase roofline insights.
+Traces are split into prefill-decode and decode-only phases using TraceLens-internal's `split_vllm_trace_annotation.py`, then analyzed with `generate_perf_report_pytorch_inference.py` for per-phase roofline insights against <GPU> specs (<mem_bw> GB/s HBM bandwidth, <peak_tflops> TFLOPS bf16 peak).
 
-#### Prefill-Decode Phase
+### Prefill-Decode Phase (<N> steps, BS=<batch_size>)
 
 | Metric | Value |
 |--------|-------|
@@ -563,11 +568,11 @@ Traces are split into prefill-decode and decode-only phases using TraceLens-inte
 
 Top roofline ops (prefill-decode):
 
-| Op Name | FLOPS/Byte | TFLOPS/s | Bound Type | Distance to Roofline (%) |
-|---------|------------|----------|------------|--------------------------|
-| ... | ... | ... | ... | ... |
+| Op Name | M×N×K | FLOPS/Byte | TFLOPS/s | Bound Type | Pct Roofline |
+|---------|-------|------------|----------|------------|--------------|
+| ... | ... | ... | ... | ... | ... |
 
-#### Decode-Only Phase
+### Decode-Only Phase (<N> steps, BS=<batch_size>)
 
 | Metric | Value |
 |--------|-------|
@@ -577,26 +582,30 @@ Top roofline ops (prefill-decode):
 
 Top roofline ops (decode-only):
 
-| Op Name | FLOPS/Byte | TFLOPS/s | Bound Type | Distance to Roofline (%) |
-|---------|------------|----------|------------|--------------------------|
-| ... | ... | ... | ... | ... |
+| Op Name | M×N×K | FLOPS/Byte | TFLOPS/s | Bound Type | Pct Roofline |
+|---------|-------|------------|----------|------------|--------------|
+| ... | ... | ... | ... | ... | ... |
 
-#### Phase Comparison
+### Phase Comparison
 
 | Metric | Prefill-Decode | Decode-Only |
 |--------|----------------|-------------|
 | GPU Computation (%) | ... | ... |
+| GPU Busy (%) | ... | ... |
+| FusedMoE Time (%) | ... | ... |
 | GEMM Time (%) | ... | ... |
 | Attention Time (%) | ... | ... |
+| RMSNorm Time (%) | ... | ... |
 | Communication Time (%) | ... | ... |
 | Dominant Bound | compute / memory | compute / memory |
+| Batch Size | ... | ... |
 
-### Profile Bottlenecks & Optimization Opportunities
+## Profile Bottlenecks & Optimization Opportunities
 - <bottleneck 1: description and recommendation>
 - <bottleneck 2: description and recommendation>
 - ...
 
-### Raw Profile Data
+## Raw Profile Data
 - Gap analysis: `results/gap_analysis/`
 - TraceLens rank-0 CSVs: `results/tracelens_rank0_csvs/`
 - Phase-split traces: `results/phase_split/`
@@ -604,17 +613,18 @@ Top roofline ops (decode-only):
 - Decode-only roofline CSVs: `results/tracelens_decode_only_csvs/`
 - GPU arch config: `results/gpu_arch.json`
 - Profile analysis JSON: `results/profile_analysis.json`
+- Profiler summary: `profiles/profiler_out_0.txt`
+- Trace file: `profiles/<trace_file_name>`
+- Traces viewable at: https://ui.perfetto.dev/
 ```
-
-If no benchmark data exists (only profile-analyze was run), create a report with just the Configuration and Profile Analysis sections.
 
 **Print the final report path:**
 ```bash
 echo ""
 echo "============================================"
-echo "  Benchmark Report Generated"
+echo "  Profiling Report Generated"
 echo "============================================"
-echo "Report: {{REPORT_DIR}}/benchmark_report.md"
+echo "Report: {{REPORT_DIR}}/profiling_report.md"
 echo "============================================"
 ```
 
@@ -630,7 +640,7 @@ Update progress.json (include "profile" in phases_completed only if profiling wa
     "tracelens_analysis": <true if step 3 succeeded, false otherwise>,
     "phase_split_roofline": <true if phase-split roofline analysis succeeded, false otherwise>,
     "gpu_arch_detected": "<GPU model name or null>",
-    "report": "{{REPORT_DIR}}/benchmark_report.md"
+    "report": "{{REPORT_DIR}}/profiling_report.md"
   }
 }
 ```
