@@ -1,7 +1,7 @@
 # Phase 5: Profile Analysis {{SKIP_LABEL}}
 
 ## Objective
-Analyze profiling traces to identify GPU kernel-level performance bottlenecks and optimization opportunities.
+Analyze profiling traces from **both eager and graph modes** to identify GPU kernel-level performance bottlenecks and optimization opportunities. Produces per-mode reports and a final combined report.
 
 {{PROFILE_ANALYSIS_NOTE}}
 
@@ -10,124 +10,28 @@ When this phase is entered (including via `--from-phase profile-analyze`), **alw
 
 ```bash
 echo "Cleaning previous profile analysis artifacts..."
-rm -rf "{{OUTPUT_DIR}}/results/gap_analysis"
-rm -rf "{{OUTPUT_DIR}}/results/tracelens_rank0_csvs"
-rm -rf "{{OUTPUT_DIR}}/results/tracelens_collective_csvs"
-rm -rf "{{OUTPUT_DIR}}/results/phase_split"
-rm -rf "{{OUTPUT_DIR}}/results/tracelens_prefill_decode_csvs"
-rm -rf "{{OUTPUT_DIR}}/results/tracelens_decode_only_csvs"
-rm -f  "{{OUTPUT_DIR}}/results/profile_analysis.json"
-rm -f  "{{OUTPUT_DIR}}/results/tracelens_rank0.log"
-rm -f  "{{OUTPUT_DIR}}/results/tracelens_collective.log"
+for MODE in eager graph; do
+    rm -rf "{{OUTPUT_DIR}}/results/gap_analysis_${MODE}"
+    rm -rf "{{OUTPUT_DIR}}/results/gap_analysis_prefill_decode_${MODE}"
+    rm -rf "{{OUTPUT_DIR}}/results/gap_analysis_decode_only_${MODE}"
+    rm -rf "{{OUTPUT_DIR}}/results/tracelens_${MODE}"
+    rm -rf "{{OUTPUT_DIR}}/results/tracelens_collective_${MODE}"
+    rm -rf "{{OUTPUT_DIR}}/results/tracelens_prefill_decode_${MODE}"
+    rm -rf "{{OUTPUT_DIR}}/results/tracelens_decode_only_${MODE}"
+    rm -rf "{{OUTPUT_DIR}}/results/phase_split_${MODE}"
+    rm -f  "{{OUTPUT_DIR}}/results/profile_analysis_${MODE}.json"
+done
 rm -f  "{{OUTPUT_DIR}}/results/gpu_arch.json"
+rm -rf "{{REPORT_DIR}}/profiling_report_eager.md"
+rm -rf "{{REPORT_DIR}}/profiling_report_graph.md"
+rm -rf "{{REPORT_DIR}}/profiling_report.md"
 echo "Cleanup done — starting fresh analysis"
 ```
 
-After cleanup, verify that profile trace files (the **source** data, not previous analysis output) exist in `{{PROFILE_DIR}}/`. If no trace files exist there, print a warning and skip to step 4.
+## TraceLens Setup
 
-## Steps
+Before running analysis steps, ensure TraceLens is installed and detect the correct Python version.
 
-### 1. Discover and Validate Trace Files on the Host
-Locate torch profiler trace files in `{{PROFILE_DIR}}/`, filtering out async_llm (frontend-only) traces, docker logs, and benchmark result JSONs. Validate that each candidate file actually contains `traceEvents` (Chrome Trace Event format) — benchmark result JSONs (with keys like `request_throughput`, `model_id`) will cause `KeyError: 'traceEvents'` in TraceLens.
-
-Detect per-rank trace files by matching the `*-rank-N*.json.gz` or `*-rank-N*.json` naming pattern (also match `rank0`, `rank1` without the dash). Fall back to any `.json.gz` / `.json` files if no rank pattern is found.
-
-**CRITICAL — DO NOT take shortcuts with trace validation.** PyTorch profiler traces place
-`deviceProperties` metadata before `traceEvents`, so the key typically appears 2–5 KB
-into the decompressed content. **Never** check only the first N characters/bytes — this
-will incorrectly reject valid traces. The script below streams 64 KB (more than enough to
-cover metadata) and performs a string search, which is fast even for 1 GB+ gzipped files.
-Run it **exactly as written**:
-
-```bash
-python3 -c "
-import gzip, glob, re, sys, os
-
-trace_dir = '{{PROFILE_DIR}}'
-valid_traces = []
-rank_map = {}
-
-PEEK_BYTES = 65536  # 64 KB decompressed — covers all metadata before traceEvents
-
-for f in sorted(glob.glob(os.path.join(trace_dir, '*.json*'))):
-    basename = os.path.basename(f)
-    if '_docker.log' in basename:
-        continue
-    if 'async_llm' in basename.lower():
-        print(f'SKIPPED (async_llm frontend trace): {f}')
-        continue
-    try:
-        opener = gzip.open if f.endswith('.gz') else open
-        with opener(f, 'rt') as fh:
-            prefix = fh.read(PEEK_BYTES)
-        if '\"traceEvents\"' in prefix:
-            valid_traces.append(f)
-            rank_match = re.search(r'rank[-_]?(\d+)', basename)
-            rank = int(rank_match.group(1)) if rank_match else len(valid_traces) - 1
-            rank_map[f] = rank
-            size_mb = os.path.getsize(f) / (1024 * 1024)
-            print(f'VALID torch trace (rank {rank}, {size_mb:.1f} MB compressed): {f}')
-        else:
-            print(f'SKIPPED (no traceEvents key in first {PEEK_BYTES} bytes): {f}')
-    except Exception as e:
-        print(f'ERROR reading {f}: {e}')
-
-print(f'TRACE_COUNT={len(valid_traces)}')
-if valid_traces:
-    sorted_by_rank = sorted(valid_traces, key=lambda x: rank_map.get(x, 999))
-    print(f'RANK0_TRACE={sorted_by_rank[0]}')
-    print(f'WORLD_SIZE={len(valid_traces)}')
-else:
-    print('WARNING: No valid torch profiler traces found. Trace analysis will be skipped.')
-"
-```
-
-If TRACE_COUNT is 0, print a warning and skip to step 4 (bottleneck analysis using benchmark data only). Do NOT run trace analysis on files that lack `traceEvents`.
-
-### 2. Gap Analysis (Kernel Profiling) — Primary
-Run gap analysis **first** — it uses only standard Python (no external dependencies) and is the primary kernel-level analysis method.
-
-This produces a ranked list of the most expensive GPU kernels from the profiling trace. Since `delay_iterations` and `max_iterations` in Phase 4 already capture only steady-state iterations, no additional time windowing is needed — the full trace is analyzed.
-
-The gap analysis pipeline:
-1. **Filter by category** — include only `kernel` and `gpu` events (case-insensitive substring matching), exclude `gpu_user_annotation`
-2. **Aggregate per kernel** — group by kernel name, sum total CUDA time, count calls
-3. **Merge across ranks** — combine stats from all rank traces into a single ranking
-4. **Rank by total duration** — sort kernels by cumulative GPU time descending
-
-**IMPORTANT**: This script processes large trace files (potentially millions of events). Set a long bash timeout (at least 600 seconds). The trace file loading step alone can take 30+ seconds for a 100MB+ gzipped trace.
-
-The pipeline deploys `trace_analyzer.py` to `{{SCRIPTS_DIR}}/`. Use it for gap analysis:
-
-```bash
-python3 "{{SCRIPTS_DIR}}/trace_analyzer.py" "{{PROFILE_DIR}}" \
-    --gap-analysis \
-    --output-dir "{{OUTPUT_DIR}}/results/gap_analysis" \
-    --start-pct 0 --end-pct 100 --top-k 20
-```
-
-You can also run a full (non-windowed) kernel summary:
-```bash
-python3 "{{SCRIPTS_DIR}}/trace_analyzer.py" "{{PROFILE_DIR}}"
-```
-
-The gap analysis CSV follows this format (matching InferenceX `gen_kstats_clamped_traces.py` output):
-```
-Name, Calls, Self CUDA total (us), Avg time (us), % Total
-```
-
-This reveals which GPU kernels dominate steady-state inference time. Typical bottleneck categories for vLLM:
-- **GEMM kernels** (e.g., `ck_fmha_*`, `hipblas*`) — matrix multiply for attention and FFN layers
-- **Communication kernels** (e.g., `ncclAllReduce*`, `allgather*`) — collective ops for tensor parallelism
-- **Custom attention** (e.g., `paged_attention_*`, `flash_attn_*`) — KV cache operations
-- **Quantization** (e.g., `dequant*`, `mxfp4_*`) — precision conversion overhead
-
-### 3. TraceLens Analysis 
-TraceLens provides additional insights beyond gap analysis (GPU timeline, operator-level breakdown, collective communication analysis). It requires external installation but is **required** — it provides GPU timeline, operator-level breakdown, and collective communication analysis that gap analysis alone cannot.
-
-**IMPORTANT**: The `pip install` can take several minutes due to dependency compilation. Set a bash timeout of at least **300 seconds** for the install command. If it times out or fails, **retry the installation once** before reporting an error.
-
-**Check if TraceLens is already installed, then clone and install only if missing:**
 ```bash
 if command -v TraceLens_generate_perf_report_pytorch &>/dev/null; then
     echo "TraceLens CLI already available"
@@ -138,67 +42,20 @@ else
     fi
     echo "Installing TraceLens (this may take a few minutes)..."
     pip install --no-build-isolation "$HOME/TraceLens-internal" 2>&1 | tail -10
-    if command -v TraceLens_generate_perf_report_pytorch &>/dev/null; then
-        echo "TraceLens CLI installed successfully"
-    else
+    if ! command -v TraceLens_generate_perf_report_pytorch &>/dev/null; then
         echo "First install attempt failed — retrying..."
         pip install --no-build-isolation "$HOME/TraceLens-internal" 2>&1 | tail -10
-        if command -v TraceLens_generate_perf_report_pytorch &>/dev/null; then
-            echo "TraceLens CLI installed successfully on retry"
-        else
-            echo "TRACELENS_INSTALL_FAILED=true"
-            echo "ERROR: TraceLens installation failed after retry"
-        fi
     fi
 fi
 ```
 
-If the output contains `TRACELENS_INSTALL_FAILED=true` after the retry, report the installation error but still proceed to step 4 using the gap analysis data. Do NOT skip TraceLens analysis without attempting the retry.
-
-**If TraceLens is available, run the single-rank performance report:**
+**Detect the Python version where TraceLens is installed** (it may differ from the default `python3`):
 ```bash
-RANK0_TRACE="<rank-0 trace path from step 1>"
-mkdir -p "{{OUTPUT_DIR}}/results/tracelens_rank0_csvs"
-
-TraceLens_generate_perf_report_pytorch \
-    --profile_json_path "$RANK0_TRACE" \
-    --output_csvs_dir "{{OUTPUT_DIR}}/results/tracelens_rank0_csvs" \
-    --enable_kernel_summary \
-    2>&1 | tee "{{OUTPUT_DIR}}/results/tracelens_rank0.log"
-
-echo "Rank-0 report exit code: $?"
-ls -lh "{{OUTPUT_DIR}}/results/tracelens_rank0_csvs/"
+TRACELENS_PYTHON=$(python3 -c "import TraceLens; print('python3')" 2>/dev/null \
+    || python3.11 -c "import TraceLens; print('python3.11')" 2>/dev/null \
+    || echo "python3")
+echo "TraceLens Python: $TRACELENS_PYTHON"
 ```
-
-This produces CSV files including:
-- `gpu_timeline.csv` — GPU activity timeline
-- `ops_summary.csv` — Operator-level time breakdown
-- `ops_summary_by_category.csv` — Time grouped by op category
-- `kernel_summary.csv` — GPU kernel execution statistics
-- `coll_analysis.csv` — Collective communication analysis
-
-**If WORLD_SIZE > 1, also run the multi-rank collective report:**
-```bash
-WORLD_SIZE=<from step 1>
-if [ "$WORLD_SIZE" -gt 1 ]; then
-    mkdir -p "{{OUTPUT_DIR}}/results/tracelens_collective_csvs"
-
-    TraceLens_generate_multi_rank_collective_report_pytorch \
-        --trace_dir "{{PROFILE_DIR}}" \
-        --world_size "$WORLD_SIZE" \
-        --output_csvs_dir "{{OUTPUT_DIR}}/results/tracelens_collective_csvs" \
-        2>&1 | tee "{{OUTPUT_DIR}}/results/tracelens_collective.log"
-
-    echo "Multi-rank collective report exit code: $?"
-    ls -lh "{{OUTPUT_DIR}}/results/tracelens_collective_csvs/"
-else
-    echo "Single rank trace — skipping multi-rank collective report"
-fi
-```
-
-**Phase-Split Roofline Analysis (Prefill-Decode vs Decode-Only):**
-
-This sub-step splits the rank-0 trace into prefill-decode and decode-only phases using TraceLens-internal's `split_vllm_trace_annotation.py`, then runs the inference-specific TraceLens report with roofline analysis on each phase. This reveals whether bottlenecks differ between compute-heavy prefill steps and memory-bandwidth-heavy decode steps.
 
 **Auto-detect GPU and create GPU arch JSON** (required for roofline calculations):
 ```bash
@@ -254,275 +111,317 @@ else:
 "
 ```
 
-**Split rank-0 trace into prefill-decode and decode-only phases:**
+---
+
+## Steps — Run for EACH Mode (eager, graph)
+
+The following steps 1–4 are executed **twice**: once for `MODE=eager` (traces in `profiles_eager/`) and once for `MODE=graph` (traces in `profiles_graph/`). All output directories are suffixed with `_${MODE}`.
+
 ```bash
-RANK0_TRACE="<rank-0 trace path from step 1>"
+for MODE in eager graph; do
+    TRACE_DIR="{{PROFILE_DIR}}/profiles_${MODE}"
+    echo ""
+    echo "========================================================"
+    echo "  Analyzing $MODE mode traces from $TRACE_DIR"
+    echo "========================================================"
+```
+
+### Step 1: Discover and Validate Trace Files
+
+Locate torch profiler trace files in `$TRACE_DIR`, filtering out async_llm (frontend-only) traces, docker logs, and benchmark result JSONs. Validate that each candidate file actually contains `traceEvents`.
+
+```bash
+python3 -c "
+import gzip, glob, re, sys, os
+
+trace_dir = '$TRACE_DIR'
+valid_traces = []
+rank_map = {}
+
+PEEK_BYTES = 65536
+
+for f in sorted(glob.glob(os.path.join(trace_dir, '*.json*'))):
+    basename = os.path.basename(f)
+    if '_docker.log' in basename:
+        continue
+    if 'async_llm' in basename.lower():
+        print(f'SKIPPED (async_llm frontend trace): {f}')
+        continue
+    try:
+        opener = gzip.open if f.endswith('.gz') else open
+        with opener(f, 'rt') as fh:
+            prefix = fh.read(PEEK_BYTES)
+        if '\"traceEvents\"' in prefix:
+            valid_traces.append(f)
+            rank_match = re.search(r'rank[-_]?(\d+)', basename)
+            rank = int(rank_match.group(1)) if rank_match else len(valid_traces) - 1
+            rank_map[f] = rank
+            size_mb = os.path.getsize(f) / (1024 * 1024)
+            print(f'VALID torch trace (rank {rank}, {size_mb:.1f} MB compressed): {f}')
+        else:
+            print(f'SKIPPED (no traceEvents key in first {PEEK_BYTES} bytes): {f}')
+    except Exception as e:
+        print(f'ERROR reading {f}: {e}')
+
+print(f'TRACE_COUNT={len(valid_traces)}')
+if valid_traces:
+    sorted_by_rank = sorted(valid_traces, key=lambda x: rank_map.get(x, 999))
+    print(f'RANK0_TRACE={sorted_by_rank[0]}')
+    print(f'WORLD_SIZE={len(valid_traces)}')
+else:
+    print('WARNING: No valid torch profiler traces found for $MODE mode.')
+"
+```
+
+If TRACE_COUNT is 0, skip this mode and continue to the next.
+
+**Create trace naming symlinks for TraceLens multi-rank tools** (they expect `rank*_trace.json.gz`):
+```bash
+cd "$TRACE_DIR"
+for f in dp0_pp0_tp*_rank*.pt.trace.json.gz; do
+    [ -f "$f" ] || continue
+    rank=$(echo "$f" | grep -oP 'rank\K\d+')
+    ln -sf "$f" "rank${rank}_trace.json.gz"
+done
+cd -
+```
+
+### Step 2: Phase-Split Traces — CRITICAL
+
+Split the rank-0 trace into prefill-decode and decode-only phases. **This step is mandatory and must succeed before proceeding.** Phase-split traces enable per-phase gap analysis and roofline comparison, which are essential for identifying whether bottlenecks differ between compute-heavy prefill and memory-bandwidth-heavy decode.
+
+```bash
 SPLIT_SCRIPT="$HOME/TraceLens-internal/examples/custom_workflows/split_vllm_trace_annotation.py"
-PHASE_SPLIT_DIR="{{OUTPUT_DIR}}/results/phase_split"
+PHASE_SPLIT_DIR="{{OUTPUT_DIR}}/results/phase_split_${MODE}"
+mkdir -p "$PHASE_SPLIT_DIR"
 
-if [ -f "$SPLIT_SCRIPT" ]; then
-    mkdir -p "$PHASE_SPLIT_DIR"
-    echo "Splitting trace into prefill-decode and decode-only phases..."
-    python3 "$SPLIT_SCRIPT" "$RANK0_TRACE" \
-        -o "$PHASE_SPLIT_DIR" \
-        --find-steady-state \
-        --num-steps 32 \
-        2>&1 | tail -30
+echo "Splitting $MODE rank-0 trace into prefill-decode and decode-only phases..."
+$TRACELENS_PYTHON "$SPLIT_SCRIPT" "$RANK0_TRACE" \
+    -o "$PHASE_SPLIT_DIR" \
+    --find-steady-state \
+    --num-steps 32 \
+    2>&1 | tee /tmp/phase_split_${MODE}.log | tail -30
 
-    echo "Phase split exit code: $?"
-    ls -lh "$PHASE_SPLIT_DIR/"
+SPLIT_EXIT=${PIPESTATUS[0]}
+echo "Phase split exit code: $SPLIT_EXIT"
+ls -lh "$PHASE_SPLIT_DIR/"
+```
+
+**If the split fails, diagnose, fix, and retry. Do NOT proceed without valid phase-split traces:**
+
+1. `ModuleNotFoundError`: The script may need a different Python version. Use the detected `$TRACELENS_PYTHON`.
+2. Empty output / no `prefilldecode_*` or `decode_*` files: The profiler `delay_iterations` / `max_iterations` may have missed the transition. **Re-run Phase 4 profiling** with adjusted parameters (e.g., increase `max_iterations` to 512 or reduce `delay_iterations`).
+3. Corrupted trace (JSON parse errors): **Re-run Phase 4 profiling** to produce fresh traces.
+4. Python version incompatibility (e.g., `match` syntax in Python 3.10): Try `python3.11` explicitly.
+
+After fixing, retry the split. Only proceed once you have valid `prefilldecode_*.json.gz` and `decode_*.json.gz` files in `$PHASE_SPLIT_DIR`.
+
+```bash
+PREFILL_DECODE_TRACE=$(ls "$PHASE_SPLIT_DIR"/prefilldecode_*.json.gz 2>/dev/null | head -1)
+DECODE_ONLY_TRACE=$(ls "$PHASE_SPLIT_DIR"/decode_*.json.gz 2>/dev/null | head -1)
+
+if [ -z "$PREFILL_DECODE_TRACE" ] || [ -z "$DECODE_ONLY_TRACE" ]; then
+    echo "CRITICAL: Phase split failed for $MODE mode. Fix and retry before proceeding."
+    # Diagnose and retry here — see guidance above
+fi
+
+echo "PREFILL_DECODE_TRACE=$PREFILL_DECODE_TRACE"
+echo "DECODE_ONLY_TRACE=$DECODE_ONLY_TRACE"
+```
+
+### Step 3: Gap Analysis (Per-Phase + Full Trace)
+
+Run gap analysis on three trace variants to get separate kernel rankings for prefill vs decode:
+
+```bash
+# Full trace
+python3 "{{SCRIPTS_DIR}}/trace_analyzer.py" "$TRACE_DIR" \
+    --gap-analysis \
+    --output-dir "{{OUTPUT_DIR}}/results/gap_analysis_${MODE}" \
+    --start-pct 0 --end-pct 100 --top-k 20
+
+# Prefill-decode phase
+python3 "{{SCRIPTS_DIR}}/trace_analyzer.py" "$PHASE_SPLIT_DIR" \
+    --gap-analysis \
+    --output-dir "{{OUTPUT_DIR}}/results/gap_analysis_prefill_decode_${MODE}" \
+    --start-pct 0 --end-pct 100 --top-k 20 \
+    --trace-pattern "prefilldecode_*.json.gz"
+
+# Decode-only phase
+python3 "{{SCRIPTS_DIR}}/trace_analyzer.py" "$PHASE_SPLIT_DIR" \
+    --gap-analysis \
+    --output-dir "{{OUTPUT_DIR}}/results/gap_analysis_decode_only_${MODE}" \
+    --start-pct 0 --end-pct 100 --top-k 20 \
+    --trace-pattern "decode_*.json.gz"
+```
+
+This produces a ranked list of the most expensive GPU kernels for each phase. Key categories:
+- **GEMM kernels** (e.g., `ck_fmha_*`, `hipblas*`) — matrix multiply for attention and FFN layers
+- **Communication kernels** (e.g., `ncclAllReduce*`, `allgather*`) — collective ops for tensor parallelism
+- **Custom attention** (e.g., `paged_attention_*`, `flash_attn_*`) — KV cache operations
+- **Quantization** (e.g., `dequant*`, `mxfp4_*`) — precision conversion overhead
+
+### Step 4: TraceLens Analysis
+
+**4a. Single-rank performance report (full trace):**
+```bash
+mkdir -p "{{OUTPUT_DIR}}/results/tracelens_${MODE}"
+
+TraceLens_generate_perf_report_pytorch \
+    --profile_json_path "$RANK0_TRACE" \
+    --output_csvs_dir "{{OUTPUT_DIR}}/results/tracelens_${MODE}" \
+    --enable_kernel_summary \
+    2>&1 | tee "{{OUTPUT_DIR}}/results/tracelens_${MODE}.log"
+
+echo "Rank-0 report exit code: $?"
+ls -lh "{{OUTPUT_DIR}}/results/tracelens_${MODE}/"
+```
+
+**4b. Multi-rank collective report (if TP > 1):**
+```bash
+if [ "$WORLD_SIZE" -gt 1 ]; then
+    mkdir -p "{{OUTPUT_DIR}}/results/tracelens_collective_${MODE}"
+
+    PANDAS_FUTURE_INFER_STRING=0 TraceLens_generate_multi_rank_collective_report_pytorch \
+        --trace_dir "$TRACE_DIR" \
+        --world_size "$WORLD_SIZE" \
+        --trace_pattern "rank*_trace.json.gz" \
+        --output_csvs_dir "{{OUTPUT_DIR}}/results/tracelens_collective_${MODE}" \
+        2>&1 | tee "{{OUTPUT_DIR}}/results/tracelens_collective_${MODE}.log"
+
+    echo "Multi-rank collective report exit code: $?"
 else
-    echo "PHASE_SPLIT_UNAVAILABLE=true"
-    echo "WARNING: split_vllm_trace_annotation.py not found at $SPLIT_SCRIPT"
-    echo "Skipping phase-split roofline analysis"
+    echo "Single rank trace — skipping multi-rank collective report"
 fi
 ```
 
-**Identify the phase-specific trace files** from the split output. The splitter produces files named `prefilldecode_*` and `decode_*`:
-```bash
-if [ -d "$PHASE_SPLIT_DIR" ] && [ "$(ls -A $PHASE_SPLIT_DIR/*.json.gz 2>/dev/null)" ]; then
-    PREFILL_DECODE_TRACE=$(ls "$PHASE_SPLIT_DIR"/prefilldecode_*.json.gz 2>/dev/null | head -1)
-    DECODE_ONLY_TRACE=$(ls "$PHASE_SPLIT_DIR"/decode_*.json.gz 2>/dev/null | head -1)
+**4c. Per-phase roofline analysis:**
 
-    echo "PREFILL_DECODE_TRACE=$PREFILL_DECODE_TRACE"
-    echo "DECODE_ONLY_TRACE=$DECODE_ONLY_TRACE"
-else
-    echo "No phase-split traces found — skipping per-phase roofline analysis"
-fi
-```
+Use the correct TraceLens script based on mode:
+- Eager mode: `generate_perf_report_pytorch_vllm.py`
+- Graph mode: `generate_perf_report_pytorch_vllm_graph.py`
 
-**Run TraceLens inference report with roofline on the prefill-decode phase:**
 ```bash
-INFERENCE_REPORT_SCRIPT="$HOME/TraceLens-internal/TraceLens/Reporting/generate_perf_report_pytorch_inference.py"
 GPU_ARCH_JSON="{{OUTPUT_DIR}}/results/gpu_arch.json"
 
-if [ -n "$PREFILL_DECODE_TRACE" ] && [ -f "$PREFILL_DECODE_TRACE" ] && [ -f "$INFERENCE_REPORT_SCRIPT" ]; then
-    mkdir -p "{{OUTPUT_DIR}}/results/tracelens_prefill_decode_csvs"
-    echo "Running TraceLens roofline on prefill-decode phase..."
-    python3 "$INFERENCE_REPORT_SCRIPT" \
+if [ "$MODE" = "graph" ]; then
+    ROOFLINE_SCRIPT="$HOME/TraceLens-internal/TraceLens/Reporting/generate_perf_report_pytorch_vllm_graph.py"
+else
+    ROOFLINE_SCRIPT="$HOME/TraceLens-internal/TraceLens/Reporting/generate_perf_report_pytorch_vllm.py"
+fi
+```
+
+**Prefill-decode phase roofline:**
+```bash
+if [ -n "$PREFILL_DECODE_TRACE" ] && [ -f "$PREFILL_DECODE_TRACE" ] && [ -f "$ROOFLINE_SCRIPT" ]; then
+    mkdir -p "{{OUTPUT_DIR}}/results/tracelens_prefill_decode_${MODE}"
+    echo "Running TraceLens roofline on $MODE prefill-decode phase..."
+
+    PANDAS_FUTURE_INFER_STRING=0 $TRACELENS_PYTHON "$ROOFLINE_SCRIPT" \
         --profile_json_path "$PREFILL_DECODE_TRACE" \
-        --output_csvs_dir "{{OUTPUT_DIR}}/results/tracelens_prefill_decode_csvs" \
+        --output_csvs_dir "{{OUTPUT_DIR}}/results/tracelens_prefill_decode_${MODE}" \
         --enable_pseudo_ops \
         --group_by_parent_module \
         --enable_kernel_summary \
         $([ -f "$GPU_ARCH_JSON" ] && echo "--gpu_arch_json_path $GPU_ARCH_JSON") \
         2>&1 | tail -30
 
-    echo "Prefill-decode roofline exit code: $?"
-    ls -lh "{{OUTPUT_DIR}}/results/tracelens_prefill_decode_csvs/"
+    echo "Prefill-decode roofline ($MODE) exit code: $?"
 else
-    echo "Skipping prefill-decode roofline (trace or script unavailable)"
+    echo "Skipping prefill-decode roofline for $MODE (trace or script unavailable)"
 fi
 ```
 
-**Run TraceLens inference report with roofline on the decode-only phase:**
+**Decode-only phase roofline:**
 ```bash
-if [ -n "$DECODE_ONLY_TRACE" ] && [ -f "$DECODE_ONLY_TRACE" ] && [ -f "$INFERENCE_REPORT_SCRIPT" ]; then
-    mkdir -p "{{OUTPUT_DIR}}/results/tracelens_decode_only_csvs"
-    echo "Running TraceLens roofline on decode-only phase..."
-    python3 "$INFERENCE_REPORT_SCRIPT" \
+if [ -n "$DECODE_ONLY_TRACE" ] && [ -f "$DECODE_ONLY_TRACE" ] && [ -f "$ROOFLINE_SCRIPT" ]; then
+    mkdir -p "{{OUTPUT_DIR}}/results/tracelens_decode_only_${MODE}"
+    echo "Running TraceLens roofline on $MODE decode-only phase..."
+
+    PANDAS_FUTURE_INFER_STRING=0 $TRACELENS_PYTHON "$ROOFLINE_SCRIPT" \
         --profile_json_path "$DECODE_ONLY_TRACE" \
-        --output_csvs_dir "{{OUTPUT_DIR}}/results/tracelens_decode_only_csvs" \
+        --output_csvs_dir "{{OUTPUT_DIR}}/results/tracelens_decode_only_${MODE}" \
         --enable_pseudo_ops \
         --group_by_parent_module \
         --enable_kernel_summary \
         $([ -f "$GPU_ARCH_JSON" ] && echo "--gpu_arch_json_path $GPU_ARCH_JSON") \
         2>&1 | tail -30
 
-    echo "Decode-only roofline exit code: $?"
-    ls -lh "{{OUTPUT_DIR}}/results/tracelens_decode_only_csvs/"
+    echo "Decode-only roofline ($MODE) exit code: $?"
 else
-    echo "Skipping decode-only roofline (trace or script unavailable)"
+    echo "Skipping decode-only roofline for $MODE (trace or script unavailable)"
 fi
 ```
 
-**Parse TraceLens results** (if the reports were generated successfully):
-Read the generated CSV files from `{{OUTPUT_DIR}}/results/tracelens_rank0_csvs/` (and `tracelens_collective_csvs/` if present) and extract key insights:
-- From `ops_summary.csv`: top time-consuming operations, their cumulative GPU time
-- From `kernel_summary.csv`: most expensive GPU kernels, call counts, average duration
-- From `ops_summary_by_category.csv`: time distribution across categories (GEMM, attention, communication, etc.)
-- From `coll_analysis.csv`: collective communication overhead and patterns
-- From `gpu_timeline.csv`: GPU utilization and idle gaps
+> **WARNING (graph mode)**: Graph mode roofline analysis can take 20+ minutes with `--enable_pseudo_ops --group_by_parent_module` due to complex `hipGraphLaunch` event hierarchies. Set a timeout of at least 1800 seconds. If it appears stalled, check CPU usage — high CPU means it's processing, not hung.
 
-Also read the phase-specific CSV files from `tracelens_prefill_decode_csvs/` and `tracelens_decode_only_csvs/` (if present) and extract:
-- From `unified_perf_summary.csv`: per-op roofline analysis (FLOPS/byte, TFLOPS/s, bound type, bound distance)
-- From `SDPA_fwd.csv` / `FLASH_ATTN_fwd.csv`: attention roofline metrics per phase
-- From `GEMM.csv`: GEMM roofline metrics per phase
-- From `gpu_timeline.csv`: GPU utilization comparison between prefill-decode and decode-only phases
-- From `ops_summary_by_category.csv`: category time distribution differences between phases
+> **NOTE (graph mode category attribution)**: In graph mode, TraceLens `ops_summary_by_category` sees most ops as "other" under `GraphModule`/`hipGraphLaunch`. Use gap analysis kernel classification from step 3 as the fallback for per-category time breakdown in the graph-mode report.
 
-**Display TraceLens results to the console** so the user can see key findings:
-```bash
-echo ""
-echo "============================================"
-echo "  TraceLens Analysis Summary (Rank 0)"
-echo "============================================"
+**4d. Aggregate results into structured JSON:**
 
-if [ -f "{{OUTPUT_DIR}}/results/tracelens_rank0_csvs/gpu_timeline.csv" ]; then
-    echo ""
-    echo "--- GPU Timeline ---"
-    cat "{{OUTPUT_DIR}}/results/tracelens_rank0_csvs/gpu_timeline.csv"
-fi
-
-if [ -f "{{OUTPUT_DIR}}/results/tracelens_rank0_csvs/ops_summary_by_category.csv" ]; then
-    echo ""
-    echo "--- Ops Summary by Category ---"
-    cat "{{OUTPUT_DIR}}/results/tracelens_rank0_csvs/ops_summary_by_category.csv"
-fi
-
-if [ -f "{{OUTPUT_DIR}}/results/tracelens_rank0_csvs/ops_summary.csv" ]; then
-    echo ""
-    echo "--- Top Ops Summary (first 25 lines) ---"
-    head -25 "{{OUTPUT_DIR}}/results/tracelens_rank0_csvs/ops_summary.csv"
-fi
-
-if [ -f "{{OUTPUT_DIR}}/results/tracelens_rank0_csvs/kernel_summary.csv" ]; then
-    echo ""
-    echo "--- Top Kernel Summary (first 25 lines) ---"
-    head -25 "{{OUTPUT_DIR}}/results/tracelens_rank0_csvs/kernel_summary.csv"
-fi
-
-if [ -f "{{OUTPUT_DIR}}/results/tracelens_rank0_csvs/GEMM.csv" ]; then
-    echo ""
-    echo "--- GEMM Kernel Summary (first 25 lines) ---"
-    head -25 "{{OUTPUT_DIR}}/results/tracelens_rank0_csvs/GEMM.csv"
-fi
-
-echo ""
-echo "============================================"
-echo "  Phase-Split Roofline Analysis"
-echo "============================================"
-
-for PHASE_LABEL in "Prefill-Decode" "Decode-Only"; do
-    if [ "$PHASE_LABEL" = "Prefill-Decode" ]; then
-        PHASE_DIR="{{OUTPUT_DIR}}/results/tracelens_prefill_decode_csvs"
-    else
-        PHASE_DIR="{{OUTPUT_DIR}}/results/tracelens_decode_only_csvs"
-    fi
-
-    if [ -d "$PHASE_DIR" ] && [ "$(ls -A $PHASE_DIR/*.csv 2>/dev/null)" ]; then
-        echo ""
-        echo "--- $PHASE_LABEL Phase ---"
-
-        if [ -f "$PHASE_DIR/gpu_timeline.csv" ]; then
-            echo ""
-            echo "  GPU Timeline ($PHASE_LABEL):"
-            cat "$PHASE_DIR/gpu_timeline.csv"
-        fi
-
-        if [ -f "$PHASE_DIR/ops_summary_by_category.csv" ]; then
-            echo ""
-            echo "  Ops by Category ($PHASE_LABEL):"
-            cat "$PHASE_DIR/ops_summary_by_category.csv"
-        fi
-
-        if [ -f "$PHASE_DIR/unified_perf_summary.csv" ]; then
-            echo ""
-            echo "  Roofline / Unified Perf Summary ($PHASE_LABEL, first 25 lines):"
-            head -25 "$PHASE_DIR/unified_perf_summary.csv"
-        fi
-
-        if [ -f "$PHASE_DIR/GEMM.csv" ]; then
-            echo ""
-            echo "  GEMM Roofline ($PHASE_LABEL, first 25 lines):"
-            head -25 "$PHASE_DIR/GEMM.csv"
-        fi
-
-        for ATTN_CSV in "$PHASE_DIR/SDPA_fwd.csv" "$PHASE_DIR/FLASH_ATTN_fwd.csv"; do
-            if [ -f "$ATTN_CSV" ]; then
-                echo ""
-                echo "  Attention Roofline ($PHASE_LABEL, first 25 lines):"
-                head -25 "$ATTN_CSV"
-                break
-            fi
-        done
-    else
-        echo ""
-        echo "  $PHASE_LABEL phase: no roofline data available"
-    fi
-done
-
-echo ""
-echo "============================================"
-```
-
-Save TraceLens analysis to `{{OUTPUT_DIR}}/results/profile_analysis.json`:
+Save all analysis data to `{{OUTPUT_DIR}}/results/profile_analysis_${MODE}.json`:
 ```json
 {
-  "tracelens_version": "<version>",
+  "mode": "<eager|graph>",
   "trace_file": "<rank0 trace path>",
   "num_ranks_analyzed": <N>,
-  "top_ops": [{"name": "...", "total_time_us": ..., "pct": ...}, ...],
-  "top_kernels": [{"name": "...", "calls": ..., "avg_time_us": ..., "pct": ...}, ...],
-  "category_breakdown": {"gemm": ..., "attention": ..., "communication": ..., ...},
-  "collective_overhead_pct": <if multi-rank>,
-  "gpu_utilization_pct": <estimated from timeline>,
-  "output_csv_dirs": ["tracelens_rank0_csvs/", "tracelens_collective_csvs/"],
+  "gap_analysis": {
+    "full_trace": "<gap_analysis_{mode}/gap_analysis.json contents>",
+    "prefill_decode": "<gap_analysis_prefill_decode_{mode}/gap_analysis.json contents>",
+    "decode_only": "<gap_analysis_decode_only_{mode}/gap_analysis.json contents>"
+  },
+  "tracelens": {
+    "gpu_timeline": "<from tracelens_{mode}/gpu_timeline.csv>",
+    "category_breakdown": "<from tracelens_{mode}/ops_summary_by_category.csv>",
+    "top_ops": "<from tracelens_{mode}/ops_summary.csv>",
+    "top_kernels": "<from tracelens_{mode}/kernel_summary.csv>"
+  },
+  "collective": "<from tracelens_collective_{mode}/nccl_summary_implicit_sync.csv if available>",
   "gpu_arch": "<detected GPU model or null>",
   "phase_split": {
-    "available": true,
-    "prefill_decode_trace": "<path to prefill-decode trace or null>",
-    "decode_only_trace": "<path to decode-only trace or null>",
-    "execution_details": "<contents of phase_split/execution_details.json>"
+    "execution_details": "<from phase_split_{mode}/execution_details.json>",
+    "prefill_decode_trace": "<path>",
+    "decode_only_trace": "<path>"
   },
   "roofline": {
     "prefill_decode": {
-      "available": true,
-      "csv_dir": "tracelens_prefill_decode_csvs/",
-      "gpu_timeline": {"computation_pct": ..., "communication_pct": ..., "idle_pct": ...},
-      "category_breakdown": {"gemm": ..., "attention": ..., ...},
-      "top_roofline_ops": [{"name": "...", "flops_per_byte": ..., "tflops_s": ..., "bound_type": "memory|compute", "bound_distance_pct": ...}, ...]
+      "gpu_timeline": "<from tracelens_prefill_decode_{mode}/gpu_timeline.csv>",
+      "category_breakdown": "<from tracelens_prefill_decode_{mode}/ops_summary_by_category.csv>",
+      "unified_perf_summary": "<from tracelens_prefill_decode_{mode}/unified_perf_summary.csv>"
     },
     "decode_only": {
-      "available": true,
-      "csv_dir": "tracelens_decode_only_csvs/",
-      "gpu_timeline": {"computation_pct": ..., "communication_pct": ..., "idle_pct": ...},
-      "category_breakdown": {"gemm": ..., "attention": ..., ...},
-      "top_roofline_ops": [{"name": "...", "flops_per_byte": ..., "tflops_s": ..., "bound_type": "memory|compute", "bound_distance_pct": ...}, ...]
+      "gpu_timeline": "<from tracelens_decode_only_{mode}/gpu_timeline.csv>",
+      "category_breakdown": "<from tracelens_decode_only_{mode}/ops_summary_by_category.csv>",
+      "unified_perf_summary": "<from tracelens_decode_only_{mode}/unified_perf_summary.csv>"
     }
   }
 }
 ```
 
-### 4. Identify Profile Bottlenecks
+```bash
+done  # end of for MODE in eager graph
+```
 
-From **gap analysis** (step 2 — always available when traces exist):
-- Identify the top-K most expensive steady-state kernels from `gap_analysis.csv`
-- Compare kernel time distribution across ranks (look for load imbalance)
-- Identify whether bottleneck is compute-bound (GEMM-heavy) or communication-bound (collective-heavy)
+---
 
-From **TraceLens** results (step 3 — should always be available; fall back to gap analysis only if install failed after retry):
-- Rank GPU kernels by cumulative time from `kernel_summary.csv`
-- Quantify collective communication overhead from `coll_analysis.csv` (time spent in AllReduce, AllGather, etc.)
-- Detect GPU idle gaps from `gpu_timeline.csv` indicating pipeline bubbles or CPU-bound phases
-- Analyze time distribution across op categories from `ops_summary_by_category.csv`
+## Step 5: Generate Per-Mode Reports
 
-From **phase-split roofline analysis** (step 3 — available when trace annotations support phase detection):
-- Compare GPU utilization and category breakdown between prefill-decode and decode-only phases
-- Identify whether prefill is compute-bound (expected for large-batch GEMM) or decode is memory-bound (expected for single-token attention)
-- From `unified_perf_summary.csv`: extract per-op roofline metrics (FLOPS/byte, TFLOPS/s, bound type, distance to roofline)
-- From `GEMM.csv` / `SDPA_fwd.csv`: compare GEMM and attention arithmetic intensity between phases
-- Flag ops far from the roofline ceiling as optimization opportunities (e.g., low TFLOPS/s relative to achievable peak)
+Generate two standalone profiling reports: `profiling_report_eager.md` and `profiling_report_graph.md`.
 
-Save profile bottleneck findings to `{{OUTPUT_DIR}}/results/profile_analysis.json` (merge with TraceLens data if already created in step 3).
+Read `profile_analysis_eager.json` / `profile_analysis_graph.json` and the corresponding gap analysis JSONs to populate each report.
 
-### 5. Generate Profiling Report
-
-Generate the profiling report at `{{REPORT_DIR}}/profiling_report.md`. This is a **standalone** report — it does NOT include benchmark results (those live in `benchmark_report.md` from Phase 3).
-
-Read `{{OUTPUT_DIR}}/results/profile_analysis.json` and `{{OUTPUT_DIR}}/results/gap_analysis/gap_analysis.json` to populate the report.
-
-The report MUST use the following template:
+Each report MUST use the following template:
 
 ```markdown
-# InferenceX Profiling Report
+# InferenceX Profiling Report (<MODE> Mode)
 
 ## Configuration
 - **Config Key**: {{CONFIG_KEY}}
 - **Date**: <current date>
-- **GPU**: <detected GPU>
+- **Docker Image**: <image from config>
+- **GPU**: <detected GPU> (<memory_gb> GB HBM, <mem_bw_gbps> GB/s, <peak_bf16_tflops> TFLOPS bf16 peak)
 - **Framework**: <framework from config>
-- **Model**: <model name>
+- **Model**: <model name> (<N> layers profiled out of <total> if reduced)
 - **Precision**: <precision>
 - **Tensor Parallelism**: <TP value>
 - **Sequence Length**: ISL=<ISL>, OSL=<OSL>
@@ -532,59 +431,79 @@ The report MUST use the following template:
 
 | Metric | Full Trace | Prefill-Decode | Decode-Only |
 |--------|------------|----------------|-------------|
-| Computation Time (%) | <from gpu_timeline.csv> | <from prefill-decode gpu_timeline.csv> | <from decode-only gpu_timeline.csv> |
+| Computation Time (%) | ... | ... | ... |
 | Exposed Comm Time (%) | ... | ... | ... |
 | Exposed Memcpy Time (%) | ... | ... | ... |
 | GPU Busy Time (%) | ... | ... | ... |
 | GPU Idle Time (%) | ... | ... | ... |
 
+**Key Finding**: <1-2 sentence summary of utilization pattern, e.g., "CUDA graphs reduced exposed communication from X% to Y%, shifting the bottleneck from AllReduce to MLA FlashAttention.">
+
 ## Top GPU Kernels (Steady-State)
 
-From gap analysis of the profiled steady-state iterations:
+From gap analysis of the full profiled steady-state iterations:
 
 | Rank | Kernel Name | Calls | Total Time (us) | Avg (us) | % Total |
 |------|-------------|-------|-----------------|----------|---------|
-| 1 | ... | ... | ... | ... | ... |
+| 1 | <kernel_name> (<functional annotation>) | ... | ... | ... | ... |
+
+Total GPU kernel time: <X> ms across <Y> unique kernel types.
+
+Annotate kernel names with human-readable functional descriptions, e.g.:
+- `_fwd_grouped_kernel_stage1` → `(MLA FlashAttention)`
+- `Cijk_Ailk_Bljk_HHS_BH_MT128x128x64...` → `(GEMM FusedQkvAProj)`
+- `ncclAllReduceRingLL` → `(AllReduce TP sync)`
+- `fused_moe_kernel` → `(FusedMoE expert dispatch)`
 
 ## Kernel Category Breakdown
 
-From TraceLens ops_summary_by_category:
+From TraceLens ops_summary_by_category (eager mode) or gap analysis kernel classification (graph mode — see note below):
 
 | Category | Count | Total Time (ms) | % of Kernel Time |
 |----------|-------|-----------------|------------------|
-| ... | ... | ... | ... |
+| GEMM | ... | ... | ... |
+| Attention | ... | ... | ... |
+| Communication | ... | ... | ... |
+| FusedMoE | ... | ... | ... |
+| other (<list key subcategories>) | ... | ... | ... |
+
+> **Note (graph mode only)**: TraceLens `ops_summary_by_category` cannot see inside `hipGraphLaunch` — most ops appear as "other" under `GraphModule`. The category breakdown above uses gap analysis kernel name classification as a fallback to attribute time to functional categories.
 
 ## Phase-Split Roofline Analysis
 
-Traces are split into prefill-decode and decode-only phases using TraceLens-internal's `split_vllm_trace_annotation.py`, then analyzed with `generate_perf_report_pytorch_inference.py` for per-phase roofline insights against <GPU> specs (<mem_bw> GB/s HBM bandwidth, <peak_tflops> TFLOPS bf16 peak).
+Traces are split into prefill-decode and decode-only phases using `split_vllm_trace_annotation.py`, then analyzed with `generate_perf_report_pytorch_vllm.py` (eager) or `generate_perf_report_pytorch_vllm_graph.py` (graph) for per-phase roofline insights against <GPU> specs (<mem_bw> GB/s HBM bandwidth, <peak_tflops> TFLOPS bf16 peak).
 
-### Prefill-Decode Phase (<N> steps, BS=<batch_size>)
+### Prefill-Decode Phase (<N> steps, BS=<batch_size>, conc=<concurrency>)
 
 | Metric | Value |
 |--------|-------|
-| Computation Time (%) | <from prefill-decode gpu_timeline.csv> |
-| GPU Busy Time (%) | <from prefill-decode gpu_timeline.csv> |
-| Dominant Bound Type | <compute or memory, from unified_perf_summary.csv> |
+| Computation Time (%) | ... |
+| GPU Busy Time (%) | ... |
+| Dominant Bound Type | compute or memory |
 
 Top roofline ops (prefill-decode):
 
 | Op Name | M×N×K | FLOPS/Byte | TFLOPS/s | Bound Type | Pct Roofline |
 |---------|-------|------------|----------|------------|--------------|
-| ... | ... | ... | ... | ... | ... |
+| <descriptive name> | ... | ... | ... | ... | ... |
 
-### Decode-Only Phase (<N> steps, BS=<batch_size>)
+Filter out trivial ops (e.g., `elementwise copy`) to focus on meaningful compute ops.
+
+### Decode-Only Phase (<N> steps, BS=<batch_size>, conc=<concurrency>)
 
 | Metric | Value |
 |--------|-------|
-| Computation Time (%) | <from decode-only gpu_timeline.csv> |
-| GPU Busy Time (%) | <from decode-only gpu_timeline.csv> |
-| Dominant Bound Type | <compute or memory, from unified_perf_summary.csv> |
+| Computation Time (%) | ... |
+| GPU Busy Time (%) | ... |
+| Dominant Bound Type | compute or memory |
 
 Top roofline ops (decode-only):
 
 | Op Name | M×N×K | FLOPS/Byte | TFLOPS/s | Bound Type | Pct Roofline |
 |---------|-------|------------|----------|------------|--------------|
-| ... | ... | ... | ... | ... | ... |
+| <descriptive name> | ... | ... | ... | ... | ... |
+
+> **Note (graph mode only)**: In graph mode, most ops inside CUDA graphs appear as a single `hipGraphLaunch` entry. Individual GEMM, attention, and MoE op roofline data is only available in the eager-mode report. See the combined report (`profiling_report.md`) for cross-referenced data.
 
 ### Phase Comparison
 
@@ -606,41 +525,98 @@ Top roofline ops (decode-only):
 - ...
 
 ## Raw Profile Data
-- Gap analysis: `results/gap_analysis/`
-- TraceLens rank-0 CSVs: `results/tracelens_rank0_csvs/`
-- Phase-split traces: `results/phase_split/`
-- Prefill-decode roofline CSVs: `results/tracelens_prefill_decode_csvs/`
-- Decode-only roofline CSVs: `results/tracelens_decode_only_csvs/`
+- Gap analysis (full): `results/gap_analysis_<mode>/`
+- Gap analysis (prefill-decode): `results/gap_analysis_prefill_decode_<mode>/`
+- Gap analysis (decode-only): `results/gap_analysis_decode_only_<mode>/`
+- TraceLens rank-0 CSVs: `results/tracelens_<mode>/`
+- TraceLens collective CSVs: `results/tracelens_collective_<mode>/`
+- Phase-split traces: `results/phase_split_<mode>/`
+- Prefill-decode roofline CSVs: `results/tracelens_prefill_decode_<mode>/`
+- Decode-only roofline CSVs: `results/tracelens_decode_only_<mode>/`
 - GPU arch config: `results/gpu_arch.json`
-- Profile analysis JSON: `results/profile_analysis.json`
-- Profiler summary: `profiles/profiler_out_0.txt`
-- Trace file: `profiles/<trace_file_name>`
+- Profile analysis JSON: `results/profile_analysis_<mode>.json`
+- Trace files: `profiles_<mode>/`
 - Traces viewable at: https://ui.perfetto.dev/
 ```
 
-**Print the final report path:**
+---
+
+## Step 6: Generate Final Combined Report
+
+After generating both per-mode reports, produce a **final combined report** at `{{REPORT_DIR}}/profiling_report.md`. This is the **primary deliverable**. The per-mode reports remain as supporting detail.
+
+### Motivation
+
+Graph mode is the production execution path and has better utilization/timing data. But its roofline table is nearly empty because TraceLens can't see inside `hipGraphLaunch`. Eager mode reveals all the individual GEMMs, attention ops, and MoE kernels with their names, shapes, and roofline metrics — these same ops run inside the graph, they're just not individually measurable in graph mode.
+
+### Rules for the Combined Report
+
+1. **All timing/utilization data** comes from graph mode: GPU utilization table, top kernels (gap analysis), category breakdown, phase comparison, bottleneck analysis.
+
+2. **Roofline table shows both graph and eager data, clearly labeled** with a `Mode` column:
+   - Ops individually visible in graph mode (outside `hipGraphLaunch`, e.g., LM head GEMM, BMM attention) show their **graph-mode** roofline metrics, marked `graph`.
+   - Ops hidden inside `hipGraphLaunch` in graph mode but individually visible in eager mode show their **eager-mode** roofline metrics (FLOPS/Byte, TFLOPS/s, Bound Type, Pct Roofline), marked `eager`.
+
+3. **Show group relationships** using tree notation under a `**hipGraphLaunch group**` parent:
+
+```markdown
+Top roofline ops (decode-only):
+
+| Op Name | M×N×K | FLOPS/Byte | TFLOPS/s | Bound Type | Pct Roofline | Mode |
+|---------|-------|------------|----------|------------|--------------|------|
+| GEMM LM head (hidden→vocab/TP) | 16×40960×7168 | 16.0 | 90.2 | memory | 70.6% | graph |
+| BMM MLA (Q×K attention scores) | 16×512×128 | 13.8 | 0.4 | memory | 0.4% | graph |
+| BMM MLA (attn×V context) | 16×128×512 | 13.8 | 0.2 | memory | 0.2% | graph |
+| **hipGraphLaunch group** | — | — | — | — | — | graph |
+| ├─ GEMM FusedQkvAProj (MLA QKV compress) | 16×9216×7168 | 15.9 | 68.9 | memory | 54.0% | eager |
+| ├─ GEMM RowParallel (MLA output proj) | 16×7168×4608 | 15.9 | 61.4 | memory | 48.2% | eager |
+| ├─ GEMM RowParallel (MLA KV proj) | 16×2112×7168 | 15.8 | 34.9 | memory | 27.5% | eager |
+| ├─ GEMM ColumnParallel (MLA Q absorb) | 16×7168×2048 | 15.8 | 34.1 | memory | 26.9% | eager |
+| └─ GEMM MLA (KV latent proj) | 16×7168×512 | 15.5 | 12.2 | memory | 9.9% | eager |
+```
+
+> **Note**: Ops under `hipGraphLaunch group` are individually invisible in graph mode. Their roofline data (FLOPS/Byte, TFLOPS/s, Pct Roofline) is measured from **eager mode** and shown here as reference. Eager-mode dispatch overhead differs from graph mode, so these numbers are approximate — actual graph-mode per-op performance may differ due to reduced launch latency and better pipelining.
+
+4. **Matching logic**: Match eager roofline ops to graph by `(op_name, M, N, K)` tuple. Ops already individually visible in graph-mode roofline appear in the top section with graph data. Remaining eager ops that are not individually visible in graph mode are grouped under the `hipGraphLaunch group`.
+
+5. **Graph-mode aggregate for the group**: From gap analysis, compute the total kernel time inside graph launches (sum of all kernels not individually visible in TraceLens roofline). Show this as the `hipGraphLaunch group` row's timing context in the Top GPU Kernels table (not the roofline table).
+
+6. **Output**: `{{REPORT_DIR}}/profiling_report.md` — the primary deliverable.
+
+---
+
+**Print the final report paths:**
 ```bash
 echo ""
 echo "============================================"
-echo "  Profiling Report Generated"
+echo "  Profiling Reports Generated"
 echo "============================================"
-echo "Report: {{REPORT_DIR}}/profiling_report.md"
+echo "Per-mode reports:"
+echo "  Eager: {{REPORT_DIR}}/profiling_report_eager.md"
+echo "  Graph: {{REPORT_DIR}}/profiling_report_graph.md"
+echo "Combined report (primary):"
+echo "  {{REPORT_DIR}}/profiling_report.md"
 echo "============================================"
 ```
 
 ## Completion
-Update progress.json (include "profile" in phases_completed only if profiling was run):
+Update progress.json:
 ```json
 {
   "phase": "profile-analyze",
   "phases_completed": ["env", "config", "benchmark", "benchmark-analyze", "profile", "profile-analyze"],
   "current_step": "profile analysis complete",
   "details": {
-    "gap_analysis": <true if step 2 succeeded, false otherwise>,
-    "tracelens_analysis": <true if step 3 succeeded, false otherwise>,
-    "phase_split_roofline": <true if phase-split roofline analysis succeeded, false otherwise>,
+    "modes_analyzed": ["eager", "graph"],
+    "gap_analysis": true,
+    "tracelens_analysis": true,
+    "phase_split_roofline": true,
     "gpu_arch_detected": "<GPU model name or null>",
-    "report": "{{REPORT_DIR}}/profiling_report.md"
+    "reports": {
+      "eager": "{{REPORT_DIR}}/profiling_report_eager.md",
+      "graph": "{{REPORT_DIR}}/profiling_report_graph.md",
+      "combined": "{{REPORT_DIR}}/profiling_report.md"
+    }
   }
 }
 ```

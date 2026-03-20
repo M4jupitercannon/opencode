@@ -79,6 +79,10 @@ export const InferenceXOptimizeCommand = cmd({
         type: "number",
         describe: "filter to specific tensor parallelism level from config search-space (e.g., 1, 4, 8)",
       })
+      .option("ep", {
+        type: "number",
+        describe: "filter to specific expert parallelism level from config search-space (e.g., 1, 8)",
+      })
       .option("conc-start", {
         type: "number",
         describe: "filter to concurrency levels >= this value",
@@ -189,6 +193,7 @@ export const InferenceXOptimizeCommand = cmd({
     UI.println(`Dry Run:           ${args["dry-run"]}`)
     UI.println(`Mode:              ${mode}`)
     if (args.tp != null) UI.println(`Filter TP:         ${args.tp}`)
+    if (args.ep != null) UI.println(`Filter EP:         ${args.ep}`)
     if (args["conc-start"] != null || args["conc-end"] != null) {
       const start = args["conc-start"] != null ? String(args["conc-start"]) : "1"
       const end = args["conc-end"] != null ? String(args["conc-end"]) : "∞"
@@ -270,6 +275,7 @@ export const InferenceXOptimizeCommand = cmd({
       dry_run: args["dry-run"],
       mode,
       filter_tp: args.tp != null ? String(args.tp) : "",
+      filter_ep: args.ep != null ? String(args.ep) : "",
       filter_conc_start: args["conc-start"] != null ? String(args["conc-start"]) : "",
       filter_conc_end: args["conc-end"] != null ? String(args["conc-end"]) : "",
       filter_seq: args["seq-len"] || "",
@@ -310,6 +316,7 @@ export const InferenceXOptimizeCommand = cmd({
       repoDir,
       hfCache,
       filterTp: args.tp != null ? String(args.tp) : "",
+      filterEp: args.ep != null ? String(args.ep) : "",
       filterConcStart: args["conc-start"] != null ? String(args["conc-start"]) : "",
       filterConcEnd: args["conc-end"] != null ? String(args["conc-end"]) : "",
       filterSeq: (args["seq-len"] as string) || "",

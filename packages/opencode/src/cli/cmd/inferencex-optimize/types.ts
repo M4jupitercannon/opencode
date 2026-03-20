@@ -29,6 +29,8 @@ export interface InferenceXConfig {
   hfCache: string
   /** Filter to a specific tensor parallelism level from config search-space */
   filterTp: string
+  /** Filter to a specific expert parallelism level from config search-space */
+  filterEp: string
   /** Filter to concurrency levels >= this value */
   filterConcStart: string
   /** Filter to concurrency levels <= this value */

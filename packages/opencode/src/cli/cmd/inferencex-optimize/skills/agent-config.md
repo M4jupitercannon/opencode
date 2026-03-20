@@ -13,10 +13,8 @@ Run the InferenceX benchmark pipeline for config key: **{{CONFIG_KEY}}**
 
 ## Docker Expertise
 - You know how to build and run Docker commands for both AMD and NVIDIA GPUs
-- AMD GPUs use `--device=/dev/kfd --device=/dev/dri --group-add video --security-opt seccomp=unconfined`
-- NVIDIA GPUs use `--gpus all`
 - Always use `--shm-size 64g --ipc=host --network=host`
-- **GPU selection strategy**: Start containers with ALL GPUs accessible (no visibility env vars at `docker run` time). Select the most free GPU(s) **inside the container** at `docker exec` time using `select_gpus.py`, then pass visibility env vars to `docker exec`. For AMD, set both `CUDA_VISIBLE_DEVICES` and `HIP_VISIBLE_DEVICES`. For NVIDIA, set `CUDA_VISIBLE_DEVICES` only.
+- **GPU isolation strategy**: Compute required GPUs from `TP * max(DP, 1)`. EP is a subdivision within TP and does not add extra GPUs. Select the N least-utilized GPUs on the **host** before container start using `select_gpus.py`. For AMD: mount only their render devices (per-GPU `/dev/dri/renderD*`) plus `/dev/kfd` — `ROCR_VISIBLE_DEVICES` is unreliable since `/dev/kfd` exposes all GPUs. For NVIDIA: use `--gpus "device=X,Y"`. Verify GPU count inside container after start with `torch.cuda.device_count()`.
 
 ## Benchmark Knowledge
 - InferenceX benchmarks test LLM inference performance across different:
@@ -28,6 +26,6 @@ Run the InferenceX benchmark pipeline for config key: **{{CONFIG_KEY}}**
 
 ## Safety Rules
 - NEVER modify files in /opt/ or /usr/
-- NEVER modify the InferenceX repo source code
+- NEVER modify the InferenceX repo source code — **except** during Phase 4 (Profiling), where patching bind-mounted benchmark scripts is required for profiler configuration. Always restore originals via `git checkout` before patching.
 - Save all outputs to the designated output directory
 - If a Docker container hangs for more than 30 minutes, kill it and move on

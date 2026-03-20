@@ -41,7 +41,7 @@ Group all configs by their `image` field. Configs sharing the same Docker image 
 Typically all configs for a given config-key use the same image, so there will be a single group.
 
 ### 5. Start One Persistent Container Per Image Group
-Detect GPU vendor and start the container with access to **all** GPUs. GPU selection happens later at `docker exec` time (not at container start).
+Detect GPU vendor, compute the number of required GPUs, select the best GPUs on the **host**, and start a container with **only those GPUs** mounted for reliable isolation.
 
 **5a. Detect GPU vendor:**
 ```bash
@@ -52,14 +52,24 @@ else
 fi
 ```
 
-**5b. Set GPU device flags (NO GPU visibility env vars):**
-The container gets access to all GPUs. Visibility is restricted per-benchmark at `docker exec` time.
+**5b. Select GPUs and set device flags:**
+Compute the required GPU count from the parallelism config. EP is a subdivision within TP and does not add extra GPUs. Use `select_gpus.py --docker-flags` to select the least-utilized GPUs and generate Docker device isolation flags (handles AMD MI355X PCI+XCP render devices and NVIDIA `--gpus device=` in one step).
 ```bash
-# For AMD GPUs (runner starts with "mi")
-GPU_FLAGS="--device=/dev/kfd --device=/dev/dri --group-add video --security-opt seccomp=unconfined"
+NUM_GPUS=$((TP * ${DP:-1}))
 
-# For NVIDIA GPUs
-GPU_FLAGS="--gpus all"
+MANUAL_GPUS="{{GPUS}}"
+if [ -n "$MANUAL_GPUS" ]; then
+    echo "Using manually specified GPUs: $MANUAL_GPUS"
+    if [ "$GPU_VENDOR" = "amd" ]; then
+        GPU_FLAGS="--device=/dev/kfd --device=/dev/dri --group-add video --security-opt seccomp=unconfined"
+    else
+        GPU_FLAGS="--gpus device=$MANUAL_GPUS"
+    fi
+else
+    GPU_FLAGS=$(python3 "{{SCRIPTS_DIR}}/select_gpus.py" $NUM_GPUS --docker-flags)
+    echo "Auto-selected GPUs on host for TP=$TP DP=${DP:-1}"
+    echo "GPU_FLAGS: $GPU_FLAGS"
+fi
 ```
 
 **5c. Start container:**
@@ -84,40 +94,24 @@ docker run -d \
     -c "sleep infinity"
 ```
 
-**5d. Copy GPU selection script into the container:**
+**5d. Verify GPU isolation:**
 ```bash
-docker cp {{SCRIPTS_DIR}}/select_gpus.py "$CONTAINER_NAME":/tmp/select_gpus.py
+docker exec "$CONTAINER_NAME" python3 -c \
+    "import torch; n=torch.cuda.device_count(); print(f'GPUs visible: {n}'); assert n==$NUM_GPUS, f'Expected $NUM_GPUS but got {n}'"
 ```
 
 {{DRY_RUN_NOTE}}
 
 ### 6. Run Each Benchmark via `docker exec`
-For each config in the group, **select the most free GPUs inside the container**, then run the benchmark script.
+For each config in the group, run the benchmark script. GPU isolation was already applied at container start (step 5b), so no per-exec GPU selection is needed — all visible GPUs inside the container are the selected ones.
 
-Select the most free GPUs **inside the container** based on real-time VRAM usage. If GPUs were manually specified, use those instead.
 ```bash
-MANUAL_GPUS="{{GPUS}}"
-if [ -n "$MANUAL_GPUS" ]; then
-    SELECTED_GPUS="$MANUAL_GPUS"
-    echo "Using manually specified GPUs: $SELECTED_GPUS"
-else
-    SELECTED_GPUS=$(docker exec "$CONTAINER_NAME" python3 /tmp/select_gpus.py $TP)
-    echo "Auto-selected most free GPUs (inside container): $SELECTED_GPUS"
-fi
-
-if [ "$GPU_VENDOR" = "amd" ]; then
-    GPU_ENV="-e CUDA_VISIBLE_DEVICES=$SELECTED_GPUS -e HIP_VISIBLE_DEVICES=$SELECTED_GPUS"
-else
-    GPU_ENV="-e CUDA_VISIBLE_DEVICES=$SELECTED_GPUS"
-fi
-
 RESULT_FILENAME="${EXP_NAME}_${PRECISION}_${FRAMEWORK}_tp${TP}-ep${EP}_conc${CONC}"
 DOCKER_LOG="{{OUTPUT_DIR}}/results/${RESULT_FILENAME}_docker.log"
 echo "DOCKER_LOG: $DOCKER_LOG"
-echo "RUN_CMD: docker exec $GPU_ENV -e MODEL=$MODEL -e TP=$TP -e EP_SIZE=$EP -e CONC=$CONC -e ISL=$ISL -e OSL=$OSL -e MAX_MODEL_LEN=$MAX_MODEL_LEN -e RANDOM_RANGE_RATIO=0.5 -e RESULT_FILENAME=$RESULT_FILENAME -e PRECISION=$PRECISION -e FRAMEWORK=$FRAMEWORK -e EXP_NAME=$EXP_NAME $CONTAINER_NAME /bin/bash /workspace/$BENCHMARK_SCRIPT"
+echo "RUN_CMD: docker exec -e MODEL=$MODEL -e TP=$TP -e EP_SIZE=$EP -e CONC=$CONC -e ISL=$ISL -e OSL=$OSL -e MAX_MODEL_LEN=$MAX_MODEL_LEN -e RANDOM_RANGE_RATIO=0.5 -e RESULT_FILENAME=$RESULT_FILENAME -e PRECISION=$PRECISION -e FRAMEWORK=$FRAMEWORK -e EXP_NAME=$EXP_NAME $CONTAINER_NAME /bin/bash /workspace/$BENCHMARK_SCRIPT"
 
 docker exec \
-    $GPU_ENV \
     -e MODEL=$MODEL \
     -e TP=$TP \
     -e EP_SIZE=$EP \

@@ -16,9 +16,55 @@ If `{{FILTER_TP}}`, `{{FILTER_CONC_START}}`/`{{FILTER_CONC_END}}`, and `{{FILTER
 mkdir -p "{{PROFILE_DIR}}"
 ```
 
+### 2a. Adaptive Layer Estimation
+Estimate total trace file size from the model's HuggingFace config. If estimated traces exceed 1 GB, profile a reduced model (8 layers) to keep traces manageable while still capturing representative kernel behavior.
+
+```bash
+python3 << 'PYEOF'
+import json, os, sys, glob
+
+model = os.environ["MODEL"]
+hf_cache = os.environ.get("HF_CACHE", os.environ.get("HF_HUB_CACHE", "~/.cache/huggingface"))
+tp = int(os.environ.get("TP", "1"))
+max_iters = 256
+
+config_path = None
+model_slug = model.replace("/", "--")
+for path in sorted(glob.glob(os.path.expanduser(hf_cache) + f"/hub/models--{model_slug}/snapshots/*/config.json")):
+    config_path = path
+    break
+
+if not config_path:
+    for root, dirs, files in os.walk(os.path.expanduser(hf_cache)):
+        if "config.json" in files and model_slug in root:
+            config_path = os.path.join(root, "config.json")
+            break
+
+if not config_path:
+    print("PROFILE_NUM_LAYERS=full")
+    sys.exit(0)
+
+with open(config_path) as f:
+    config = json.load(f)
+num_layers = config.get("num_hidden_layers", 32)
+num_experts = config.get("n_routed_experts", config.get("num_local_experts", 0))
+
+base_mb = 0.12 if num_experts > 0 else 0.08
+estimated_mb = num_layers * tp * max_iters * base_mb * 1.35
+
+if estimated_mb > 1024:
+    print(f"PROFILE_NUM_LAYERS=8")
+    print(f"NOTE: Estimated {estimated_mb:.0f} MB > 1 GB for {num_layers} layers. Profiling 8/{num_layers} layers.")
+else:
+    print(f"PROFILE_NUM_LAYERS=full")
+    print(f"NOTE: Estimated {estimated_mb:.0f} MB for {num_layers} layers. Profiling all layers.")
+PYEOF
+```
+
+If `PROFILE_NUM_LAYERS != full`, inject `--hf-overrides '{"num_hidden_layers": 8}'` into the vLLM serve command in step 3a. The report should note: `**Model**: <name> (<N> layers profiled out of <total>)`.
+
 ### 3. Start Persistent Profiling Container
-Start **one** persistent container for all profiling runs with access to **all** GPUs. Add profiling environment variables.
-GPU selection happens later at `docker exec` time (not at container start).
+Detect GPU vendor, compute the number of required GPUs, select the best GPUs on the **host**, and start a container with **only those GPUs** mounted.
 
 **3a. Detect GPU vendor:**
 ```bash
@@ -29,14 +75,24 @@ else
 fi
 ```
 
-**3b. Set GPU device flags (NO GPU visibility env vars):**
-The container gets access to all GPUs. Visibility is restricted per-run at `docker exec` time.
+**3b. Select GPUs and set device flags:**
+Same host-side GPU isolation as Phase 2 (Benchmark). EP is a subdivision within TP and does not add extra GPUs. Use `select_gpus.py --docker-flags` to select GPUs and generate Docker device isolation flags in one step.
 ```bash
-# For AMD GPUs (runner starts with "mi")
-GPU_FLAGS="--device=/dev/kfd --device=/dev/dri --group-add video --security-opt seccomp=unconfined"
+NUM_GPUS=$((TP * ${DP:-1}))
 
-# For NVIDIA GPUs
-GPU_FLAGS="--gpus all"
+MANUAL_GPUS="{{GPUS}}"
+if [ -n "$MANUAL_GPUS" ]; then
+    echo "Using manually specified GPUs: $MANUAL_GPUS"
+    if [ "$GPU_VENDOR" = "amd" ]; then
+        GPU_FLAGS="--device=/dev/kfd --device=/dev/dri --group-add video --security-opt seccomp=unconfined"
+    else
+        GPU_FLAGS="--gpus device=$MANUAL_GPUS"
+    fi
+else
+    GPU_FLAGS=$(python3 "{{SCRIPTS_DIR}}/select_gpus.py" $NUM_GPUS --docker-flags)
+    echo "Auto-selected GPUs on host for TP=$TP DP=${DP:-1}"
+    echo "GPU_FLAGS: $GPU_FLAGS"
+fi
 ```
 
 **3c. Start container:**
@@ -64,14 +120,15 @@ docker run -d \
     -c "sleep infinity"
 ```
 
-**3d. Copy GPU selection script into the container:**
+**3d. Verify GPU isolation:**
 ```bash
-docker cp {{SCRIPTS_DIR}}/select_gpus.py "$CONTAINER_NAME":/tmp/select_gpus.py
+docker exec "$CONTAINER_NAME" python3 -c \
+    "import torch; n=torch.cuda.device_count(); print(f'GPUs visible: {n}'); assert n==$NUM_GPUS, f'Expected $NUM_GPUS but got {n}'"
 ```
 
 {{DRY_RUN_NOTE}}
 
-### 3a. Inject vLLM Profiler Config
+### 3e. Inject vLLM Profiler Config
 vLLM >= 0.15 requires `--profiler-config.*` CLI args on the `vllm serve` command to register the `/start_profile` and `/stop_profile` API endpoints. The `VLLM_TORCH_PROFILER_DIR` env var is deprecated; without `--profiler-config.*` args, the profiling routes are never attached and calls to `/start_profile` silently fail, producing no torch traces. 
 
 First restore the benchmark script to its original state (previous runs may have patched the host copy via bind mount), then inject the profiler args:
@@ -98,7 +155,7 @@ rrr = float(os.environ.get('RANDOM_RANGE_RATIO', '0.5'))
 # split_vllm_trace_annotation.py (--find-steady-state --num-steps 32)
 # can extract both phase traces for roofline analysis.
 #
-# With num_prompts = conc * 10 (step 3c disables capping), the
+# With num_prompts = conc * 10 (step 3g disables capping), the
 # workload runs in ~10 "waves" of conc concurrent requests.
 # Each iteration produces one token per active sequence.
 #   total_iters ≈ 10 * avg_osl
@@ -147,7 +204,7 @@ PYEOF
 
 NOTE: The container bind-mounts `{{REPO_DIR}}:/workspace`, so these changes affect the host repo. Step 6 cleans up generated files, and the `git checkout` above ensures a clean starting state.
 
-### 3b. Disable Relay Trace Staging
+### 3f. Disable Relay Trace Staging
 The `move_profile_trace_for_relay()` function in `benchmark_lib.sh` copies the rank trace to the repo root as a relay file. This is for CI/CD workflows and not needed here — we collect rank traces directly from the profiles directory. Neutralize the function **call** inside the container by replacing it with a bash no-op (`:`) so the enclosing `if` block remains syntactically valid:
 ```bash
 docker exec "$CONTAINER_NAME" python3 -c "
@@ -168,7 +225,7 @@ print('Disabled move_profile_trace_for_relay')
 "
 ```
 
-### 3c. Keep Full Prompt Count for Steady-State Profiling
+### 3g. Keep Full Prompt Count for Steady-State Profiling
 By default `benchmark_lib.sh` caps `num_prompts` to `max_concurrency` when `PROFILE=1`, producing a single-batch run with no mixed prefill+decode steady state. Disable this cap so the benchmark sends `conc * 10` prompts, giving the profiler a continuous-flow workload with both prefill-decode and decode-only phases for phase-split roofline analysis:
 ```bash
 docker exec "$CONTAINER_NAME" python3 -c "
@@ -187,40 +244,22 @@ print('Disabled num_prompts capping — benchmark will use original num_prompts 
 "
 ```
 
-### 4. Run Each Profile via `docker exec`
-For each selected config, **select the most free GPUs inside the container**, then run the benchmark script with profiling env vars.
+### 4. Run Dual-Mode Profiling (Eager + Graph)
+Run profiling twice: first in **eager mode** (`--enforce-eager`), then in **graph mode** (CUDA graphs enabled). GPU isolation was applied at container start (step 3b–3d), so all visible GPUs inside the container are the selected ones — no per-exec GPU selection needed.
 
-Select the most free GPUs **inside the container** based on real-time VRAM usage. If GPUs were manually specified, use those instead.
+Each mode produces multi-rank traces that are collected into separate directories for independent analysis.
+
+**4a. Eager-mode profiling run:**
+The benchmark script was already patched in step 3e with `--enforce-eager` and `--profiler-config.*` args.
 ```bash
-MANUAL_GPUS="{{GPUS}}"
-if [ -n "$MANUAL_GPUS" ]; then
-    SELECTED_GPUS="$MANUAL_GPUS"
-    echo "Using manually specified GPUs: $SELECTED_GPUS"
-else
-    SELECTED_GPUS=$(docker exec "$CONTAINER_NAME" python3 /tmp/select_gpus.py $TP)
-    echo "Auto-selected most free GPUs (inside container): $SELECTED_GPUS"
-fi
-
-if [ "$GPU_VENDOR" = "amd" ]; then
-    GPU_ENV="-e CUDA_VISIBLE_DEVICES=$SELECTED_GPUS -e HIP_VISIBLE_DEVICES=$SELECTED_GPUS"
-else
-    GPU_ENV="-e CUDA_VISIBLE_DEVICES=$SELECTED_GPUS"
-fi
-
 PROFILE_RESULT="${EXP_NAME}_${PRECISION}_${FRAMEWORK}_tp${TP}-ep${EP}_conc${CONC}_profile"
-DOCKER_LOG="{{PROFILE_DIR}}/${PROFILE_RESULT}_docker.log"
-```
+DOCKER_LOG="{{PROFILE_DIR}}/${PROFILE_RESULT}_eager_docker.log"
 
-**Print the log file path and the full docker exec command to the terminal** so the user can monitor progress and reproduce the run:
-```bash
+echo "=== EAGER MODE PROFILING ==="
 echo "DOCKER_LOG: $DOCKER_LOG"
-echo "RUN_CMD: docker exec $GPU_ENV -e MODEL=$MODEL -e TP=$TP -e EP_SIZE=$EP -e CONC=$CONC -e ISL=$ISL -e OSL=$OSL -e MAX_MODEL_LEN=$MAX_MODEL_LEN -e RANDOM_RANGE_RATIO=0.5 -e RESULT_FILENAME=$PROFILE_RESULT -e PRECISION=$PRECISION -e FRAMEWORK=$FRAMEWORK -e EXP_NAME=$EXP_NAME $CONTAINER_NAME /bin/bash /workspace/$BENCHMARK_SCRIPT"
-```
+echo "RUN_CMD: docker exec -e MODEL=$MODEL -e TP=$TP -e EP_SIZE=$EP -e CONC=$CONC -e ISL=$ISL -e OSL=$OSL -e MAX_MODEL_LEN=$MAX_MODEL_LEN -e RANDOM_RANGE_RATIO=0.5 -e RESULT_FILENAME=${PROFILE_RESULT}_eager -e PRECISION=$PRECISION -e FRAMEWORK=$FRAMEWORK -e EXP_NAME=$EXP_NAME $CONTAINER_NAME /bin/bash /workspace/$BENCHMARK_SCRIPT"
 
-Then start the profiling benchmark run:
-```bash
 docker exec \
-    $GPU_ENV \
     -e MODEL=$MODEL \
     -e TP=$TP \
     -e EP_SIZE=$EP \
@@ -229,7 +268,7 @@ docker exec \
     -e OSL=$OSL \
     -e MAX_MODEL_LEN=$MAX_MODEL_LEN \
     -e RANDOM_RANGE_RATIO=0.5 \
-    -e RESULT_FILENAME=$PROFILE_RESULT \
+    -e RESULT_FILENAME=${PROFILE_RESULT}_eager \
     -e PRECISION=$PRECISION \
     -e FRAMEWORK=$FRAMEWORK \
     -e EXP_NAME=$EXP_NAME \
@@ -237,14 +276,132 @@ docker exec \
     /bin/bash /workspace/$BENCHMARK_SCRIPT \
     > "$DOCKER_LOG" 2>&1
 EXIT_CODE=$?
-echo "Profile exit code: $EXIT_CODE"
+echo "Eager profile exit code: $EXIT_CODE"
 if [ $EXIT_CODE -ne 0 ]; then
     echo "=== Last 50 lines of docker log ==="
     tail -n 50 "$DOCKER_LOG"
 fi
 ```
 
-IMPORTANT: The docker exec runs in the **foreground** writing stdout/stderr to the log file (no output is printed to the terminal). If the command fails (non-zero exit code), the last 50 lines of the log are printed to help diagnose the issue. On success, only the exit code line is shown.
+Collect eager-mode traces immediately (before graph-mode run overwrites the profiles directory):
+```bash
+mkdir -p "{{PROFILE_DIR}}/profiles_eager"
+for f in {{REPO_DIR}}/profiles/*.json*; do
+    [ -f "$f" ] || continue
+    case "$(basename "$f")" in
+        *async_llm*) rm -f "$f" ;;
+        *)           cp "$f" "{{PROFILE_DIR}}/profiles_eager/" && rm -f "$f" ;;
+    esac
+done
+for f in {{REPO_DIR}}/profiles/profiler_out_*.txt; do
+    [ -f "$f" ] && cp "$f" "{{PROFILE_DIR}}/profiles_eager/" && rm -f "$f"
+done
+echo "Eager traces collected:"
+ls -lh "{{PROFILE_DIR}}/profiles_eager/"
+```
+
+**4b. Re-patch for graph mode and run:**
+Remove `--enforce-eager` from the benchmark script so vLLM uses CUDA graphs:
+```bash
+cd {{REPO_DIR}} && git checkout -- "$BENCHMARK_SCRIPT" benchmarks/benchmark_lib.sh 2>/dev/null || true
+```
+Re-apply all patches from steps 3e, 3f, 3g **without** `--enforce-eager`:
+```bash
+docker exec \
+    -e OSL="${OSL}" -e CONC="${CONC}" -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO:-0.5}" \
+    "$CONTAINER_NAME" python3 - "/workspace/$BENCHMARK_SCRIPT" <<'PYEOF'
+import sys, os, re, math
+
+target = sys.argv[1]
+prof_dir = os.environ.get('VLLM_TORCH_PROFILER_DIR', '/workspace/profiles')
+
+osl = int(os.environ.get('OSL', '512'))
+conc = int(os.environ.get('CONC', '32'))
+rrr = float(os.environ.get('RANDOM_RANGE_RATIO', '0.5'))
+
+num_prompts = conc * 10
+avg_osl = osl * (1 + rrr) / 2 if rrr < 1 else osl
+total_iters = int(num_prompts * avg_osl / conc)
+transition = int(0.9 * total_iters)
+max_iters = 256
+delay_iters = max(0, transition - max_iters // 2)
+
+print(f'Graph mode: delay={delay_iters}, max={max_iters}')
+
+# No --enforce-eager for graph mode
+profiler_args = (
+    '--profiler-config.profiler torch '
+    '--profiler-config.torch_profiler_dir ' + prof_dir + ' '
+    '--profiler-config.torch_profiler_record_shapes True '
+    '--profiler-config.torch_profiler_with_memory False '
+    '--profiler-config.torch_profiler_with_flops False '
+    '--profiler-config.torch_profiler_use_gzip True '
+    '--profiler-config.ignore_frontend True '
+    '--profiler-config.delay_iterations ' + str(delay_iters) + ' '
+    '--profiler-config.max_iterations ' + str(max_iters)
+)
+with open(target) as fh:
+    content = fh.read()
+content = re.sub(r'--enforce-eager\s+', '', content)
+content = re.sub(r'--profiler-config\.\S+\s+\S+\s*', '', content)
+content = re.sub(r'--ignore_frontend\s+\S+\s*', '', content)
+new_content = content.replace('vllm serve ', 'vllm serve ' + profiler_args + ' ', 1)
+if new_content != content:
+    with open(target, 'w') as fh:
+        fh.write(new_content)
+    print(f'Patched {target} for graph mode (no --enforce-eager)')
+PYEOF
+```
+
+**IMPORTANT**: After `git checkout`, `benchmark_lib.sh` is also restored. You **must** re-apply the patches from steps 3f (disable relay trace staging) and 3g (disable num_prompts capping) by re-running both `docker exec` commands from those steps. Also add `--hf-overrides '{"num_hidden_layers": 8}'` if reduced layers are needed (step 2a). Then run graph-mode profiling:
+```bash
+DOCKER_LOG="{{PROFILE_DIR}}/${PROFILE_RESULT}_graph_docker.log"
+
+echo "=== GRAPH MODE PROFILING ==="
+echo "DOCKER_LOG: $DOCKER_LOG"
+
+docker exec \
+    -e MODEL=$MODEL \
+    -e TP=$TP \
+    -e EP_SIZE=$EP \
+    -e CONC=$CONC \
+    -e ISL=$ISL \
+    -e OSL=$OSL \
+    -e MAX_MODEL_LEN=$MAX_MODEL_LEN \
+    -e RANDOM_RANGE_RATIO=0.5 \
+    -e RESULT_FILENAME=${PROFILE_RESULT}_graph \
+    -e PRECISION=$PRECISION \
+    -e FRAMEWORK=$FRAMEWORK \
+    -e EXP_NAME=$EXP_NAME \
+    "$CONTAINER_NAME" \
+    /bin/bash /workspace/$BENCHMARK_SCRIPT \
+    > "$DOCKER_LOG" 2>&1
+EXIT_CODE=$?
+echo "Graph profile exit code: $EXIT_CODE"
+if [ $EXIT_CODE -ne 0 ]; then
+    echo "=== Last 50 lines of docker log ==="
+    tail -n 50 "$DOCKER_LOG"
+fi
+```
+
+Collect graph-mode traces:
+```bash
+mkdir -p "{{PROFILE_DIR}}/profiles_graph"
+for f in {{REPO_DIR}}/profiles/*.json*; do
+    [ -f "$f" ] || continue
+    case "$(basename "$f")" in
+        *async_llm*) rm -f "$f" ;;
+        *)           cp "$f" "{{PROFILE_DIR}}/profiles_graph/" && rm -f "$f" ;;
+    esac
+done
+for f in {{REPO_DIR}}/profiles/profiler_out_*.txt; do
+    [ -f "$f" ] && cp "$f" "{{PROFILE_DIR}}/profiles_graph/" && rm -f "$f"
+done
+echo "Graph traces collected:"
+ls -lh "{{PROFILE_DIR}}/profiles_graph/"
+```
+
+IMPORTANT: Each docker exec runs in the **foreground** writing stdout/stderr to the log file. If the command fails (non-zero exit code), the last 50 lines of the log are printed to help diagnose the issue.
 
 ### 5. Clean Up Container
 After **all** profiling runs are complete, stop and remove the container:
@@ -253,38 +410,19 @@ docker stop "$CONTAINER_NAME"
 docker rm "$CONTAINER_NAME"
 ```
 
-### 6. Collect Profile Traces and Benchmark Results
-Copy the **actual torch profiler traces** (produced by vLLM to `VLLM_TORCH_PROFILER_DIR`) and benchmark result JSONs to the output directory, then clean up all generated files from the repo:
+### 6. Collect Benchmark Results and Clean Up Repo
+Traces were already collected per-mode in step 4. Copy any remaining benchmark result JSONs and clean up:
 ```bash
-# Torch profiler traces written by vLLM to the profiles subdirectory.
-# With ignore_frontend: true, only rank-0 (worker) traces should be produced.
-# Defensively skip any async_llm traces that may appear — they contain only
-# frontend CPU scheduling and lack the GPU kernels / Input Dims needed for
-# shape analysis.
-for f in {{REPO_DIR}}/profiles/*.json*; do
-    [ -f "$f" ] || continue
-    case "$(basename "$f")" in
-        *async_llm*) rm -f "$f" ;;
-        *)           cp "$f" "{{PROFILE_DIR}}/" && rm -f "$f" ;;
-    esac
-done
-
-# Copy InferenceX profiler summary (profiler_out_0.txt) and rename with config context
-if [ -f "{{REPO_DIR}}/profiles/profiler_out_0.txt" ]; then
-    cp "{{REPO_DIR}}/profiles/profiler_out_0.txt" "{{PROFILE_DIR}}/profiler_out_0.txt"
-    rm -f "{{REPO_DIR}}/profiles/profiler_out_0.txt"
-    echo "Collected profiler_out_0.txt"
-fi
-
-# Copy benchmark result JSONs from the repo to the output results directory
 mkdir -p "{{OUTPUT_DIR}}/results"
 cp {{REPO_DIR}}/results/*.json "{{OUTPUT_DIR}}/results/" 2>/dev/null || true
 rm -f {{REPO_DIR}}/results/*.json 2>/dev/null || true
 
-echo "Collected trace files:"
-ls -lh "{{PROFILE_DIR}}/"
-echo "Collected benchmark results:"
-ls -lh "{{OUTPUT_DIR}}/results/" 2>/dev/null || echo "(none)"
+cd {{REPO_DIR}} && git checkout -- "$BENCHMARK_SCRIPT" benchmarks/benchmark_lib.sh 2>/dev/null || true
+
+echo "=== Collected traces ==="
+echo "Eager mode:" && ls -lh "{{PROFILE_DIR}}/profiles_eager/" 2>/dev/null || echo "(none)"
+echo "Graph mode:" && ls -lh "{{PROFILE_DIR}}/profiles_graph/" 2>/dev/null || echo "(none)"
+echo "Benchmark results:" && ls -lh "{{OUTPUT_DIR}}/results/" 2>/dev/null || echo "(none)"
 ```
 
 ### 7. Profile Summary
